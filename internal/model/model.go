@@ -5,6 +5,12 @@ package model
 
 import "time"
 
+// ProtocolVersion is the daemon↔client wire protocol version, reported by
+// wtd at GET /api/version and as the SSE stream's first "hello" event. A
+// client refuses to proceed against a daemon reporting a different value
+// rather than risk silently misinterpreting a shape it doesn't understand.
+const ProtocolVersion = 1
+
 // AgentKind identifies which tool is (likely) driving a worktree. It is inferred,
 // never authoritative — the cockpit is agent-agnostic and only reads git/fs.
 type AgentKind string

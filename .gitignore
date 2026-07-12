@@ -1,2 +1,4 @@
 /bin/
 *.sock
+/wt
+/wtd

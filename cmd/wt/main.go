@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +21,27 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
+// version is set at build time via -ldflags "-X main.version=...". "dev" is
+// the fallback for a plain `go build`/`go run`.
+var version = "dev"
+
 func main() {
+	args := os.Args[1:]
+	if len(args) == 0 {
+		args = []string{"ls"}
+	}
+
+	// These run without ever touching the daemon — no protocol handshake
+	// needed (or possible, if wtd isn't even running).
+	switch args[0] {
+	case "-version", "--version":
+		printVersion(os.Stdout)
+		return
+	case "-h", "--help", "help":
+		usage()
+		return
+	}
+
 	home, _ := os.UserHomeDir()
 	socket := filepath.Join(home, ".wtcockpit", "wtd.sock")
 	if s := os.Getenv("WTD_SOCKET"); s != "" {
@@ -28,10 +49,14 @@ func main() {
 	}
 	c := newClient(socket)
 
-	args := os.Args[1:]
-	if len(args) == 0 {
-		args = []string{"ls"}
+	// Every remaining command talks to wtd, so check the protocol handshake
+	// first: one extra round trip per invocation, accepted (unix socket,
+	// sub-ms) for the sake of failing loudly on a version mismatch instead of
+	// silently misinterpreting a shape this build doesn't understand.
+	if err := c.checkVersion(); err != nil {
+		fatal("%v", err)
 	}
+
 	switch args[0] {
 	case "ls":
 		must(c.ls())
@@ -42,6 +67,8 @@ func main() {
 			fatal("usage: wt diff <id>")
 		}
 		must(c.diff(args[1]))
+	case "status":
+		must(c.status(len(args) > 1 && args[1] == "--json"))
 	case "review":
 		if len(args) < 3 {
 			fatal("usage: wt review <id> <file> [--off]")
@@ -59,11 +86,15 @@ func main() {
 	case "refresh":
 		must(c.post("/api/refresh", nil, nil))
 		fmt.Println("refreshed")
-	case "-h", "--help", "help":
-		usage()
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, refresh)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, status)", args[0])
 	}
+}
+
+// printVersion writes the build-time version string to w. Pulled out of the
+// -version flag branch so it's unit-testable without exercising os.Args/os.Exit.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "wt %s (%s)\n", version, runtime.Version())
 }
 
 // ---- client ----
@@ -85,6 +116,36 @@ func newClient(socket string) *client {
 			},
 		},
 	}
+}
+
+// checkVersion performs the daemon↔client protocol handshake: GET
+// /api/version and confirm wtd speaks the same model.ProtocolVersion this
+// client was built against. main runs it once before dispatching to any
+// daemon-touching command.
+func (c *client) checkVersion() error {
+	resp, err := c.http.Get(c.base + "/api/version")
+	if err != nil {
+		return fmt.Errorf("cannot reach wtd (is it running?): %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("wtd is v0.1 (no protocol handshake); rebuild/restart wtd")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("wtd returned %s", resp.Status)
+	}
+
+	var v struct {
+		Protocol int `json:"protocol"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return fmt.Errorf("wtd /api/version: %w", err)
+	}
+	if v.Protocol != model.ProtocolVersion {
+		return fmt.Errorf("protocol mismatch: wt speaks %d, wtd speaks %d — rebuild both from the same checkout and restart wtd", model.ProtocolVersion, v.Protocol)
+	}
+	return nil
 }
 
 func (c *client) get(path string, out any) error {
@@ -157,12 +218,36 @@ func (c *client) watch() error {
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var event string
 	for sc.Scan() {
-		if strings.HasPrefix(sc.Text(), "data:") {
+		if shouldRenderSSELine(sc.Text(), &event) {
 			render()
 		}
 	}
 	return sc.Err()
+}
+
+// shouldRenderSSELine advances the SSE per-frame event-name state machine (an
+// "event: <name>" line names the frame that follows; a blank line ends it)
+// and reports whether the just-scanned line is a "data:" payload that should
+// trigger a re-render. Every data line renders except one inside a "hello"
+// frame — the version-handshake preamble handleEvents sends first (see
+// cmd/wtd's handleEvents/currentVersion). wt already verified the handshake
+// via GET /api/version before this command ran, so the hello frame is
+// consumed here with no visible effect rather than causing a spurious render.
+func shouldRenderSSELine(line string, event *string) bool {
+	switch {
+	case strings.HasPrefix(line, "event:"):
+		*event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		return false
+	case line == "":
+		*event = ""
+		return false
+	case strings.HasPrefix(line, "data:"):
+		return *event != "hello"
+	default:
+		return false
+	}
 }
 
 func (c *client) diff(id string) error {
@@ -171,6 +256,37 @@ func (c *client) diff(id string) error {
 		return err
 	}
 	renderDiff(d)
+	return nil
+}
+
+// statusPayload mirrors /api/status's JSON shape. Kept local (like approve's
+// anonymous result struct below) rather than importing the daemon's internal
+// packages — wt only ever depends on the wire format, never on wtd's Go types.
+type statusPayload struct {
+	Version       string   `json:"version"`
+	Protocol      int      `json:"protocol"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	SocketPath    string   `json:"socketPath"`
+	WatcherMode   string   `json:"watcherMode"`
+	Roots         []string `json:"roots"`
+	StatePath     string   `json:"statePath"`
+	RepoCount     int      `json:"repoCount"`
+	WorktreeCount int      `json:"worktreeCount"`
+	ReviewedFiles int      `json:"reviewedFiles"`
+	TotalFiles    int      `json:"totalFiles"`
+}
+
+func (c *client) status(jsonOut bool) error {
+	var st statusPayload
+	if err := c.get("/api/status", &st); err != nil {
+		return err
+	}
+	if jsonOut {
+		b, _ := json.MarshalIndent(st, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	renderStatus(st)
 	return nil
 }
 
@@ -332,6 +448,20 @@ func renderDiff(d model.Diff) {
 	}
 }
 
+func renderStatus(st statusPayload) {
+	uptime := time.Duration(st.UptimeSeconds * float64(time.Second)).Round(time.Second)
+	fmt.Printf("%s%swtd status%s\n", bold, blue, reset)
+	fmt.Printf("  %sversion%s    %s (protocol %d)\n", dim, reset, st.Version, st.Protocol)
+	fmt.Printf("  %suptime%s     %s\n", dim, reset, uptime)
+	fmt.Printf("  %ssocket%s     %s\n", dim, reset, st.SocketPath)
+	fmt.Printf("  %swatcher%s    %s\n", dim, reset, st.WatcherMode)
+	fmt.Printf("  %sstate%s      %s\n", dim, reset, st.StatePath)
+	fmt.Printf("  %sroots%s      %s\n", dim, reset, strings.Join(st.Roots, ", "))
+	fmt.Printf("  %srepos%s      %d\n", dim, reset, st.RepoCount)
+	fmt.Printf("  %sworktrees%s  %d\n", dim, reset, st.WorktreeCount)
+	fmt.Printf("  %sreviewed%s   %d/%d files\n", dim, reset, st.ReviewedFiles, st.TotalFiles)
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -347,9 +477,11 @@ func usage() {
   wt ls                     list worktrees (radar)
   wt watch                  live radar, updates on every change
   wt diff <id>              show a worktree's diff
+  wt status [--json]        daemon health: version, uptime, watcher, roots, review counts
   wt review <id> <file>     mark a file reviewed (--off to unmark)
   wt approve <id>           merge worktree→base & remove it (needs full review + clean tree)
   wt refresh                force a rescan
+  wt -version               print the client's build version
 
 Set WTD_SOCKET to override the daemon socket path.
 `)

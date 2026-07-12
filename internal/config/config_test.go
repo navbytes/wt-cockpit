@@ -28,6 +28,8 @@ tcp = "127.0.0.1:7799"
 state = "/home/nav/.wtcockpit/state.json"
 interval = "5s"
 watch = "fsnotify"
+log_format = "json"
+log_level = "debug"
 
 [repos."/home/nav/code/api-server"]
 base = "develop"
@@ -72,6 +74,12 @@ func TestLoadFullExamplePopulatesEveryField(t *testing.T) {
 	}
 	if cfg.Watch != "fsnotify" {
 		t.Errorf("Watch = %q", cfg.Watch)
+	}
+	if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json", cfg.LogFormat)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
 
 	rc, ok := cfg.Repos["/home/nav/code/api-server"]

@@ -24,15 +24,17 @@ type RepoConfig struct {
 // Config is the on-disk shape of config.toml. The zero value (returned when
 // the file doesn't exist) means "nothing configured" — every field left unset.
 type Config struct {
-	Roots    []string              `toml:"roots"`
-	Base     string                `toml:"base"`
-	Socket   string                `toml:"socket"`
-	TCP      string                `toml:"tcp"`
-	State    string                `toml:"state"`
-	Interval time.Duration         `toml:"interval"`
-	Watch    string                `toml:"watch"`
-	Repos    map[string]RepoConfig `toml:"repos"`
-	Rules    []guardrail.Rule      `toml:"rules"`
+	Roots     []string              `toml:"roots"`
+	Base      string                `toml:"base"`
+	Socket    string                `toml:"socket"`
+	TCP       string                `toml:"tcp"`
+	State     string                `toml:"state"`
+	Interval  time.Duration         `toml:"interval"`
+	Watch     string                `toml:"watch"`
+	LogFormat string                `toml:"log_format"`
+	LogLevel  string                `toml:"log_level"`
+	Repos     map[string]RepoConfig `toml:"repos"`
+	Rules     []guardrail.Rule      `toml:"rules"`
 
 	// RulesSet is true iff [[rules]] appeared in the file at all (even empty).
 	// An absent [[rules]] means "use guardrail.DefaultRules()"; a present one —

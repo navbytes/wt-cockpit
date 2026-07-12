@@ -1,0 +1,13 @@
+[Unit]
+Description=wt-cockpit daemon (wtd)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wtd
+# Add flags here if you don't use ~/.config/wtcockpit/config.toml, e.g.:
+# ExecStart=/usr/local/bin/wtd -root %h/code
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
