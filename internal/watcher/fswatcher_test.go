@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/navbytes/wt-cockpit/internal/gitbackend"
 )
 
@@ -142,19 +143,35 @@ func TestFSWatcherFileEditTriggersTargetedRefresh(t *testing.T) {
 	rec.waitFor(t, featurePath, 3*time.Second)
 }
 
+// TestFSWatcherCommitInLinkedWorktreeTriggersRefresh is MN3's fixed version:
+// the previous form wrote an *untracked* new.go before committing, so
+// rec.waitFor was trivially satisfiable by that working-tree Create event
+// alone — the test would still pass even if the gitdir (HEAD/index/logs)
+// watch were deleted entirely. To actually pin gitdir-driven detection, this
+// drains the one working-tree event a content edit necessarily produces
+// *before* committing, then commits with no further working-tree write at
+// all (`git commit -am`, not `git add` + a new file write) and requires a
+// FRESH onChange(featurePath) after that point — something only the gitdir
+// watch (index/HEAD/logs, all internal to .git) can produce.
 func TestFSWatcherCommitInLinkedWorktreeTriggersRefresh(t *testing.T) {
 	root, _, featurePath := buildRepoWithLinkedWorktree(t)
 	rec := newRecorder()
 	cancel, done := runWatcher(t, newTestFSWatcher(root), rec)
 	defer func() { cancel(); <-done }()
 
-	os.WriteFile(filepath.Join(featurePath, "new.go"), []byte("package app\n"), 0o644)
-	git(t, featurePath, "add", "-A")
-	git(t, featurePath, "commit", "-q", "-m", "feature work")
-
-	// The commit alone (HEAD/index/logs in the linked worktree's gitdir) must
-	// surface a change, independent of whatever the earlier file write did.
+	os.WriteFile(filepath.Join(featurePath, "app.go"), []byte("package app\n\nfunc B() {}\n"), 0o644)
 	rec.waitFor(t, featurePath, 3*time.Second)
+
+	before := len(rec.snapshot())
+	git(t, featurePath, "commit", "-q", "-am", "feature work")
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(rec.snapshot()) <= before {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(rec.snapshot()) <= before {
+		t.Fatalf("commit alone (gitdir HEAD/index/logs, no further working-tree write) should trigger a fresh onChange(%q); calls=%v", featurePath, rec.snapshot())
+	}
 }
 
 func TestFSWatcherCoalescesBurstOfWrites(t *testing.T) {
@@ -215,4 +232,189 @@ func TestFSWatcherContextCancelStopsCleanly(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return within 3s of ctx cancel")
 	}
+}
+
+// TestReconcileDropsBookkeepingForRemovedWorktree is a whitebox unit test of
+// fsSession.reconcile: once a worktree disappears from `git worktree list`,
+// the next reconcile must drop its watched-dir and dirCount bookkeeping —
+// otherwise a stale root would linger forever, permanently eating into the
+// per-worktree fd cap and (if a path were ever reused) able to misroute a
+// future event to a dead root.
+func TestReconcileDropsBookkeepingForRemovedWorktree(t *testing.T) {
+	root, repoPath, featurePath := buildRepoWithLinkedWorktree(t)
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsw.Close()
+
+	sess := &fsSession{
+		fsw:       fsw,
+		be:        gitbackend.NewCLI(),
+		watched:   map[string]watchEntry{},
+		dirCount:  map[string]int{},
+		capLogged: map[string]bool{},
+	}
+	sess.reconcile([]string{root}, 4)
+
+	if _, ok := sess.dirCount[featurePath]; !ok {
+		t.Fatalf("precondition: feature worktree should be tracked after the first reconcile, got %+v", sess.dirCount)
+	}
+
+	git(t, repoPath, "worktree", "remove", "--force", featurePath)
+	sess.reconcile([]string{root}, 4)
+
+	if _, ok := sess.dirCount[featurePath]; ok {
+		t.Errorf("dirCount should drop the removed worktree, got %+v", sess.dirCount)
+	}
+	for path, entry := range sess.watched {
+		if entry.root == featurePath {
+			t.Errorf("watched map still has an entry for the removed worktree: %s -> %+v", path, entry)
+		}
+	}
+}
+
+// TestFSWatcherWorktreeRemoveDoesNotPanic runs `git worktree remove` on a
+// worktree while it is actively watched via the real Run() event loop (not
+// the whitebox reconcile call above). A panic in the event-handling goroutine
+// would crash the whole test binary, so simply completing is most of the
+// assertion; the rest confirms the session is still healthy afterwards (not
+// wedged) by proving a different, still-existing worktree keeps triggering.
+func TestFSWatcherWorktreeRemoveDoesNotPanic(t *testing.T) {
+	root, repoPath, featurePath := buildRepoWithLinkedWorktree(t)
+	rec := newRecorder()
+	cancel, done := runWatcher(t, newTestFSWatcher(root), rec)
+	defer func() { cancel(); <-done }()
+
+	before := len(rec.snapshot())
+	git(t, repoPath, "worktree", "remove", "--force", featurePath)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(rec.snapshot()) <= before {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(rec.snapshot()) <= before {
+		t.Fatalf("expected the watcher to signal a change after worktree removal, got none; calls=%v", rec.snapshot())
+	}
+
+	// Still alive & correctly tracking afterwards: editing the still-existing
+	// main worktree keeps triggering its own onChange.
+	os.WriteFile(filepath.Join(repoPath, "app.go"), []byte("package app\n\nfunc Q() {}\n"), 0o644)
+	rec.waitFor(t, repoPath, 3*time.Second)
+}
+
+// TestFSWatcherRapidMkdirThenWriteEventuallySurfaces exercises the
+// watch-escalation race named in the T2 handoff: a subdirectory is created
+// and immediately written into, with no delay for the Create event to be
+// processed and a watch installed on it before the write happens (contrast
+// with TestFSWatcherEscalatesIntoNewSubdirectory, which deliberately waits
+// for escalation to land first). Even if escalation loses that race, the
+// periodic reconciliation tick's unconditional onChange("") — fired every
+// tick regardless of whether anything was detected — must still surface the
+// change within one interval. A short interval is used here (unlike the
+// package default 30s) specifically so this safety net is what the test can
+// observe within a normal timeout.
+func TestFSWatcherRapidMkdirThenWriteEventuallySurfaces(t *testing.T) {
+	root, _, featurePath := buildRepoWithLinkedWorktree(t)
+	rec := newRecorder()
+	w := &FSWatcher{Roots: []string{root}, Interval: 500 * time.Millisecond, Backend: gitbackend.NewCLI()}
+	cancel, done := runWatcher(t, w, rec)
+	defer func() { cancel(); <-done }()
+
+	before := len(rec.snapshot())
+	newDir := filepath.Join(featurePath, "rapidpkg")
+	// No settling sleep before the write, on purpose: mkdir and the write race
+	// the watcher's own subdirectory-watch escalation.
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(newDir, "new.go"), []byte("package rapidpkg\n"), 0o644)
+
+	// Generous eventual assertion: either escalation won the race (featurePath
+	// reported directly) or the reconciliation tick's unconditional
+	// onChange("") papered over a lost Create event — either outcome means
+	// the change wasn't lost forever, which is the documented guarantee.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, c := range rec.snapshot()[before:] {
+			if c == featurePath || c == "" {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("neither escalation nor the reconciliation tick surfaced the rapid mkdir+write; calls=%v", rec.snapshot())
+}
+
+// TestFSWatcherContextCancelDuringEventStormReturnsCleanly cancels ctx while
+// a goroutine is actively hammering the watched worktree with writes, unlike
+// TestFSWatcherContextCancelStopsCleanly (which cancels with nothing in
+// flight). This targets shutdown races between the debounce timers' AfterFunc
+// goroutines (each trying to send on `fired`) and Run's own goroutine
+// returning — exactly what -race is for.
+func TestFSWatcherContextCancelDuringEventStormReturnsCleanly(t *testing.T) {
+	root, _, featurePath := buildRepoWithLinkedWorktree(t)
+	rec := newRecorder()
+	cancel, done := runWatcher(t, newTestFSWatcher(root), rec)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		target := filepath.Join(featurePath, "app.go")
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				os.WriteFile(target, []byte("package app\n\n// "+string(rune('a'+i%26))+"\n"), 0o644)
+				i++
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond) // let the storm actually get going
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return within 3s of ctx cancel during an event storm")
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestFSWatcherTracksTwoReposUnderOneRoot: a single FSWatcher over one root
+// containing two independent (sibling, non-nested) repos must track each
+// one's edits individually — proving discovery + per-worktree watching both
+// work across multiple repos, not just multiple worktrees of one repo.
+func TestFSWatcherTracksTwoReposUnderOneRoot(t *testing.T) {
+	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	repoA := filepath.Join(root, "repo-a")
+	repoB := filepath.Join(root, "repo-b")
+	for _, r := range []string{repoA, repoB} {
+		if err := os.MkdirAll(r, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		git(t, r, "init", "-q", "-b", "main")
+		os.WriteFile(filepath.Join(r, "app.go"), []byte("package app\n"), 0o644)
+		git(t, r, "add", ".")
+		git(t, r, "commit", "-q", "-m", "init")
+	}
+
+	rec := newRecorder()
+	cancel, done := runWatcher(t, newTestFSWatcher(root), rec)
+	defer func() { cancel(); <-done }()
+
+	os.WriteFile(filepath.Join(repoA, "app.go"), []byte("package app\n\nfunc A() {}\n"), 0o644)
+	rec.waitFor(t, repoA, 3*time.Second)
+
+	os.WriteFile(filepath.Join(repoB, "app.go"), []byte("package app\n\nfunc B() {}\n"), 0o644)
+	rec.waitFor(t, repoB, 3*time.Second)
 }

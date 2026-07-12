@@ -80,7 +80,7 @@ func main() {
 	*socket = mergeSetting(*socket, explicit["socket"], cfg.Socket)
 	*tcp = mergeSetting(*tcp, explicit["tcp"], cfg.TCP)
 	*statePath = mergeSetting(*statePath, explicit["state"], cfg.State)
-	*interval = mergeSetting(*interval, explicit["interval"], cfg.Interval)
+	*interval = clampInterval(mergeSetting(*interval, explicit["interval"], cfg.Interval))
 	*watchMode = mergeSetting(*watchMode, explicit["watch"], cfg.Watch)
 
 	if len(roots) == 0 {
@@ -166,6 +166,13 @@ func main() {
 // flag.Parse: the user's explicit value if explicit is true, otherwise
 // whatever built-in default it was registered with. cfgVal is the config
 // file's value for the same setting (""/zero means the config didn't set it).
+//
+// NT1: this can't tell "config explicitly set the value to T's zero value"
+// (e.g. interval = "0s") apart from "config never mentioned this setting" —
+// both look identical (cfgVal == zero) and both fall back to flagVal. Fine
+// for every setting wtd currently merges this way (an explicit zero isn't a
+// meaningful choice for any of them), but worth knowing before reusing this
+// for a setting where zero is a legitimate, distinct value from unset.
 func mergeSetting[T comparable](flagVal T, explicit bool, cfgVal T) T {
 	if explicit {
 		return flagVal
@@ -175,6 +182,25 @@ func mergeSetting[T comparable](flagVal T, explicit bool, cfgVal T) T {
 		return cfgVal
 	}
 	return flagVal
+}
+
+// clampInterval enforces a practical floor on the poll/reconciliation
+// interval (NT2): a tiny but positive value — e.g. a "10ms" typo in a flag or
+// config file — would peg a CPU core on a full-rescan loop, so anything below
+// 1s is raised to it, with a warning so the operator knows why what they
+// configured isn't what's running. Zero and negative values are left alone:
+// they already have their own documented fallback in the watcher package
+// (Poller and FSWatcher both default to a sane interval on interval<=0), and
+// clamping them here too would just duplicate that with a different constant.
+// This lives here, not in the watcher constructors, because their tests
+// deliberately use sub-second intervals for speed.
+func clampInterval(d time.Duration) time.Duration {
+	const floor = time.Second
+	if d > 0 && d < floor {
+		log.Printf("interval %s is below the %s floor; using %s instead", d, floor, floor)
+		return floor
+	}
+	return d
 }
 
 // mergeRoots applies the same flags > config > built-in-default precedence
@@ -192,6 +218,9 @@ func mergeRoots(flagVal []string, explicit bool, cfgVal []string) []string {
 
 // baseFor builds the engine's per-repo base-branch override map from the
 // config's [repos."<path>"] tables, dropping entries that don't set a base.
+// Keys are normalised (~-expanded, then made absolute) the same way
+// discovery resolves each root before turning it into a repo.Path — the two
+// must match exactly, or a `[repos."~/code/x"]` override silently no-ops.
 func baseFor(cfg config.Config) map[string]string {
 	if len(cfg.Repos) == 0 {
 		return nil
@@ -199,10 +228,32 @@ func baseFor(cfg config.Config) map[string]string {
 	m := make(map[string]string, len(cfg.Repos))
 	for path, rc := range cfg.Repos {
 		if rc.Base != "" {
-			m[filepath.Clean(path)] = rc.Base
+			m[cleanRepoKey(path)] = rc.Base
 		}
 	}
 	return m
+}
+
+// cleanRepoKey mirrors discovery's own root normalisation (~-expansion +
+// filepath.Abs; discovery.expandHome isn't exported, so this is a minimal
+// local equivalent) so a config [repos."..."] key compares equal to the
+// repo.Path discovery actually produces.
+func cleanRepoKey(path string) string {
+	if abs, err := filepath.Abs(expandHome(path)); err == nil {
+		return abs
+	}
+	return filepath.Clean(path)
+}
+
+// expandHome expands a leading "~" (or "~/...") to the user's home directory,
+// same convention as discovery.expandHome.
+func expandHome(p string) string {
+	if len(p) >= 1 && p[0] == '~' && (len(p) == 1 || p[1] == '/') {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[1:])
+		}
+	}
+	return p
 }
 
 type server struct{ eng *engine.Engine }

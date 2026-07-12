@@ -82,6 +82,18 @@ func TestNoFalsePositives(t *testing.T) {
 	}
 }
 
+// TestRuleWithNoConditionsNeverMatches covers a rule loaded from a config
+// [[rules]] table with only "name" set (every condition field left at its
+// TOML zero value): fileMatches' hasCond guard means such a rule matches no
+// file, and it's not a ratio rule either (MinDeleteAddRatio == 0), so it must
+// produce zero hits — never a crash, and never a false positive on every file.
+func TestRuleWithNoConditionsNeverMatches(t *testing.T) {
+	e := New([]Rule{{Name: "only-a-name"}})
+	if hits := e.Eval(sampleDiff()); len(hits) != 0 {
+		t.Fatalf("a rule with no conditions should never match, got %+v", hits)
+	}
+}
+
 func TestDefaultRulesLoad(t *testing.T) {
 	e := New(DefaultRules())
 	hits := e.Eval(sampleDiff())
