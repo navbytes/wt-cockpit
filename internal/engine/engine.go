@@ -38,8 +38,9 @@ var ErrFileChanged = errors.New("file changed since it was reviewed")
 type Config struct {
 	Roots          []string
 	MaxDepth       int
-	DefaultBase    string        // "" => use each repo's own default branch
-	ActivityWindow time.Duration // how recently a change counts as "active"
+	DefaultBase    string            // "" => use each repo's own default branch
+	BaseFor        map[string]string // repo path -> base override, takes precedence over DefaultBase
+	ActivityWindow time.Duration     // how recently a change counts as "active"
 }
 
 // meta is the engine's per-worktree cache: enough to skip re-diffing unchanged
@@ -322,7 +323,10 @@ func (e *Engine) Refresh(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		base := e.cfg.DefaultBase
+		base := e.cfg.BaseFor[repo.Path]
+		if base == "" {
+			base = e.cfg.DefaultBase
+		}
 		if base == "" {
 			if b, ok := baseByRepo[repo.Path]; ok {
 				base = b
