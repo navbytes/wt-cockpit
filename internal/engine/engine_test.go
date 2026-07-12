@@ -171,6 +171,85 @@ func TestSetReviewedUpdatesCount(t *testing.T) {
 	}
 }
 
+// TestReviewedMapReflectsPerFileHashMatch is the engine-level TDD case for
+// the WP3 sanctioned API addition (P3-design.md): GET /api/diff's per-file
+// `reviewed` map is computed from the same per-file hash match SetReviewed/
+// buildWorktree's aggregate count already use. Unreviewed files are absent
+// from ReviewedFiles entirely, so they must read as false, not merely
+// "missing".
+func TestReviewedMapReflectsPerFileHashMatch(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	newFile := findFile(d.Files, "new.go")
+	if newFile == nil {
+		t.Fatal("precondition: new.go must be in the diff")
+	}
+	if err := e.SetReviewed(feat.ID, "new.go", true, newFile.Hash); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := e.ReviewedMap(feat.ID)
+	if !ok {
+		t.Fatal("ReviewedMap() ok = false, want true for a known worktree")
+	}
+	if !got["new.go"] {
+		t.Errorf("ReviewedMap()[new.go] = false, want true after SetReviewed")
+	}
+	for _, f := range d.Files {
+		if f.Path != "new.go" && got[f.Path] {
+			t.Errorf("ReviewedMap()[%s] = true, want false (never reviewed)", f.Path)
+		}
+	}
+}
+
+// TestReviewedMapUnknownWorktreeReturnsFalseOK mirrors Diff()'s own
+// unknown-id contract (ok=false, zero value) rather than a distinct error —
+// cmd/wtd's handleDiff already 404s on Diff()'s ok=false before ever
+// reaching ReviewedMap.
+func TestReviewedMapUnknownWorktreeReturnsFalseOK(t *testing.T) {
+	e := newEngine(t, t.TempDir())
+	if _, ok := e.ReviewedMap("no-such-id"); ok {
+		t.Error("ReviewedMap() ok = true, want false for an unknown worktree")
+	}
+}
+
+// TestReviewedMapFlipsFalseAfterEdit is the engine-level half of the TESTS
+// brief's "reviewed→commit→still true; edit→false" (the commit-survives half
+// is already TestReviewSurvivesCommit; this is the edit-resets half, at the
+// ReviewedMap accessor specifically rather than the aggregate count).
+func TestReviewedMapFlipsFalseAfterEdit(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	newFile := findFile(d.Files, "new.go")
+	if err := e.SetReviewed(feat.ID, "new.go", true, newFile.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := e.ReviewedMap(feat.ID); !got["new.go"] {
+		t.Fatal("precondition: new.go should read reviewed before the edit")
+	}
+
+	wt := filepath.Join(root, "api-server-feature")
+	if err := os.WriteFile(filepath.Join(wt, "new.go"), []byte("package api\n\nfunc C() {}\nfunc E() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := e.ReviewedMap(feat.ID)
+	if got["new.go"] {
+		t.Error("ReviewedMap()[new.go] = true after editing the file, want false (stale review hash)")
+	}
+}
+
 func TestRefreshDetectsRemovedWorktree(t *testing.T) {
 	root := buildWorkspace(t)
 	e := newEngine(t, root)

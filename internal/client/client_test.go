@@ -132,6 +132,50 @@ func TestDiffDecodesStructuredDiffAndPassesIDThrough(t *testing.T) {
 	}
 }
 
+// TestDiffDecodesPerFileReviewedMap pins the WP3 sanctioned API addition:
+// GET /api/diff's response gains an additive `reviewed` map (path -> bool).
+// Client() needs no code change for this — model.Diff gaining the field is
+// what makes it flow through the existing json.Decode automatically; this
+// test exists so a future signature change to Diff's wire shape can't
+// silently drop the field without a red test.
+func TestDiffDecodesPerFileReviewedMap(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"worktreeId":"wt-1","base":"main","files":[{"path":"a.go"}],"reviewed":{"a.go":true,"b.go":false}}`)
+	}))
+	defer ts.Close()
+
+	d, err := testClient(ts).Diff(context.Background(), "wt-1")
+	if err != nil {
+		t.Fatalf("Diff() error = %v", err)
+	}
+	if !d.Reviewed["a.go"] || d.Reviewed["b.go"] {
+		t.Errorf("Diff().Reviewed = %+v, want a.go=true, b.go=false", d.Reviewed)
+	}
+}
+
+// TestDiffDecodesMissingReviewedFieldAsNil pins forward/backward compat: an
+// older wtd's response (no "reviewed" key at all) must decode cleanly with a
+// nil map, not an error — encoding/json's normal missing-field behavior,
+// pinned here since a TUI reading d.Reviewed[path] on a nil map must still
+// be safe (Go's nil-map-read-returns-zero-value semantics).
+func TestDiffDecodesMissingReviewedFieldAsNil(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"worktreeId":"wt-1","base":"main"}`)
+	}))
+	defer ts.Close()
+
+	d, err := testClient(ts).Diff(context.Background(), "wt-1")
+	if err != nil {
+		t.Fatalf("Diff() error = %v", err)
+	}
+	if d.Reviewed != nil {
+		t.Errorf("Diff().Reviewed = %+v, want nil for a pre-WP3 response", d.Reviewed)
+	}
+	if d.Reviewed["anything"] {
+		t.Error("reading a nil Reviewed map must return false, not panic")
+	}
+}
+
 // TestDiffReturnsBodyVerbatimOnError: unlike a plain "wtd returned 404 Not
 // Found", the daemon's actual reason (e.g. "unknown worktree id") is what a
 // TUI error card / CLI message should show.

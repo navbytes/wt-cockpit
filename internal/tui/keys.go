@@ -65,5 +65,8 @@ var keys = keyMap{
 const radarKeybar = "↑↓/jk move  ⏎ diff  r review  t tmux  a approve  / search  f active  R refresh  q quit"
 
 // reviewKeybar is the Review view's context-sensitive keybar text (mock's
-// keybar-review).
-const reviewKeybar = "↑↓/jk file  space toggle  a approve  t tmux  esc back  q quit"
+// keybar-review). j/k walk files; plain ↑/↓ (and ctrl-d/u, pgup/pgdn, g/G,
+// not all spelled out here) fine-scroll the same diff pane (P3-design.md
+// §1.3's Review table splits the two apart, unlike Radar's diff-focused
+// mode where j/k themselves scroll).
+const reviewKeybar = "j/k file  ↑↓ scroll  space toggle  a approve  t tmux  esc back  q quit"

@@ -336,6 +336,103 @@ func TestHandleReviewReturns200AndAppliesReview(t *testing.T) {
 	}
 }
 
+// getDiff GETs /api/diff?id= through the real mux and decodes it — the
+// handler-level counterpart to the CLI/TUI's internal/client.Diff, used here
+// so tests exercise the actual wire shape (including the WP3 `reviewed`
+// field) rather than calling srv.eng.Diff directly.
+func getDiff(t *testing.T, handler http.Handler, id string) model.Diff {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/diff?id="+id, nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/diff status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var d model.Diff
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+		t.Fatalf("decoding /api/diff response: %v", err)
+	}
+	return d
+}
+
+// TestHandleDiffReviewedMapSurvivesCommitAndFlipsFalseOnEdit is the
+// handler-level TDD case for the WP3 sanctioned API addition: GET /api/diff
+// gains a per-file `reviewed` map, additive to the existing wire shape,
+// computed from the engine's per-file hash matching (engine.ReviewedMap).
+// Exercises the brief's exact scenario: reviewed -> commit -> still true;
+// edit -> false.
+func TestHandleDiffReviewedMapSurvivesCommitAndFlipsFalseOnEdit(t *testing.T) {
+	srv, feat := buildTestServer(t)
+	handler := srv.routes()
+
+	d := getDiff(t, handler, feat.ID)
+	var appHash string
+	for _, f := range d.Files {
+		if f.Path == "app.go" {
+			appHash = f.Hash
+		}
+	}
+	if appHash == "" {
+		t.Fatal("precondition: app.go must be in the diff")
+	}
+	if rec := postJSON(t, handler, "/api/review", map[string]any{
+		"id": feat.ID, "file": "app.go", "reviewed": true, "hash": appHash,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("marking app.go reviewed: status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	d2 := getDiff(t, handler, feat.ID)
+	if !d2.Reviewed["app.go"] {
+		t.Fatalf("reviewed map = %+v, want app.go=true right after marking it reviewed", d2.Reviewed)
+	}
+
+	// Commit the reviewed change: per-file review identity survives a commit
+	// (the content, and so the per-file hash, doesn't change).
+	wtPath, ok := srv.eng.WorktreePath(feat.ID)
+	if !ok {
+		t.Fatal("worktree path not found")
+	}
+	testGit(t, wtPath, "add", ".")
+	testGit(t, wtPath, "commit", "-q", "-m", "apply review")
+	if err := srv.eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	d3 := getDiff(t, handler, feat.ID)
+	if !d3.Reviewed["app.go"] {
+		t.Errorf("reviewed map = %+v, want app.go still true after a commit", d3.Reviewed)
+	}
+
+	// Now edit app.go again: the stored review hash no longer matches, so it
+	// must flip back to unreviewed.
+	if err := os.WriteFile(filepath.Join(wtPath, "app.go"), []byte("package app\n\nfunc B() {}\nfunc C() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	d4 := getDiff(t, handler, feat.ID)
+	if d4.Reviewed["app.go"] {
+		t.Errorf("reviewed map = %+v, want app.go false after editing the file again", d4.Reviewed)
+	}
+}
+
+// TestHandleDiffReviewedMapOmitsNeverReviewedFiles: a file that was never
+// reviewed must read false, not merely be absent in a way a naive `if
+// reviewed[path]` check couldn't already handle — pinning that Go's
+// zero-value-for-missing-key semantics are exactly what the wire format
+// relies on (no separate "unset" tri-state needed).
+func TestHandleDiffReviewedMapOmitsNeverReviewedFiles(t *testing.T) {
+	srv, feat := buildTestServer(t)
+	handler := srv.routes()
+
+	d := getDiff(t, handler, feat.ID)
+	if d.Reviewed["app.go"] {
+		t.Errorf("reviewed map = %+v, want app.go false — it was never reviewed", d.Reviewed)
+	}
+}
+
 // TestHandleVersionReturnsProtocolAndVersion pins /api/version's contract:
 // the handshake payload every client checks before trusting anything else.
 func TestHandleVersionReturnsProtocolAndVersion(t *testing.T) {

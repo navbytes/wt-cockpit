@@ -176,6 +176,28 @@ func (v *diffview) ToggleFold() {
 	v.clampOffset()
 }
 
+// currentFile returns the file under the cursor (same file currentFileIndex
+// resolves for `[`/`]`/`o`), used by Review's space-toggle to know which
+// file/hash to send. ok=false only when the diff has no files at all.
+func (v *diffview) currentFile() (model.DiffFile, bool) {
+	fi := v.currentFileIndex()
+	if fi < 0 || fi >= len(v.diff.Files) {
+		return model.DiffFile{}, false
+	}
+	return v.diff.Files[fi], true
+}
+
+// setReviewed applies a reviewed state for one file, keyed by path (matches
+// model.Diff.Reviewed's own keying): Review's space-toggle uses it for the
+// optimistic flip before the request round-trips, and reviewOKMsg/a 409
+// revert use it for server-truth reconciliation.
+func (v *diffview) setReviewed(path string, reviewed bool) {
+	if v.diff.Reviewed == nil {
+		v.diff.Reviewed = map[string]bool{}
+	}
+	v.diff.Reviewed[path] = reviewed
+}
+
 // ---- rendering ----
 
 // render paints exactly the visible slice [offset, offset+height) into a
@@ -244,6 +266,9 @@ func (v *diffview) renderFileHeader(fi int, width int, danger map[string]bool) s
 		tag = "  " + styles.Del.Render("danger")
 	case f.Status != model.FileModified:
 		tag = "  " + styles.Dim.Render(string(f.Status))
+	}
+	if v.diff.Reviewed[f.Path] {
+		tag += "  " + styles.Add.Render("✓")
 	}
 
 	stats := "  " + styles.Add.Render(fmt.Sprintf("+%d", f.Stats.Add)) + " " + styles.Del.Render(fmt.Sprintf("-%d", f.Stats.Del))

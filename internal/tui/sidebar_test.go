@@ -187,3 +187,187 @@ func TestRemoveOfUnselectedWorktreeLeavesSelectionUntouched(t *testing.T) {
 		t.Errorf("selectedID = %q, want a1 unchanged (a2 wasn't selected)", s.selectedID)
 	}
 }
+
+// ---- WP3: "/" search + "f" active-only filter ----
+
+func TestMatchesFilterSubstringOnRepoNameBranchCaseInsensitive(t *testing.T) {
+	w := model.Worktree{Repo: "API-Server", Name: "Auth-Refactor", Branch: "feature/AUTH-99"}
+	for _, q := range []string{"api", "AUTH-refactor", "feature/auth", ""} {
+		if !matchesFilter(w, q, false) {
+			t.Errorf("matchesFilter(query=%q) = false, want true", q)
+		}
+	}
+	if matchesFilter(w, "nope", false) {
+		t.Error("matchesFilter(query=nope) = true, want false")
+	}
+}
+
+func TestMatchesFilterActiveOnlyExcludesNonActive(t *testing.T) {
+	active := model.Worktree{State: model.StateActive}
+	idle := model.Worktree{State: model.StateIdle}
+	if !matchesFilter(active, "", true) {
+		t.Error("an active worktree must pass the active-only filter")
+	}
+	if matchesFilter(idle, "", true) {
+		t.Error("an idle worktree must not pass the active-only filter")
+	}
+}
+
+func TestFilteredReturnsRowsUnchangedWhenNoFilterActive(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{wt("a1", "alpha", "one", time.Second)})
+	got := s.filtered()
+	if len(got) != len(s.rows) {
+		t.Errorf("filtered() = %d rows, want %d (identical to rows with no filter)", len(got), len(s.rows))
+	}
+}
+
+func TestFilteredDropsRepoHeaderWhenNoMemberMatches(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one", State: model.StateActive},
+		{ID: "z1", Repo: "zeta", Name: "two", State: model.StateIdle},
+	})
+	s.activeOnly = true
+	got := s.filtered()
+
+	var repos []string
+	for _, r := range got {
+		if r.header {
+			repos = append(repos, r.repo)
+		}
+	}
+	if len(repos) != 1 || repos[0] != "alpha" {
+		t.Errorf("headers in filtered() = %v, want only alpha (zeta has no active member)", repos)
+	}
+}
+
+func TestFilteredCombinesQueryAndActiveOnlyWithAnd(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one", State: model.StateActive},
+		{ID: "a2", Repo: "alpha", Name: "two", State: model.StateIdle},
+	})
+	s.filterInput.SetValue("one")
+	s.activeOnly = true
+
+	var ids []string
+	for _, r := range s.filtered() {
+		if !r.header {
+			ids = append(ids, r.wt.ID)
+		}
+	}
+	if len(ids) != 1 || ids[0] != "a1" {
+		t.Errorf("filtered ids = %v, want exactly [a1] (matches query AND active)", ids)
+	}
+}
+
+func TestSearchLifecycleStartTypeCommit(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one"},
+		{ID: "z1", Repo: "zeta", Name: "two"},
+	})
+	if s.searching() {
+		t.Fatal("precondition: not searching yet")
+	}
+	s.startSearch()
+	if !s.searching() {
+		t.Fatal("startSearch() should focus the input")
+	}
+	s.filterInput.SetValue("zeta") // simulate typed input landing (Update() itself is bubbles' own machinery)
+	s.fixSelection()
+	if _, ok := s.selected(); !ok {
+		t.Fatal("a selection should exist among the filtered rows")
+	}
+	if sel, _ := s.selected(); sel.ID != "z1" {
+		t.Errorf("selected = %q, want z1 once the query narrows to zeta", sel.ID)
+	}
+
+	s.commitSearch()
+	if s.searching() {
+		t.Error("commitSearch() should blur the input")
+	}
+	if s.filterInput.Value() != "zeta" {
+		t.Errorf("filterInput.Value() = %q, want the query kept after commit", s.filterInput.Value())
+	}
+}
+
+func TestSearchCancelClearsQueryAndSelectionReturnsToFullSet(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one"},
+		{ID: "z1", Repo: "zeta", Name: "two"},
+	})
+	s.startSearch()
+	s.filterInput.SetValue("zeta")
+	s.fixSelection()
+
+	s.cancelSearch()
+	if s.searching() {
+		t.Error("cancelSearch() should blur the input")
+	}
+	if s.filterInput.Value() != "" {
+		t.Errorf("filterInput.Value() = %q, want cleared after cancel", s.filterInput.Value())
+	}
+	if len(s.filtered()) != len(s.rows) {
+		t.Error("clearing the search should restore every row")
+	}
+}
+
+func TestHasFilterAndClearFilter(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{wt("a1", "alpha", "one", time.Second)})
+	if s.hasFilter() {
+		t.Fatal("precondition: no filter active yet")
+	}
+	s.activeOnly = true
+	if !s.hasFilter() {
+		t.Error("hasFilter() should be true once active-only is set")
+	}
+	s.clearFilter()
+	if s.hasFilter() || s.activeOnly || s.filterInput.Value() != "" {
+		t.Errorf("clearFilter() left state = query %q activeOnly %v, want both cleared", s.filterInput.Value(), s.activeOnly)
+	}
+}
+
+// TestFixSelectionReselectsWithinFilteredSetWhenCurrentSelectionFilteredOut
+// pins the generalisation of fixSelection to the *visible* set: a
+// worktree.upserted-style event that quietly falls outside the active
+// filter shouldn't leave the selection dangling on a hidden row.
+func TestFixSelectionReselectsWithinFilteredSetWhenCurrentSelectionFilteredOut(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one", State: model.StateActive},
+		{ID: "a2", Repo: "alpha", Name: "two", State: model.StateIdle},
+	})
+	s.selectedID = "a2"
+	s.activeOnly = true // a2 (idle) no longer matches
+
+	s.fixSelection()
+	if s.selectedID != "a1" {
+		t.Errorf("selectedID = %q, want a1 (the only visible row) once a2 is filtered out", s.selectedID)
+	}
+}
+
+func TestMoveUpDownOperateOverFilteredRows(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one", State: model.StateActive, LastChange: fixedTime(3)},
+		{ID: "a2", Repo: "alpha", Name: "two", State: model.StateIdle, LastChange: fixedTime(2)},
+		{ID: "a3", Repo: "alpha", Name: "three", State: model.StateActive, LastChange: fixedTime(1)},
+	})
+	s.activeOnly = true // hides a2
+
+	if s.selectedID != "a3" {
+		t.Fatalf("precondition: selectedID = %q, want a3 (most recent active)", s.selectedID)
+	}
+	s.moveDown()
+	if s.selectedID != "a1" {
+		t.Errorf("moveDown skipped the filtered-out a2: selectedID = %q, want a1", s.selectedID)
+	}
+	s.moveUp()
+	if s.selectedID != "a3" {
+		t.Errorf("selectedID = %q, want back to a3", s.selectedID)
+	}
+}
