@@ -172,13 +172,11 @@ func reviewedCount(files []model.DiffFile, reviewed map[string]string) int {
 	return n
 }
 
-// ApproveResult summarises a completed approve.
-type ApproveResult struct {
-	WorktreeID string `json:"worktreeId"`
-	Merged     string `json:"merged"`  // feature branch
-	Into       string `json:"into"`    // base branch
-	Removed    string `json:"removed"` // removed worktree path
-}
+// ApproveResult summarises a completed approve. Moved to internal/model (the
+// wire-shape package every frontend, including the thin client, can import
+// without dragging the engine along) — kept here as an alias so existing
+// engine.ApproveResult references keep compiling unchanged.
+type ApproveResult = model.ApproveResult
 
 // Approve is the single write path. It is deliberately gated: every file in the
 // worktree's diff must be marked reviewed, and the worktree must be clean (all work

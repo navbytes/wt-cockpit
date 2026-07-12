@@ -161,3 +161,15 @@ type Event struct {
 	Hit      *GuardrailHit `json:"hit,omitempty"`
 	At       time.Time     `json:"at"`
 }
+
+// ApproveResult summarises a completed approve: the engine's only mutation.
+// It lives here (not in internal/engine, where it originated) so the shared
+// client package can decode it without importing the engine — a thin client
+// binary must never drag gitbackend/discovery/etc. in with it. See
+// internal/engine.ApproveResult, kept as a type alias for source compat.
+type ApproveResult struct {
+	WorktreeID string `json:"worktreeId"`
+	Merged     string `json:"merged"`  // feature branch
+	Into       string `json:"into"`    // base branch
+	Removed    string `json:"removed"` // removed worktree path
+}
