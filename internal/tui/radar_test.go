@@ -56,6 +56,18 @@ func TestDiffLRUPutOnExistingIDUpdatesAndPromotes(t *testing.T) {
 	}
 }
 
+// TestNewRadarViewDiffLRUCapMatchesDesignBudget pins the *production* diffLRU
+// cap against P3-design.md §6's budget-table row ("plus max 4 cached
+// model.Diffs") — the eviction tests above deliberately construct a
+// newDiffLRU with a small synthetic cap directly, so nothing else asserts
+// the real constant newRadarView() wires up hasn't drifted.
+func TestNewRadarViewDiffLRUCapMatchesDesignBudget(t *testing.T) {
+	r := newRadarView()
+	if r.diffs.cap != 4 {
+		t.Errorf("newRadarView().diffs.cap = %d, want 4 (P3-design.md §6)", r.diffs.cap)
+	}
+}
+
 // ---- radarView.ensureDiff ----
 
 func TestEnsureDiffDispatchesFetchOnCacheMiss(t *testing.T) {

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	wtclient "github.com/navbytes/wt-cockpit/internal/client"
 	"github.com/navbytes/wt-cockpit/internal/model"
 	"github.com/navbytes/wt-cockpit/internal/tui"
@@ -25,10 +27,27 @@ import (
 // the fallback for a plain `go build`/`go run`.
 var version = "dev"
 
+// isTerminal reports whether stdout is a TTY — the seam bare `wt`'s default
+// routes on (P3-design.md §2.1). A var, not a bare call inline, so tests can
+// fake it without needing a real terminal.
+var isTerminal = func() bool { return isatty.IsTerminal(os.Stdout.Fd()) }
+
+// defaultCommand is what bare `wt` (no args) runs. A TTY opens the full TUI —
+// the "daily driver" goal a default-on-TTY flip is meant to deliver; anything
+// else (a pipe, a redirect, cron, a script) keeps the existing `ls` text
+// output so `wt | grep` and scripts never break. `wt ls`/`wt tui` are
+// unaffected: both stay explicit, TTY-independent entries.
+func defaultCommand(isTTY bool) string {
+	if isTTY {
+		return "tui"
+	}
+	return "ls"
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		args = []string{"ls"}
+		args = []string{defaultCommand(isTerminal())}
 	}
 
 	// These run without ever touching the daemon — no protocol handshake
@@ -453,6 +472,8 @@ func truncate(s string, n int) string {
 func usage() {
 	fmt.Print(`wt — worktree cockpit client
 
+  wt                        on a terminal: full-screen TUI (same as wt tui);
+                             piped/redirected: text radar (same as wt ls)
   wt tui                    full-screen cockpit: radar + review panes, live
   wt ls                     list worktrees (radar)
   wt watch                  live radar, updates on every change
