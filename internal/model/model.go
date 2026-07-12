@@ -102,10 +102,19 @@ type DiffFile struct {
 	Stats   Stats      `json:"stats"`
 	Hunks   []Hunk     `json:"hunks"`
 	Binary  bool       `json:"binary"`
-	// Hash is a stable per-file identity: sha1(path + status + every hunk line).
-	// Unlike the whole-diff hash it survives a commit inside the worktree (the
-	// content doesn't change), which is what lets review state be keyed per file
-	// instead of resetting whenever anything in the worktree changes.
+	// OldBlob/NewBlob are the git object ids from the diff's "index a..b"
+	// header line, when git emitted one (it's omitted for a pure,
+	// content-identical rename; either side is the all-zero placeholder for
+	// /dev/null on an add/delete). They let Hash notice a content change even
+	// when there are zero hunks — notably binary files, which git never
+	// renders as hunks — since the blob id always moves when the bytes do.
+	OldBlob string `json:"oldBlob,omitempty"`
+	NewBlob string `json:"newBlob,omitempty"`
+	// Hash is a stable per-file identity: sha1(path + status + blobs + every
+	// hunk line). Unlike the whole-diff hash it survives a commit inside the
+	// worktree (the content doesn't change), which is what lets review state
+	// be keyed per file instead of resetting whenever anything in the
+	// worktree changes.
 	Hash string `json:"hash"`
 }
 

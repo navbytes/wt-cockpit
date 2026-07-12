@@ -585,3 +585,532 @@ func TestApproveBlockedOnStaleReviewHash(t *testing.T) {
 		t.Errorf("error should mention review, got: %v", err)
 	}
 }
+
+// TestFileRenamePrunesOldPathReviewAndLeavesNewPathUnreviewed covers the
+// rename edge of per-file review identity: review app.go, rename it to
+// app2.go (git mv, which git detects as a rename since content stays highly
+// similar), refresh. The old path's review record must be pruned (it can
+// never be hash-matched again — pruneReviews drops any stored path no longer
+// in the diff), and the new path must start unreviewed — nothing carries a
+// review across a rename automatically.
+func TestFileRenamePrunesOldPathReviewAndLeavesNewPathUnreviewed(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	appFile := findFile(d.Files, "app.go")
+	if appFile == nil {
+		t.Fatal("precondition: app.go must be in the diff")
+	}
+	if err := e.SetReviewed(feat.ID, "app.go", true, appFile.Hash); err != nil {
+		t.Fatal(err)
+	}
+
+	wt := filepath.Join(root, "api-server-feature")
+	git(t, wt, "mv", "app.go", "app2.go")
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rev, _ := e.st.ReviewedFiles(feat.ID)
+	if _, ok := rev["app.go"]; ok {
+		t.Errorf("old path's review record should be pruned after rename, got %+v", rev)
+	}
+
+	d2, _ := e.Diff(feat.ID)
+	renamed := findFile(d2.Files, "app2.go")
+	if renamed == nil {
+		t.Fatalf("expected app2.go (renamed) in the diff: %+v", d2.Files)
+	}
+	if renamed.Status != model.FileRenamed || renamed.OldPath != "app.go" {
+		t.Errorf("renamed file = %+v, want status=renamed oldPath=app.go", renamed)
+	}
+	if rev[renamed.Path] == renamed.Hash {
+		t.Errorf("the new path must not inherit review state from the old path, got %+v", rev)
+	}
+	got := findByBranch(e.List(), "feature")
+	if got.Reviewed != 0 {
+		t.Errorf("reviewed count = %d, want 0 (renamed file starts unreviewed)", got.Reviewed)
+	}
+}
+
+// TestFileRestoredToReviewedContentDoesNotResurrectOldReview: a file is
+// reviewed, then edited back to byte-identical-with-base content so it drops
+// out of the diff entirely (pruneReviews removes its store entry at that
+// point, per the code). Restoring the exact previously-reviewed content later
+// reproduces the identical per-file hash — but the store entry is gone for
+// good, so the file must NOT resurrect as reviewed. Per the pruning design in
+// engine.go (files that drop out "can never be hash-matched again"), this is
+// the correct behaviour, not a bug: reappearing is indistinguishable from a
+// brand new occurrence of that content once the store record was dropped.
+func TestFileRestoredToReviewedContentDoesNotResurrectOldReview(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	wt := filepath.Join(root, "api-server-feature")
+
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+	d, _ := e.Diff(feat.ID)
+	appFile := findFile(d.Files, "app.go")
+	if appFile == nil {
+		t.Fatal("precondition: app.go must be in the diff")
+	}
+	reviewedContent, err := os.ReadFile(filepath.Join(wt, "app.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SetReviewed(feat.ID, "app.go", true, appFile.Hash); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revert to base's exact content: app.go drops out of the diff entirely.
+	baseContent, err := os.ReadFile(filepath.Join(root, "api-server", "app.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(wt, "app.go"), baseContent, 0o644)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := e.Diff(feat.ID)
+	if findFile(d2.Files, "app.go") != nil {
+		t.Fatalf("precondition: app.go should have dropped out of the diff, got %+v", d2.Files)
+	}
+	rev, _ := e.st.ReviewedFiles(feat.ID)
+	if _, ok := rev["app.go"]; ok {
+		t.Fatalf("precondition: app.go's review record should be pruned once it left the diff, got %+v", rev)
+	}
+
+	// Restore the exact previously-reviewed content: the file reappears with
+	// the identical hash it had when it was reviewed.
+	os.WriteFile(filepath.Join(wt, "app.go"), reviewedContent, 0o644)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d3, _ := e.Diff(feat.ID)
+	appFile3 := findFile(d3.Files, "app.go")
+	if appFile3 == nil {
+		t.Fatalf("app.go should be back in the diff: %+v", d3.Files)
+	}
+	if appFile3.Hash != appFile.Hash {
+		t.Fatalf("restoring identical content should reproduce the identical hash, got %q want %q", appFile3.Hash, appFile.Hash)
+	}
+
+	rev2, _ := e.st.ReviewedFiles(feat.ID)
+	if rev2["app.go"] == appFile3.Hash {
+		t.Errorf("a re-appeared file must NOT resurrect as reviewed via a stale store entry, got reviewed hash %q", rev2["app.go"])
+	}
+	got := findByBranch(e.List(), "feature")
+	if got.Reviewed != 0 {
+		t.Errorf("reviewed count = %d, want 0 (restored file must count as unreviewed)", got.Reviewed)
+	}
+}
+
+// TestReviewDoesNotCrossContaminateBetweenWorktreesWithSameFilePath: two
+// worktrees of the same repo each have their own "app.go" changed
+// differently. Reviewing one must not affect the other's review state, even
+// though the file path (the store's second-level map key) is identical —
+// isolation must come from the worktree id (first-level key).
+func TestReviewDoesNotCrossContaminateBetweenWorktreesWithSameFilePath(t *testing.T) {
+	root := buildWorkspace(t)
+	repo := filepath.Join(root, "api-server")
+	wt2 := filepath.Join(root, "api-server-feature2")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature2", wt2)
+	os.WriteFile(filepath.Join(wt2, "app.go"), []byte("package api\n\nfunc A() {}\nfunc Z() {}\n"), 0o644)
+
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat1 := findByBranch(e.List(), "feature")
+	feat2 := findByBranch(e.List(), "feature2")
+	if feat1 == nil || feat2 == nil {
+		t.Fatalf("expected both feature worktrees tracked: %+v", e.List())
+	}
+	if feat1.ID == feat2.ID {
+		t.Fatalf("distinct worktrees must have distinct ids, both got %q", feat1.ID)
+	}
+
+	d1, _ := e.Diff(feat1.ID)
+	f1 := findFile(d1.Files, "app.go")
+	if f1 == nil {
+		t.Fatal("precondition: feature's app.go must be in its diff")
+	}
+	if err := e.SetReviewed(feat1.ID, "app.go", true, f1.Hash); err != nil {
+		t.Fatal(err)
+	}
+
+	got2 := findByBranch(e.List(), "feature2")
+	if got2.Reviewed != 0 {
+		t.Errorf("reviewing feature's app.go must not mark feature2's app.go reviewed, got reviewed=%d", got2.Reviewed)
+	}
+	rev2, _ := e.st.ReviewedFiles(feat2.ID)
+	if len(rev2) != 0 {
+		t.Errorf("feature2's review store should be untouched by feature's review, got %+v", rev2)
+	}
+	// feature's own review must still hold.
+	got1 := findByBranch(e.List(), "feature")
+	if got1.Reviewed != 1 {
+		t.Errorf("feature's own reviewed count = %d, want 1", got1.Reviewed)
+	}
+}
+
+// TestSetReviewedUnreviewRoundTrip: review a file, unreview it, review it
+// again — the reviewed count and store state must track exactly, and the
+// same expectedHash gate that guards reviewed=true must also guard
+// reviewed=false (an unreview against a stale hash is rejected too).
+func TestSetReviewedUnreviewRoundTrip(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	newFile := findFile(d.Files, "new.go")
+	if newFile == nil {
+		t.Fatal("precondition: new.go must be in the diff")
+	}
+
+	if err := e.SetReviewed(feat.ID, "new.go", true, newFile.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != 1 {
+		t.Fatalf("precondition: reviewed = %d, want 1", got)
+	}
+
+	if err := e.SetReviewed(feat.ID, "new.go", false, newFile.Hash); err != nil {
+		t.Fatalf("unreview with the still-current hash should succeed: %v", err)
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != 0 {
+		t.Errorf("reviewed = %d after unreview, want 0", got)
+	}
+	rev, _ := e.st.ReviewedFiles(feat.ID)
+	if _, ok := rev["new.go"]; ok {
+		t.Errorf("unreview should remove the store entry entirely, got %+v", rev)
+	}
+
+	// Round-trip: reviewing again with the same (still current) hash succeeds.
+	if err := e.SetReviewed(feat.ID, "new.go", true, newFile.Hash); err != nil {
+		t.Fatalf("re-reviewing after unreview should succeed: %v", err)
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != 1 {
+		t.Errorf("reviewed = %d after re-review, want 1", got)
+	}
+
+	// Unreviewing with a stale expectedHash is rejected exactly like reviewing is.
+	if err := e.SetReviewed(feat.ID, "new.go", false, "not-the-real-hash"); !errors.Is(err, ErrFileChanged) {
+		t.Errorf("unreview with a stale expectedHash should return ErrFileChanged, got %v", err)
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != 1 {
+		t.Errorf("a rejected unreview must not change the reviewed count, got %d want 1", got)
+	}
+}
+
+// TestFileHashStableAcrossUntrackedStagedAndCommittedStates walks new.go
+// through three distinct git states relative to the same content — untracked
+// (synthesized via untrackedDiff's `git diff --no-index`), staged (`git add`,
+// picked up by the main DiffAgainstBase call as a "new file"), and committed
+// (still "new" relative to the merge-base) — and asserts the per-file hash
+// never moves. This is the property per-file review identity depends on: a
+// file's hash must be a function of its content, not of which git plumbing
+// path happened to produce the diff for it.
+func TestFileHashStableAcrossUntrackedStagedAndCommittedStates(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	wt := filepath.Join(root, "api-server-feature")
+
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+	d1, _ := e.Diff(feat.ID)
+	f1 := findFile(d1.Files, "new.go")
+	if f1 == nil {
+		t.Fatal("precondition: untracked new.go must appear in the diff")
+	}
+	hUntracked := f1.Hash
+	if hUntracked == "" {
+		t.Fatal("untracked new.go should have a non-empty hash")
+	}
+
+	git(t, wt, "add", "new.go")
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := e.Diff(feat.ID)
+	f2 := findFile(d2.Files, "new.go")
+	if f2 == nil {
+		t.Fatal("new.go missing from the diff once staged")
+	}
+	if f2.Hash != hUntracked {
+		t.Errorf("staged hash %q != untracked hash %q", f2.Hash, hUntracked)
+	}
+
+	git(t, wt, "commit", "-q", "-m", "add new.go")
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d3, _ := e.Diff(feat.ID)
+	f3 := findFile(d3.Files, "new.go")
+	if f3 == nil {
+		t.Fatal("new.go missing from the diff once committed")
+	}
+	if f3.Hash != hUntracked {
+		t.Errorf("committed hash %q != untracked hash %q", f3.Hash, hUntracked)
+	}
+}
+
+// TestApproveFailsAfterClearWorktreeWipesReviews: if a worktree's review
+// state is cleared (the only production caller is Approve's own
+// post-merge cleanup, but the store method is part of the Store interface
+// and nothing stops another path from calling it), a later Approve attempt
+// must refuse — gate 1 re-derives "reviewed" from the store on every call, so
+// wiping it must force every file back to unreviewed.
+func TestApproveFailsAfterClearWorktreeWipesReviews(t *testing.T) {
+	root := buildWorkspace(t)
+	commitWorktree(t, root)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatalf("review %s: %v", f.Path, err)
+		}
+	}
+
+	if err := e.st.ClearWorktree(feat.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Approve(feat.ID); err == nil {
+		t.Fatal("approve should refuse once ClearWorktree has wiped review state")
+	} else if !strings.Contains(err.Error(), "review") {
+		t.Errorf("error should mention review, got: %v", err)
+	}
+}
+
+// TestDoubleApproveFailsCleanlyOnSecondCall: Approve's own success path calls
+// ClearWorktree, deletes the cache entry and removes the worktree from the
+// registry. Calling Approve again on the same id afterwards (e.g. a
+// double-click) must fail cleanly ("unknown worktree"), never panic.
+func TestDoubleApproveFailsCleanlyOnSecondCall(t *testing.T) {
+	root := buildWorkspace(t)
+	commitWorktree(t, root)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.Approve(feat.ID); err != nil {
+		t.Fatalf("first approve: %v", err)
+	}
+
+	if _, err := e.Approve(feat.ID); err == nil {
+		t.Fatal("second approve on an already-approved (removed) worktree should fail, not panic")
+	}
+}
+
+// buildUnicodeSpaceWorkspace makes a workspace with a feature worktree that
+// modifies a tracked file whose name contains a space, and adds an untracked
+// file whose name contains non-ASCII (unicode) characters — both legal git
+// paths.
+func buildUnicodeSpaceWorkspace(t *testing.T) (root string) {
+	root = t.TempDir()
+	repo := filepath.Join(root, "api-server")
+	os.MkdirAll(repo, 0o755)
+	git(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "file with space.txt"), []byte("base\n"), 0o644)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+
+	wt := filepath.Join(root, "api-server-feature")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", wt)
+	os.WriteFile(filepath.Join(wt, "file with space.txt"), []byte("base\nedited\n"), 0o644)
+	os.WriteFile(filepath.Join(wt, "café.txt"), []byte("hello café\n"), 0o644)
+	return root
+}
+
+// TestReviewPathsWithSpacesAndUnicode is DEFECT D1: git's default
+// core.quotePath=true quotes+octal-escapes non-ASCII paths (e.g.
+// "caf\303\251.txt" for "café.txt") on the "diff --git"/"+++" lines, and
+// separately appends a bare trailing tab after any "+++ "/"--- " path that
+// merely *contains a space* (git's own disambiguation marker for such
+// paths). diffparse.stripPrefix only trims literal surrounding double
+// quotes — it never decodes the octal escapes and never trims the trailing
+// tab — so model.DiffFile.Path ends up corrupted for both kinds of path
+// (confirmed empirically: a unicode filename parses to the literal escaped
+// string, and a space-containing filename picks up an invisible trailing
+// tab). This breaks the file-identity contract SetReviewed relies on: a
+// caller (UI/API client) that requests review using the real on-disk
+// filename gets ErrFileNotFound because the engine's cur.Path never actually
+// equals that string.
+func TestReviewPathsWithSpacesAndUnicode(t *testing.T) {
+	root := buildUnicodeSpaceWorkspace(t)
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+	d, _ := e.Diff(feat.ID)
+
+	spaced := findFile(d.Files, "file with space.txt")
+	if spaced == nil {
+		t.Fatalf(`expected a file literally named "file with space.txt" in the diff, got %+v`, d.Files)
+	}
+	if err := e.SetReviewed(feat.ID, "file with space.txt", true, spaced.Hash); err != nil {
+		t.Errorf("review by the real filename (with space) should succeed, got %v", err)
+	}
+
+	unicodeFile := findFile(d.Files, "café.txt")
+	if unicodeFile == nil {
+		t.Fatalf(`expected a file literally named "café.txt" in the diff, got %+v`, d.Files)
+	}
+	if err := e.SetReviewed(feat.ID, "café.txt", true, unicodeFile.Hash); err != nil {
+		t.Errorf("review by the real filename (unicode) should succeed, got %v", err)
+	}
+}
+
+// buildBinaryWorkspace makes a workspace with a feature worktree that
+// modifies a tracked BINARY file in place (same path, no rename). The base
+// content starts with a NUL byte so git's binary heuristic classifies every
+// subsequent diff of this path as binary — zero hunks — regardless of what
+// the feature branch's bytes look like afterwards (confirmed against real
+// git: binary classification depends on either side of the diff, and the
+// merge-base side never changes as the feature branch is edited further).
+func buildBinaryWorkspace(t *testing.T) (root string) {
+	root = t.TempDir()
+	repo := filepath.Join(root, "api-server")
+	os.MkdirAll(repo, 0o755)
+	git(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "asset.bin"), []byte{0x00, 0x01, 0x02, 0x03}, 0o644)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+
+	wt := filepath.Join(root, "api-server-feature")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", wt)
+	os.WriteFile(filepath.Join(wt, "asset.bin"), []byte{0xAA, 0xBB, 0xCC, 0xDD}, 0o644)
+	return root
+}
+
+// TestBinaryFileHashChangesWithContent is DEFECT B1's core parsing-to-hash
+// claim: engine.fileHash used to be sha1(path + status + hunk lines), and a
+// binary diff always has zero hunks, so two completely different binary
+// bodies at the same path produced the identical Hash. Folding OldBlob/NewBlob
+// in fixes it — the blob id is a pure function of content.
+func TestBinaryFileHashChangesWithContent(t *testing.T) {
+	root := buildBinaryWorkspace(t)
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+	d, _ := e.Diff(feat.ID)
+	f := findFile(d.Files, "asset.bin")
+	if f == nil || !f.Binary {
+		t.Fatalf("precondition: asset.bin must be a binary diff entry, got %+v", d.Files)
+	}
+	if len(f.Hunks) != 0 {
+		t.Fatalf("precondition: a binary diff must have zero hunks, got %d", len(f.Hunks))
+	}
+	hash1 := f.Hash
+	if hash1 == "" {
+		t.Fatal("precondition: asset.bin should have a non-empty hash")
+	}
+
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "asset.bin"), []byte{0x11, 0x22, 0x33, 0x44, 0x55}, 0o644)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := e.Diff(findByBranch(e.List(), "feature").ID)
+	f2 := findFile(d2.Files, "asset.bin")
+	if f2 == nil {
+		t.Fatal("asset.bin missing from the diff after a further edit")
+	}
+	if f2.Hash == hash1 {
+		t.Errorf("two different binary bodies at the same path produced the same Hash %q (zero hunks either way) — a reviewed binary would stay reviewed after its bytes changed", hash1)
+	}
+}
+
+// TestApproveRefusesAfterBinaryFileBytesChangeWithZeroHunks is DEFECT B1's
+// end-to-end exploit: review a binary file, then swap its bytes for
+// completely different ones (still zero hunks either way) and commit —
+// without B1's fix this bypasses the review gate entirely, since the old
+// path+status+hunks hash never moved.
+func TestApproveRefusesAfterBinaryFileBytesChangeWithZeroHunks(t *testing.T) {
+	root := buildBinaryWorkspace(t)
+	commitWorktree(t, root)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	f := findFile(d.Files, "asset.bin")
+	if f == nil {
+		t.Fatal("precondition: asset.bin must be in the diff")
+	}
+	if err := e.SetReviewed(feat.ID, "asset.bin", true, f.Hash); err != nil {
+		t.Fatalf("review asset.bin: %v", err)
+	}
+
+	// Swap the bytes for something completely different, then commit — a
+	// binary diff renders zero hunks regardless, so only OldBlob/NewBlob can
+	// reveal the change.
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "asset.bin"), []byte{0xDE, 0xAD, 0xBE, 0xEF}, 0o644)
+	commitWorktree(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	feat2 := findByBranch(e.List(), "feature")
+	if feat2.Reviewed != 0 {
+		t.Errorf("swapping a reviewed binary file's bytes should unreview it, got reviewed=%d", feat2.Reviewed)
+	}
+	if _, err := e.Approve(feat2.ID); err == nil {
+		t.Fatal("approve should refuse: asset.bin's bytes changed since it was reviewed, even though the binary diff has zero hunks")
+	}
+}
+
+// TestApproveRefusesWhenWorktreeChangedSinceLastRefresh is FIX M1: Approve
+// must never trust a possibly-stale cache entry. Review every file, then
+// edit+commit further in the worktree WITHOUT ever calling any engine
+// refresh (the real window between polls/fsnotify debounce and an Approve
+// call, or a concurrent caller) — Approve itself must re-diff fresh and
+// refuse, because the stored review no longer matches the file's *actual
+// current* content, even though the engine's cache hasn't been told yet.
+func TestApproveRefusesWhenWorktreeChangedSinceLastRefresh(t *testing.T) {
+	root := buildWorkspace(t)
+	commitWorktree(t, root)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatalf("review %s: %v", f.Path, err)
+		}
+	}
+
+	// Edit app.go further and commit, but deliberately do NOT refresh the
+	// engine — Approve itself must catch this via its own fresh re-diff.
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc A() {}\nfunc B() {}\nfunc D() {}\n"), 0o644)
+	commitWorktree(t, root)
+
+	if _, err := e.Approve(feat.ID); err == nil {
+		t.Fatal("approve should refuse: app.go changed since it was reviewed, and the engine cache was never refreshed")
+	} else if !strings.Contains(err.Error(), "review") {
+		t.Errorf("error should mention review, got: %v", err)
+	}
+}

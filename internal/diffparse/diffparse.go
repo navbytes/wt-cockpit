@@ -52,18 +52,34 @@ func Parse(diff string) []model.DiffFile {
 
 		case strings.HasPrefix(ln, "rename from "):
 			cur.Status = model.FileRenamed
-			cur.OldPath = strings.TrimPrefix(ln, "rename from ")
+			// No a/b prefix on this line (unlike ---/+++/diff --git), just the
+			// bare path — only undo quoting/escaping, don't strip a fake prefix.
+			cur.OldPath = unquotePath(strings.TrimPrefix(ln, "rename from "))
 
 		case strings.HasPrefix(ln, "rename to "):
 			cur.Status = model.FileRenamed
-			cur.Path = strings.TrimPrefix(ln, "rename to ")
+			cur.Path = unquotePath(strings.TrimPrefix(ln, "rename to "))
+
+		case strings.HasPrefix(ln, "index "):
+			cur.OldBlob, cur.NewBlob = parseIndexLine(ln)
 
 		case strings.HasPrefix(ln, "Binary files"):
 			cur.Binary = true
 
 		case strings.HasPrefix(ln, "--- "):
-			// old path; "/dev/null" means an add. Real path handled via +++.
-			continue
+			// Old path; "/dev/null" means an add (OldPath is already "" from the
+			// "new file" case above). A real path here is authoritative for a
+			// plain modify or a delete — where Path itself holds the old path,
+			// per DiffFile's doc comment, since there's no "+++" real path to set
+			// it — and redundant-but-harmless for a rename (already set by
+			// "rename from ", which this just reproduces identically).
+			p := strings.TrimPrefix(ln, "--- ")
+			if p != "/dev/null" {
+				cur.OldPath = stripPrefix(p)
+				if cur.Status == model.FileDeleted {
+					cur.Path = cur.OldPath
+				}
+			}
 
 		case strings.HasPrefix(ln, "+++ "):
 			p := strings.TrimPrefix(ln, "+++ ")
@@ -114,6 +130,13 @@ func Parse(diff string) []model.DiffFile {
 }
 
 // parseDiffGitPaths extracts a/ and b/ paths from a "diff --git a/x b/y" line.
+// The split on the first space is naive and can mis-tokenize when a path
+// itself contains a space — harmless in practice, because both return values
+// here are only ever provisional: OldPath is immediately overwritten by
+// "rename from "/"--- ", and Path by "rename to "/"+++ ", for every status
+// this parser produces except a mode-only change or a 100%-similarity rename
+// with an unchanged mode, neither of which has any hunks (nothing reviewable)
+// riding on the exact pre-image path anyway.
 func parseDiffGitPaths(ln string) (old, new string) {
 	rest := strings.TrimPrefix(ln, "diff --git ")
 	// Paths are space-separated but may themselves contain spaces; the common
@@ -125,13 +148,52 @@ func parseDiffGitPaths(ln string) (old, new string) {
 	return "", stripPrefix(rest)
 }
 
-// stripPrefix removes a leading a/ or b/ (or quoted variants) from a diff path.
+// unquotePath undoes the two independent transformations git applies to a
+// path on a diff header line: core.quotePath=true (the default) wraps a path
+// containing a non-ASCII byte (or another special character) in double
+// quotes with C-style octal escapes (e.g. café.txt -> "caf\303\251.txt"), and
+// — completely independently — git always appends a bare trailing tab after
+// a path (quoted or not) that merely *contains a space*, to mark
+// unambiguously where the filename ends. Either, both, or neither may apply.
+func unquotePath(p string) string {
+	p = strings.TrimSuffix(p, "\t")
+	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		if unquoted, err := strconv.Unquote(p); err == nil {
+			return unquoted
+		}
+		// Malformed/unsupported escape: fall through with the tab trimmed but
+		// the quotes left as-is rather than losing the value entirely.
+	}
+	return p
+}
+
+// stripPrefix removes a leading a/ or b/ from a diff path — git always adds
+// one on "---"/"+++"/"diff --git" lines even though the real path has no such
+// prefix — after first undoing git's path quoting/escaping.
 func stripPrefix(p string) string {
-	p = strings.Trim(p, "\"")
+	p = unquotePath(p)
 	if strings.HasPrefix(p, "a/") || strings.HasPrefix(p, "b/") {
 		return p[2:]
 	}
 	return p
+}
+
+// parseIndexLine extracts the old/new blob object ids from a per-file
+// "index <old>..<new>[ <mode>]" header line. Git omits the trailing mode when
+// the file's mode also changed (carried instead by separate "old mode"/"new
+// mode" lines) and omits the line entirely for a pure, content-identical
+// (100%-similarity) rename — an absent index line just leaves both "".
+func parseIndexLine(ln string) (oldBlob, newBlob string) {
+	rest := strings.TrimPrefix(ln, "index ")
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	blobs := strings.SplitN(fields[0], "..", 2)
+	if len(blobs) != 2 {
+		return "", ""
+	}
+	return blobs[0], blobs[1]
 }
 
 // parseHunkHeader parses "@@ -oldStart,oldLen +newStart,newLen @@ optional".

@@ -176,3 +176,188 @@ func TestParseEmpty(t *testing.T) {
 		t.Errorf("empty diff should yield no files, got %d", len(got))
 	}
 }
+
+// The fixtures below are captured verbatim (byte-for-byte, via od -c) from
+// real `git diff` output (git 2.54.0), not hand-typed — DEFECT D1 is about
+// two behaviours only real git output demonstrates together: core.quotePath
+// (default true) wraps a path containing a non-ASCII byte in double quotes
+// with C-style octal escapes (café.txt -> "caf\303\251.txt"), and,
+// completely independently, git always appends a bare trailing tab after a
+// "---"/"+++ " path that merely *contains a space*.
+
+const unicodeAddDiff = "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n" +
+	"new file mode 100644\n" +
+	"index 0000000..2ccb1d1\n" +
+	"--- /dev/null\n" +
+	"+++ \"b/caf\\303\\251.txt\"\n" +
+	"@@ -0,0 +1 @@\n" +
+	"+hello cafe accent\n"
+
+func TestParseDecodesQuotedOctalEscapedUnicodePath(t *testing.T) {
+	files := Parse(unicodeAddDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+	if f.Path != "café.txt" {
+		t.Errorf("path = %q, want %q", f.Path, "café.txt")
+	}
+	if f.Status != model.FileAdded {
+		t.Errorf("status = %q, want added", f.Status)
+	}
+}
+
+const spacedModifyDiff = "diff --git a/file with space.txt b/file with space.txt\n" +
+	"index df967b9..acc0f1b 100644\n" +
+	"--- a/file with space.txt\t\n" +
+	"+++ b/file with space.txt\t\n" +
+	"@@ -1 +1,2 @@\n" +
+	" base\n" +
+	"+edited\n"
+
+func TestParseTrimsTrailingTabForSpacedPath(t *testing.T) {
+	files := Parse(spacedModifyDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+	if f.Path != "file with space.txt" {
+		t.Errorf("path = %q, want %q (no trailing tab)", f.Path, "file with space.txt")
+	}
+	if f.OldPath != "file with space.txt" {
+		t.Errorf(`oldPath = %q, want %q (sourced from the "--- " line, not the ambiguous "diff --git" split)`, f.OldPath, "file with space.txt")
+	}
+	if f.OldBlob != "df967b9" || f.NewBlob != "acc0f1b" {
+		t.Errorf("blobs = %q..%q, want df967b9..acc0f1b", f.OldBlob, f.NewBlob)
+	}
+}
+
+const spacedUnicodeModifyDiff = "diff --git \"a/space caf\\303\\251.txt\" \"b/space caf\\303\\251.txt\"\n" +
+	"index 587be6b..b77b4eb 100644\n" +
+	"--- \"a/space caf\\303\\251.txt\"\t\n" +
+	"+++ \"b/space caf\\303\\251.txt\"\t\n" +
+	"@@ -1 +1,2 @@\n" +
+	" x\n" +
+	"+y\n"
+
+func TestParseDecodesQuotedPathWithBothSpaceAndUnicodeAndTrailingTab(t *testing.T) {
+	files := Parse(spacedUnicodeModifyDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+	const want = "space café.txt"
+	if f.Path != want {
+		t.Errorf("path = %q, want %q", f.Path, want)
+	}
+	if f.OldPath != want {
+		t.Errorf("oldPath = %q, want %q", f.OldPath, want)
+	}
+}
+
+const deletedSpacedDiff = "diff --git a/new name with space.txt b/new name with space.txt\n" +
+	"deleted file mode 100644\n" +
+	"index 83db48f..0000000\n" +
+	"--- a/new name with space.txt\t\n" +
+	"+++ /dev/null\n" +
+	"@@ -1,3 +0,0 @@\n" +
+	"-line1\n" +
+	"-line2\n" +
+	"-line3\n"
+
+// TestParseSetsPathFromDashLineForDeletedSpacedFile: for a deleted file,
+// model.DiffFile.Path holds the *old* path (there is no "+++" real path to
+// set it, per model.go's doc comment) — it must come from "--- ", not the
+// ambiguous two-paths-on-one-line "diff --git" split, which mangles it for
+// any space-containing name.
+func TestParseSetsPathFromDashLineForDeletedSpacedFile(t *testing.T) {
+	f := Parse(deletedSpacedDiff)[0]
+	if f.Status != model.FileDeleted {
+		t.Errorf("status = %q, want deleted", f.Status)
+	}
+	const want = "new name with space.txt"
+	if f.Path != want {
+		t.Errorf("path = %q, want %q", f.Path, want)
+	}
+}
+
+const renamedUnicodeDiff = "diff --git a/plain.txt \"b/ren\\303\\241med.txt\"\n" +
+	"similarity index 100%\n" +
+	"rename from plain.txt\n" +
+	"rename to \"ren\\303\\241med.txt\"\n"
+
+func TestParseDecodesQuotedUnicodeRenameToPath(t *testing.T) {
+	f := Parse(renamedUnicodeDiff)[0]
+	if f.Status != model.FileRenamed {
+		t.Errorf("status = %q, want renamed", f.Status)
+	}
+	if f.OldPath != "plain.txt" {
+		t.Errorf("oldPath = %q, want plain.txt", f.OldPath)
+	}
+	const want = "renámed.txt"
+	if f.Path != want {
+		t.Errorf("path = %q, want %q", f.Path, want)
+	}
+}
+
+const binaryModifyDiff = "diff --git a/a.bin b/a.bin\n" +
+	"index a04f2ac..89e1de6 100644\n" +
+	"Binary files a/a.bin and b/a.bin differ\n"
+
+// TestParseIndexLineExtractsBlobsForBinaryModify is the parsing half of
+// DEFECT/FIX B1: a binary file's diff never has hunks, so OldBlob/NewBlob are
+// the only signal left that its content actually changed.
+func TestParseIndexLineExtractsBlobsForBinaryModify(t *testing.T) {
+	f := Parse(binaryModifyDiff)[0]
+	if !f.Binary {
+		t.Fatalf("expected binary file: %+v", f)
+	}
+	if f.OldBlob != "a04f2ac" || f.NewBlob != "89e1de6" {
+		t.Errorf("blobs = %q..%q, want a04f2ac..89e1de6", f.OldBlob, f.NewBlob)
+	}
+	if len(f.Hunks) != 0 {
+		t.Errorf("binary file should have zero hunks, got %d", len(f.Hunks))
+	}
+}
+
+const modeChangeIndexLineHasNoModeSuffixDiff = "diff --git a/file with space.txt b/file with space.txt\n" +
+	"old mode 100644\n" +
+	"new mode 100755\n" +
+	"index df967b9..acc0f1b\n" +
+	"--- a/file with space.txt\t\n" +
+	"+++ b/file with space.txt\t\n" +
+	"@@ -1 +1,2 @@\n" +
+	" base\n" +
+	"+edited\n"
+
+// TestParseIndexLineWithoutModeSuffixStillExtractsBlobs: git omits the
+// trailing mode on the "index" line whenever the file's mode also changed
+// (carried instead by separate "old mode"/"new mode" lines) — the blobs must
+// still parse.
+func TestParseIndexLineWithoutModeSuffixStillExtractsBlobs(t *testing.T) {
+	f := Parse(modeChangeIndexLineHasNoModeSuffixDiff)[0]
+	if f.OldBlob != "df967b9" || f.NewBlob != "acc0f1b" {
+		t.Errorf("blobs = %q..%q, want df967b9..acc0f1b", f.OldBlob, f.NewBlob)
+	}
+}
+
+const pureRenameNoIndexLineDiff = "diff --git a/a.bin b/b.bin\n" +
+	"similarity index 100%\n" +
+	"rename from a.bin\n" +
+	"rename to b.bin\n"
+
+// TestParseNoIndexLineForPureRenameLeavesBlobsEmpty: git omits the "index"
+// line entirely for a pure (100%-similarity) rename — the defensive case B1
+// calls out explicitly. Nothing should panic, and the blobs just stay "".
+func TestParseNoIndexLineForPureRenameLeavesBlobsEmpty(t *testing.T) {
+	f := Parse(pureRenameNoIndexLineDiff)[0]
+	if f.Status != model.FileRenamed || f.OldPath != "a.bin" || f.Path != "b.bin" {
+		t.Errorf("rename parsed wrong: %+v", f)
+	}
+	if f.OldBlob != "" || f.NewBlob != "" {
+		t.Errorf("a pure (100%%-similarity) rename has no index line; blobs should stay empty, got %q..%q", f.OldBlob, f.NewBlob)
+	}
+	if len(f.Hunks) != 0 {
+		t.Errorf("pure rename should have zero hunks, got %d", len(f.Hunks))
+	}
+}

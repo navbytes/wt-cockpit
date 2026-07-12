@@ -186,7 +186,21 @@ type ApproveResult struct {
 // worktree's branch into the base branch (in whichever worktree has base checked
 // out) and removes the worktree. If the merge fails it is aborted, leaving base
 // untouched, and the error is returned — nothing is removed.
+//
+// Approve holds refreshMu for its entire duration (FIX M1): it never trusts a
+// possibly-stale cache entry — a commit-after-review landing in the window
+// before the next poll/fsnotify-debounced refresh must not slip past the
+// review gate — so it re-diffs the worktree fresh first, via the same locked
+// helper RefreshOne uses, and evaluates every gate against that fresh diff.
+// Holding the lock through the merge/cache mutations at the end also closes
+// the second half of M1: a concurrent Refresh/RefreshOne can no longer race
+// in and resurrect the worktree this call just merged and removed.
 func (e *Engine) Approve(id string) (ApproveResult, error) {
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+
+	e.refreshOneLocked(id)
+
 	e.mu.RLock()
 	m, ok := e.cache[id]
 	e.mu.RUnlock()
@@ -282,16 +296,25 @@ func (e *Engine) RefreshOne(ctx context.Context, worktreePath string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	e.refreshOneLocked(id)
+	return nil
+}
 
-	// Re-check under refreshMu: a concurrent Refresh may have removed this
-	// worktree (it holds refreshMu for its whole scan) while we waited for the
-	// lock. If so, that scan already published the removal — nothing to do,
-	// and resurrecting it here would race the removal.
+// refreshOneLocked re-diffs the cached worktree identified by id in place.
+// Callers must already hold refreshMu — it exists so both RefreshOne (the
+// watcher's targeted-refresh path) and Approve (which must never gate on a
+// possibly-stale cache entry, per FIX M1) can re-diff a single worktree
+// without racing a concurrent Refresh/RefreshOne for the same id. Reports
+// whether the worktree was (still) cached; there is nothing to refresh if a
+// concurrent Refresh removed it — it holds refreshMu for its whole scan, so
+// that removal is already published, and resurrecting the entry here would
+// race it.
+func (e *Engine) refreshOneLocked(id string) bool {
 	e.mu.RLock()
 	prev, ok := e.cache[id]
 	e.mu.RUnlock()
 	if !ok {
-		return nil
+		return false
 	}
 
 	branch, err := e.be.CurrentBranch(prev.path)
@@ -301,7 +324,7 @@ func (e *Engine) RefreshOne(ctx context.Context, worktreePath string) error {
 	repo := model.Repo{Name: prev.repo, Path: prev.repoPath}
 	ref := gitbackend.WorktreeRef{Path: prev.path, Branch: branch}
 	e.refreshWorktree(repo, ref, prev.base, id)
-	return nil
+	return true
 }
 
 // Refresh performs a full scan: discover repos, expand worktrees, and for any whose
@@ -521,16 +544,25 @@ func hashString(s string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// fileHash computes a per-file diff identity: sha1 over the file's path, status,
-// and every hunk line (kind + content). Unlike the whole-diff hash it is
-// unaffected by any other file changing, and — because it doesn't include hunk
-// start line numbers — by unrelated shifts elsewhere in the same file's hunks;
-// it only moves when this file's own content actually changes.
+// fileHash computes a per-file diff identity: sha1 over the file's path,
+// status, old/new blob object ids (from the diff's "index a..b" line, when
+// git provided one), and every hunk line (kind + content). The blob ids are
+// what make this safe for files with zero hunks: a binary diff (or a
+// 100%-similarity rename) never renders hunks, so hunk lines alone would
+// leave the hash pinned to path+status no matter how much the bytes changed
+// — see DEFECT/FIX B1. Unlike the whole-diff hash it is unaffected by any
+// other file changing, and — because it doesn't include hunk start line
+// numbers — by unrelated shifts elsewhere in the same file's hunks; it only
+// moves when this file's own content actually changes.
 func fileHash(f model.DiffFile) string {
 	var b strings.Builder
 	b.WriteString(f.Path)
 	b.WriteByte('\n')
 	b.WriteString(string(f.Status))
+	b.WriteByte('\n')
+	b.WriteString(f.OldBlob)
+	b.WriteByte('\n')
+	b.WriteString(f.NewBlob)
 	b.WriteByte('\n')
 	for _, h := range f.Hunks {
 		for _, l := range h.Lines {
