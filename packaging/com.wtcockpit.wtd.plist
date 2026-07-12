@@ -15,8 +15,13 @@
 
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- Restart only on failure (mirrors the systemd unit's Restart=on-failure);
+	     plain <true/> would also respawn a cleanly-exiting or misconfigured wtd forever. -->
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 
 	<!-- launchd does not expand "~" — replace YOUR_USER with your actual home
 	     directory before loading this plist (see packaging/README.md). -->
