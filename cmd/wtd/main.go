@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -151,16 +152,23 @@ func (s *server) handleReview(w http.ResponseWriter, r *http.Request) {
 		ID       string `json:"id"`
 		File     string `json:"file"`
 		Reviewed bool   `json:"reviewed"`
+		Hash     string `json:"hash"` // optional: the file hash the caller last viewed
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.eng.SetReviewed(req.ID, req.File, req.Reviewed); err != nil {
+	err := s.eng.SetReviewed(req.ID, req.File, req.Reviewed, req.Hash)
+	switch {
+	case err == nil:
+		writeJSON(w, map[string]bool{"ok": true})
+	case errors.Is(err, engine.ErrFileChanged):
+		http.Error(w, "file changed since viewed: "+err.Error(), http.StatusConflict)
+	case errors.Is(err, engine.ErrFileNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *server) handleApprove(w http.ResponseWriter, r *http.Request) {

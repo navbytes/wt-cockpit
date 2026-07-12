@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,6 +81,15 @@ func findByBranch(list []model.Worktree, branch string) *model.Worktree {
 	return nil
 }
 
+func findFile(files []model.DiffFile, path string) *model.DiffFile {
+	for i := range files {
+		if files[i].Path == path {
+			return &files[i]
+		}
+	}
+	return nil
+}
+
 func TestRefreshPopulatesWorktreeWithStatsAndGuardrails(t *testing.T) {
 	root := buildWorkspace(t)
 	e := newEngine(t, root)
@@ -136,6 +146,9 @@ func TestDiffReturnsStructuredFiles(t *testing.T) {
 	for _, f := range d.Files {
 		if f.Path == "new.go" && f.Status == model.FileAdded {
 			sawNew = true
+			if f.Hash == "" {
+				t.Error("new.go should have a non-empty per-file hash")
+			}
 		}
 	}
 	if !sawNew {
@@ -149,7 +162,7 @@ func TestSetReviewedUpdatesCount(t *testing.T) {
 	e.Refresh(context.Background())
 	feat := findByBranch(e.List(), "feature")
 
-	if err := e.SetReviewed(feat.ID, "new.go", true); err != nil {
+	if err := e.SetReviewed(feat.ID, "new.go", true, ""); err != nil {
 		t.Fatal(err)
 	}
 	got := findByBranch(e.List(), "feature")
@@ -178,21 +191,102 @@ func TestRefreshDetectsRemovedWorktree(t *testing.T) {
 	}
 }
 
-func TestReviewResetsWhenDiffChanges(t *testing.T) {
+// TestReviewSurvivesUnrelatedFileEdit replaces the old
+// TestReviewResetsWhenDiffChanges: under per-file review identity, editing a
+// file that was never reviewed must not touch another file's review state (the
+// old behaviour cleared ALL reviews whenever the whole-diff hash moved).
+func TestReviewSurvivesUnrelatedFileEdit(t *testing.T) {
 	root := buildWorkspace(t)
 	e := newEngine(t, root)
 	e.Refresh(context.Background())
 	feat := findByBranch(e.List(), "feature")
-	e.SetReviewed(feat.ID, "new.go", true)
+	d, _ := e.Diff(feat.ID)
+	newFile := findFile(d.Files, "new.go")
+	if newFile == nil {
+		t.Fatal("precondition: new.go must be in the diff")
+	}
+	if err := e.SetReviewed(feat.ID, "new.go", true, newFile.Hash); err != nil {
+		t.Fatal(err)
+	}
 
-	// Change the diff: edit app.go further in the worktree.
+	// Change a different file's diff: edit app.go further in the worktree.
 	wt := filepath.Join(root, "api-server-feature")
 	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc A() {}\nfunc B() {}\nfunc D() {}\n"), 0o644)
 	e.Refresh(context.Background())
 
 	got := findByBranch(e.List(), "feature")
-	if got.Reviewed != 0 {
-		t.Errorf("review state should reset when the diff changes, got reviewed=%d", got.Reviewed)
+	if got.Reviewed != 1 {
+		t.Errorf("reviewing new.go must survive an unrelated edit to app.go, got reviewed=%d", got.Reviewed)
+	}
+}
+
+// TestEditingOneFileUnreviewsOnlyThatFile is AC2: review two files, edit one of
+// them, and only the edited file should flip back to unreviewed.
+func TestEditingOneFileUnreviewsOnlyThatFile(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	if len(d.Files) < 2 {
+		t.Fatalf("precondition: need >=2 files, got %d", len(d.Files))
+	}
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatalf("review %s: %v", f.Path, err)
+		}
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != len(d.Files) {
+		t.Fatalf("precondition: reviewed = %d, want all %d files reviewed", got, len(d.Files))
+	}
+
+	// Edit app.go only.
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc A() {}\nfunc B() {}\nfunc D() {}\n"), 0o644)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rev, err := e.st.ReviewedFiles(feat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := e.Diff(feat.ID)
+	for _, f := range d2.Files {
+		wantReviewed := f.Path != "app.go"
+		gotReviewed := rev[f.Path] == f.Hash
+		if gotReviewed != wantReviewed {
+			t.Errorf("file %s: reviewed=%v, want %v", f.Path, gotReviewed, wantReviewed)
+		}
+	}
+}
+
+func TestSetReviewedRejectsStaleExpectedHash(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	err := e.SetReviewed(feat.ID, "new.go", true, "not-the-real-hash")
+	if !errors.Is(err, ErrFileChanged) {
+		t.Errorf("expected ErrFileChanged, got %v", err)
+	}
+	// The stale attempt must not have recorded anything.
+	rev, _ := e.st.ReviewedFiles(feat.ID)
+	if _, ok := rev["new.go"]; ok {
+		t.Errorf("a rejected review must not be recorded, got %+v", rev)
+	}
+}
+
+func TestSetReviewedRejectsUnknownFile(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	if err := e.SetReviewed(feat.ID, "does-not-exist.go", true, ""); !errors.Is(err, ErrFileNotFound) {
+		t.Errorf("expected ErrFileNotFound, got %v", err)
 	}
 }
 
@@ -207,8 +301,42 @@ func testGitEnv() []string {
 // be merged (the approve path requires a clean, committed worktree).
 func commitWorktree(t *testing.T, root string) {
 	wt := filepath.Join(root, "api-server-feature")
-	git(t, wt, "add", ".")
+	git(t, wt, "add", "-A")
 	git(t, wt, "commit", "-q", "-m", "feature work")
+}
+
+// TestReviewSurvivesCommit is the headline case this task exists for: review
+// every file, commit the worktree, refresh — every file must still be reviewed
+// and approve must proceed. Under the old whole-diff-hash reset, committing
+// (review → commit → everything resets) broke this.
+func TestReviewSurvivesCommit(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatalf("review %s: %v", f.Path, err)
+		}
+	}
+	if got := findByBranch(e.List(), "feature").Reviewed; got != len(d.Files) {
+		t.Fatalf("precondition: reviewed = %d before commit, want %d", got, len(d.Files))
+	}
+
+	commitWorktree(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	feat2 := findByBranch(e.List(), "feature")
+	if feat2.Reviewed != len(d.Files) {
+		t.Errorf("reviewed = %d after commit, want %d (commit must not reset review)", feat2.Reviewed, len(d.Files))
+	}
+	if _, err := e.Approve(feat2.ID); err != nil {
+		t.Fatalf("approve should proceed after commit+refresh, got: %v", err)
+	}
 }
 
 func TestApproveRequiresFullReview(t *testing.T) {
@@ -228,7 +356,7 @@ func TestApproveRequiresFullReview(t *testing.T) {
 	// Review every file, then approve.
 	d, _ := e.Diff(feat.ID)
 	for _, f := range d.Files {
-		if err := e.SetReviewed(feat.ID, f.Path, true); err != nil {
+		if err := e.SetReviewed(feat.ID, f.Path, true, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -261,7 +389,7 @@ func TestApproveRequiresCleanWorktree(t *testing.T) {
 	// Review everything so only the cleanliness gate can block.
 	d, _ := e.Diff(feat.ID)
 	for _, f := range d.Files {
-		e.SetReviewed(feat.ID, f.Path, true)
+		e.SetReviewed(feat.ID, f.Path, true, "")
 	}
 	_, err := e.Approve(feat.ID)
 	if err == nil {
@@ -269,5 +397,39 @@ func TestApproveRequiresCleanWorktree(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "uncommitted") {
 		t.Errorf("error should mention uncommitted changes, got: %v", err)
+	}
+}
+
+// TestApproveBlockedOnStaleReviewHash is AC3's stale-review case: a file is
+// reviewed, then edited again (and re-committed, so only the review gate is in
+// play) — approve must refuse because the stored hash no longer matches.
+func TestApproveBlockedOnStaleReviewHash(t *testing.T) {
+	root := buildWorkspace(t)
+	commitWorktree(t, root)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Edit app.go again after review, then commit — worktree stays clean, but
+	// app.go's stored review hash is now stale.
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc A() {}\nfunc B() {}\nfunc D() {}\n"), 0o644)
+	commitWorktree(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat = findByBranch(e.List(), "feature")
+
+	if _, err := e.Approve(feat.ID); err == nil {
+		t.Fatal("approve should refuse when a reviewed file's hash is stale")
+	} else if !strings.Contains(err.Error(), "review") {
+		t.Errorf("error should mention review, got: %v", err)
 	}
 }
