@@ -191,6 +191,61 @@ func TestRefreshDetectsRemovedWorktree(t *testing.T) {
 	}
 }
 
+// TestRefreshOneUpdatesOnlyTargetWorktree is the targeted-refresh contract the
+// fsnotify watcher relies on: a path hint must re-diff only that worktree,
+// leaving every other worktree's cached state untouched.
+func TestRefreshOneUpdatesOnlyTargetWorktree(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	feat := findByBranch(e.List(), "feature")
+	main := findByBranch(e.List(), "main")
+	if feat == nil || main == nil {
+		t.Fatalf("precondition: need both main and feature worktrees, got %+v", e.List())
+	}
+
+	// Edit the feature worktree further so its diff (and hash) must change.
+	wt := filepath.Join(root, "api-server-feature")
+	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc A() {}\nfunc B() {}\nfunc D() {}\n"), 0o644)
+
+	if err := e.RefreshOne(context.Background(), wt); err != nil {
+		t.Fatal(err)
+	}
+
+	feat2 := findByBranch(e.List(), "feature")
+	main2 := findByBranch(e.List(), "main")
+	if feat2.DiffHash == feat.DiffHash {
+		t.Errorf("RefreshOne did not pick up the edit: diff hash unchanged (%s)", feat2.DiffHash)
+	}
+	if !main2.LastChange.Equal(main.LastChange) {
+		t.Errorf("RefreshOne touched the unrelated main worktree: lastChange %v -> %v", main.LastChange, main2.LastChange)
+	}
+	if main2.DiffHash != main.DiffHash {
+		t.Errorf("RefreshOne touched the unrelated main worktree's diff hash: %s -> %s", main.DiffHash, main2.DiffHash)
+	}
+}
+
+// TestRefreshOneFallsBackForUnknownPath covers the "unknown path" branch: if
+// the engine has no cached worktree for the given path (e.g. Refresh has never
+// run yet), RefreshOne must fall back to a full Refresh rather than silently
+// doing nothing.
+func TestRefreshOneFallsBackForUnknownPath(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+
+	wt := filepath.Join(root, "api-server-feature")
+	if err := e.RefreshOne(context.Background(), wt); err != nil {
+		t.Fatal(err)
+	}
+
+	if findByBranch(e.List(), "feature") == nil {
+		t.Errorf("RefreshOne on an unknown path should fall back to a full Refresh, got %+v", e.List())
+	}
+}
+
 // TestReviewSurvivesUnrelatedFileEdit replaces the old
 // TestReviewResetsWhenDiffChanges: under per-file review identity, editing a
 // file that was never reviewed must not touch another file's review state (the
