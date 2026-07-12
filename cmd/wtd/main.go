@@ -51,7 +51,8 @@ func main() {
 	tcp := flag.String("tcp", "", "optional TCP address to also listen on (e.g. 127.0.0.1:7799)")
 	statePath := flag.String("state", filepath.Join(dataDir, "state.json"), "review state file")
 	base := flag.String("base", "", "diff baseline branch (default: each repo's own default)")
-	interval := flag.Duration("interval", 2*time.Second, "poll interval")
+	interval := flag.Duration("interval", 2*time.Second, "poll interval (also governs the fsnotify reconciliation tick)")
+	watchMode := flag.String("watch", "fsnotify", "watcher backend: fsnotify (default) or poll")
 	flag.Parse()
 
 	if len(roots) == 0 {
@@ -67,18 +68,35 @@ func main() {
 	}
 	reg := registry.New()
 	gr := guardrail.New(guardrail.DefaultRules())
+	be := gitbackend.NewCLI()
 	eng := engine.New(engine.Config{
 		Roots:          roots,
 		DefaultBase:    *base,
 		ActivityWindow: 30 * time.Second,
-	}, gitbackend.NewCLI(), reg, st, gr)
+	}, be, reg, st, gr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Watcher drives refreshes; swap the Poller for an fsnotify watcher later.
-	go (&watcher.Poller{Interval: *interval}).Run(ctx, func(string) {
-		if err := eng.Refresh(ctx); err != nil && ctx.Err() == nil {
+	// Watcher drives refreshes. fsnotify is git-state-first and default; -watch
+	// poll keeps the old fixed-interval fallback (e.g. for flaky network mounts).
+	var wch watcher.Watcher
+	switch *watchMode {
+	case "fsnotify":
+		wch = &watcher.FSWatcher{Roots: roots, Interval: *interval, Backend: be}
+	case "poll":
+		wch = &watcher.Poller{Interval: *interval}
+	default:
+		log.Fatalf("unknown -watch value %q (want fsnotify or poll)", *watchMode)
+	}
+	go wch.Run(ctx, func(path string) {
+		var err error
+		if path == "" {
+			err = eng.Refresh(ctx)
+		} else {
+			err = eng.RefreshOne(ctx, path)
+		}
+		if err != nil && ctx.Err() == nil {
 			log.Printf("refresh: %v", err)
 		}
 	})

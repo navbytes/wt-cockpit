@@ -14,8 +14,10 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
-// skipDirs are never descended into during discovery.
-var skipDirs = map[string]bool{
+// SkipDirs are never descended into during discovery. Exported so other
+// filesystem walkers (notably the fsnotify watcher) apply the exact same
+// skip-list instead of duplicating it.
+var SkipDirs = map[string]bool{
 	"node_modules": true, "vendor": true, "target": true, "dist": true,
 	"build": true, ".venv": true, "venv": true, "__pycache__": true,
 	".next": true, ".cache": true, ".terraform": true,
@@ -72,7 +74,7 @@ func walk(dir, root string, maxDepth int, onRepo func(string)) error {
 			continue
 		}
 		name := e.Name()
-		if skipDirs[name] || (len(name) > 1 && name[0] == '.') {
+		if SkipDirs[name] || (len(name) > 1 && name[0] == '.') {
 			continue
 		}
 		child := filepath.Join(dir, name)

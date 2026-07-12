@@ -256,6 +256,53 @@ func (e *Engine) Approve(id string) (ApproveResult, error) {
 	return ApproveResult{WorktreeID: id, Merged: m.branch, Into: m.base, Removed: m.path}, nil
 }
 
+// RefreshOne re-diffs a single worktree identified by its filesystem path — the
+// targeted counterpart to Refresh, so a change hint from the watcher doesn't
+// force a full rescan of every repo under every root. worktreePath is looked up
+// the same way Refresh derives ids (worktreeID), so it must be the same path
+// the engine already knows the worktree by. An unknown path (not yet cached —
+// e.g. a brand new worktree the watcher hasn't reconciled into a full Refresh
+// yet) falls back to a full Refresh.
+//
+// ponytail: refresh stays serialized (refreshMu, shared with Refresh); a
+// GOMAXPROCS re-diff pool is only worth it once many hot worktrees measurably
+// lag under one-at-a-time refreshes.
+func (e *Engine) RefreshOne(ctx context.Context, worktreePath string) error {
+	id := worktreeID(worktreePath)
+	e.mu.RLock()
+	_, ok := e.cache[id]
+	e.mu.RUnlock()
+	if !ok {
+		return e.Refresh(ctx)
+	}
+
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Re-check under refreshMu: a concurrent Refresh may have removed this
+	// worktree (it holds refreshMu for its whole scan) while we waited for the
+	// lock. If so, that scan already published the removal — nothing to do,
+	// and resurrecting it here would race the removal.
+	e.mu.RLock()
+	prev, ok := e.cache[id]
+	e.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	branch, err := e.be.CurrentBranch(prev.path)
+	if err != nil {
+		branch = prev.branch // worktree may be mid-operation; keep the last known branch
+	}
+	repo := model.Repo{Name: prev.repo, Path: prev.repoPath}
+	ref := gitbackend.WorktreeRef{Path: prev.path, Branch: branch}
+	e.refreshWorktree(repo, ref, prev.base, id)
+	return nil
+}
+
 // Refresh performs a full scan: discover repos, expand worktrees, and for any whose
 // git state changed, recompute the diff, guardrails and stats. It is safe to call
 // concurrently — scans are serialised.
