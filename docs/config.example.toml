@@ -1,0 +1,46 @@
+# Example wtd config file.
+#
+# Default location: $XDG_CONFIG_HOME/wtcockpit/config.toml, falling back to
+# ~/.config/wtcockpit/config.toml. Override with `wtd -config /path/to/file`.
+#
+# Precedence: explicit command-line flags > this file > wtd's built-in
+# defaults. A flag you actually pass on the command line always wins; a value
+# you leave unset here falls back to wtd's built-in default.
+#
+# Every key below is optional — an absent file, or an absent key within it,
+# means "use the built-in default" for that setting. Unknown/misspelled keys
+# are a hard error at load time (better than a guardrail rule silently never
+# firing because of a typo).
+
+# Root directories to scan for repos. Repeats the effect of one or more
+# `-root` flags. An explicit `-root` on the command line replaces this list
+# entirely rather than merging with it.
+roots = ["~/code", "~/work"]
+
+# Default diff baseline branch for every repo, used when a repo has no
+# per-repo override below and wtd can't otherwise detect its default branch.
+base = "main"
+
+# Daemon options — same meaning as their same-named flags. Unlike `roots`,
+# these are used as-is (no "~" expansion), so spell out the full path.
+socket = "/Users/nav/.wtcockpit/wtd.sock"
+tcp = ""                 # e.g. "127.0.0.1:7799" to also listen on TCP
+state = "/Users/nav/.wtcockpit/state.json"
+interval = "2s"          # poll interval / fsnotify reconciliation tick
+watch = "fsnotify"       # "fsnotify" (default) or "poll"
+
+# Per-repo base branch override. Key is the repo's absolute path; only repos
+# that need something other than the global `base` above need an entry.
+[repos."/Users/nav/code/api-server"]
+base = "develop"
+
+# Guardrail rules. If this section is present at all — even with a single
+# rule, as here — it REPLACES the built-in default rule set entirely (an
+# append-only scheme would make the defaults un-disableable). Omit [[rules]]
+# altogether to keep the built-in defaults. Fields match guardrail.Rule; the
+# one below is copied straight from the built-in defaults.
+[[rules]]
+name = "touches-migrations"
+severity = "danger"          # "warn" | "danger"
+message = "touches database migrations"
+path_glob = "**/migrations/**"

@@ -345,6 +345,103 @@ func TestSetReviewedRejectsUnknownFile(t *testing.T) {
 	}
 }
 
+// buildTwoBranchWorkspace makes a repo where "develop" has diverged from
+// "main" by one commit (develop-only.txt), and a "feature" worktree is
+// branched off "develop" with its own uncommitted addition (feature.txt).
+// It returns the workspace root and the repo's absolute path.
+func buildTwoBranchWorkspace(t *testing.T) (root, repoPath string) {
+	root = t.TempDir()
+	repoPath = filepath.Join(root, "api-server")
+	os.MkdirAll(repoPath, 0o755)
+	git(t, repoPath, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repoPath, "shared.txt"), []byte("base\n"), 0o644)
+	git(t, repoPath, "add", ".")
+	git(t, repoPath, "commit", "-q", "-m", "init")
+
+	git(t, repoPath, "branch", "develop")
+	git(t, repoPath, "checkout", "-q", "develop")
+	os.WriteFile(filepath.Join(repoPath, "develop-only.txt"), []byte("d\n"), 0o644)
+	git(t, repoPath, "add", ".")
+	git(t, repoPath, "commit", "-q", "-m", "on develop")
+	git(t, repoPath, "checkout", "-q", "main")
+
+	wt := filepath.Join(root, "api-server-feature")
+	git(t, repoPath, "worktree", "add", "-q", "-b", "feature", wt, "develop")
+	os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("f\n"), 0o644)
+	return root, repoPath
+}
+
+// TestPerRepoBaseOverridePicksCorrectMergeBase is the per-repo base plumbing
+// test: with a global default of "main" but a BaseFor override pointing this
+// one repo at "develop", the feature worktree (itself branched off develop)
+// must diff against develop's merge-base — so develop's own exclusive commit
+// (develop-only.txt) must NOT show up as part of feature's diff, only
+// feature's own change should. Without the override (global "main" only),
+// the same worktree's diff against main *does* include develop-only.txt,
+// proving the override is what changed the outcome.
+func TestPerRepoBaseOverridePicksCorrectMergeBase(t *testing.T) {
+	root, repoPath := buildTwoBranchWorkspace(t)
+
+	reg := registry.New()
+	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := gitbackend.NewCLIWithEnv(testGitEnv())
+	gr := guardrail.New(guardrail.DefaultRules())
+
+	// Baseline: no per-repo override, global base "main".
+	eNoOverride := New(Config{
+		Roots:          []string{root},
+		MaxDepth:       4,
+		DefaultBase:    "main",
+		ActivityWindow: 30 * time.Second,
+	}, be, reg, st, gr)
+	if err := eNoOverride.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(eNoOverride.List(), "feature")
+	if feat == nil {
+		t.Fatalf("feature worktree not tracked; got %+v", eNoOverride.List())
+	}
+	d, _ := eNoOverride.Diff(feat.ID)
+	if findFile(d.Files, "develop-only.txt") == nil {
+		t.Fatalf("precondition: diffing against main should include develop-only.txt, got %+v", d.Files)
+	}
+
+	// With the override: same workspace, fresh engine/registry/store so caches
+	// don't leak between the two assertions.
+	reg2 := registry.New()
+	st2, err := store.OpenJSON(filepath.Join(t.TempDir(), "state2.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eOverride := New(Config{
+		Roots:          []string{root},
+		MaxDepth:       4,
+		DefaultBase:    "main",
+		BaseFor:        map[string]string{repoPath: "develop"},
+		ActivityWindow: 30 * time.Second,
+	}, be, reg2, st2, gr)
+	if err := eOverride.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat2 := findByBranch(eOverride.List(), "feature")
+	if feat2 == nil {
+		t.Fatalf("feature worktree not tracked; got %+v", eOverride.List())
+	}
+	if feat2.Base != "develop" {
+		t.Errorf("Base = %q, want develop (per-repo override)", feat2.Base)
+	}
+	d2, _ := eOverride.Diff(feat2.ID)
+	if findFile(d2.Files, "develop-only.txt") != nil {
+		t.Errorf("diff against develop base should not include develop's own file: %+v", d2.Files)
+	}
+	if findFile(d2.Files, "feature.txt") == nil {
+		t.Errorf("expected feature.txt in diff: %+v", d2.Files)
+	}
+}
+
 func testGitEnv() []string {
 	return append(os.Environ(),
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",

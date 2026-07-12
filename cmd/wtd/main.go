@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/navbytes/wt-cockpit/internal/config"
 	"github.com/navbytes/wt-cockpit/internal/engine"
 	"github.com/navbytes/wt-cockpit/internal/gitbackend"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
@@ -53,7 +54,34 @@ func main() {
 	base := flag.String("base", "", "diff baseline branch (default: each repo's own default)")
 	interval := flag.Duration("interval", 2*time.Second, "poll interval (also governs the fsnotify reconciliation tick)")
 	watchMode := flag.String("watch", "fsnotify", "watcher backend: fsnotify (default) or poll")
+	configPath := flag.String("config", config.DefaultPath(), "path to config.toml (roots, base, guardrails, daemon options)")
 	flag.Parse()
+
+	// Precedence is explicit flags > config file > the built-in defaults set
+	// above. flag.Visit only calls back for flags the user actually passed, so
+	// it's how we tell "explicit -base main" apart from "-base defaulted to ''".
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	// -config was explicitly requested: unlike the conventional default path, a
+	// missing or invalid file here is fatal — the user asked for this file.
+	if explicit["config"] {
+		if _, statErr := os.Stat(*configPath); statErr != nil {
+			log.Fatalf("-config %s: %v", *configPath, statErr)
+		}
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config %s: %v", *configPath, err)
+	}
+
+	roots = mergeRoots(roots, explicit["root"], cfg.Roots)
+	*base = mergeSetting(*base, explicit["base"], cfg.Base)
+	*socket = mergeSetting(*socket, explicit["socket"], cfg.Socket)
+	*tcp = mergeSetting(*tcp, explicit["tcp"], cfg.TCP)
+	*statePath = mergeSetting(*statePath, explicit["state"], cfg.State)
+	*interval = mergeSetting(*interval, explicit["interval"], cfg.Interval)
+	*watchMode = mergeSetting(*watchMode, explicit["watch"], cfg.Watch)
 
 	if len(roots) == 0 {
 		if cwd, err := os.Getwd(); err == nil {
@@ -67,11 +95,12 @@ func main() {
 		log.Fatalf("open state: %v", err)
 	}
 	reg := registry.New()
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := guardrail.New(cfg.RulesOr(guardrail.DefaultRules()))
 	be := gitbackend.NewCLI()
 	eng := engine.New(engine.Config{
 		Roots:          roots,
 		DefaultBase:    *base,
+		BaseFor:        baseFor(cfg),
 		ActivityWindow: 30 * time.Second,
 	}, be, reg, st, gr)
 
@@ -130,6 +159,50 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
 	log.Print("wtd stopped")
+}
+
+// mergeSetting resolves one setting's final value under flags > config >
+// built-in-default precedence. flagVal is the flag variable's value after
+// flag.Parse: the user's explicit value if explicit is true, otherwise
+// whatever built-in default it was registered with. cfgVal is the config
+// file's value for the same setting (""/zero means the config didn't set it).
+func mergeSetting[T comparable](flagVal T, explicit bool, cfgVal T) T {
+	if explicit {
+		return flagVal
+	}
+	var zero T
+	if cfgVal != zero {
+		return cfgVal
+	}
+	return flagVal
+}
+
+// mergeRoots applies the same flags > config > built-in-default precedence
+// for -root, except an explicit -root *replaces* config roots entirely rather
+// than merging with them — no surprise unions of CLI and config roots.
+func mergeRoots(flagVal []string, explicit bool, cfgVal []string) []string {
+	if explicit {
+		return flagVal
+	}
+	if len(cfgVal) > 0 {
+		return cfgVal
+	}
+	return flagVal
+}
+
+// baseFor builds the engine's per-repo base-branch override map from the
+// config's [repos."<path>"] tables, dropping entries that don't set a base.
+func baseFor(cfg config.Config) map[string]string {
+	if len(cfg.Repos) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(cfg.Repos))
+	for path, rc := range cfg.Repos {
+		if rc.Base != "" {
+			m[filepath.Clean(path)] = rc.Base
+		}
+	}
+	return m
 }
 
 type server struct{ eng *engine.Engine }
