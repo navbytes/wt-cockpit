@@ -6,8 +6,8 @@ BIN := bin
 all: lint test build
 
 build:
-	$(GO) build -o $(BIN)/wtd ./cmd/wtd
-	$(GO) build -o $(BIN)/wt ./cmd/wt
+	$(GO) build -ldflags "-X main.version=$$(git describe --tags --always --dirty)" -o $(BIN)/wtd ./cmd/wtd
+	$(GO) build -ldflags "-X main.version=$$(git describe --tags --always --dirty)" -o $(BIN)/wt ./cmd/wt
 
 test:
 	$(GO) test ./...

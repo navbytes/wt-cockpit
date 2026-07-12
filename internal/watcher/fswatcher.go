@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,7 +91,7 @@ func (w *FSWatcher) Run(ctx context.Context, onChange func(path string)) {
 
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("fswatcher: %v; falling back to polling", err)
+		slog.Warn("fswatcher: fsnotify unavailable; falling back to polling", "error", err)
 		(&Poller{Interval: interval}).Run(ctx, onChange)
 		return
 	}
@@ -149,7 +149,7 @@ func (w *FSWatcher) Run(ctx context.Context, onChange func(path string)) {
 			if !ok {
 				return
 			}
-			log.Printf("fswatcher: %v", err)
+			slog.Warn("fswatcher error", "error", err)
 		case key := <-fired:
 			if key == globalKey {
 				sess.reconcile(w.Roots, maxDepth)
@@ -265,7 +265,7 @@ func (s *fsSession) addTree(root, dir string) {
 		}
 		if s.dirCount[root] >= maxWatchedDirsPerWorktree {
 			if !s.capLogged[root] {
-				log.Printf("fswatcher: %s hit the %d watched-dir cap; relying on the reconciliation tick for the rest", root, maxWatchedDirsPerWorktree)
+				slog.Warn("fswatcher watched-dir cap hit; relying on reconciliation tick", "root", root, "cap", maxWatchedDirsPerWorktree)
 				s.capLogged[root] = true
 			}
 			return filepath.SkipDir

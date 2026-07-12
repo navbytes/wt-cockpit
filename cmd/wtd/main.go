@@ -10,12 +10,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -42,6 +44,10 @@ func (m *multiFlag) Set(v string) error {
 	return nil
 }
 
+// version is set at build time via -ldflags "-X main.version=...". "dev" is
+// the fallback for a plain `go build`/`go run`.
+var version = "dev"
+
 func main() {
 	var roots multiFlag
 	home, _ := os.UserHomeDir()
@@ -55,7 +61,15 @@ func main() {
 	interval := flag.Duration("interval", 2*time.Second, "poll interval (also governs the fsnotify reconciliation tick)")
 	watchMode := flag.String("watch", "fsnotify", "watcher backend: fsnotify (default) or poll")
 	configPath := flag.String("config", config.DefaultPath(), "path to config.toml (roots, base, guardrails, daemon options)")
+	logFormat := flag.String("log-format", "text", "log output format: text or json")
+	logLevel := flag.String("log-level", "info", "log verbosity: debug, info, warn, or error")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		printVersion(os.Stdout)
+		return
+	}
 
 	// Precedence is explicit flags > config file > the built-in defaults set
 	// above. flag.Visit only calls back for flags the user actually passed, so
@@ -67,12 +81,14 @@ func main() {
 	// missing or invalid file here is fatal — the user asked for this file.
 	if explicit["config"] {
 		if _, statErr := os.Stat(*configPath); statErr != nil {
-			log.Fatalf("-config %s: %v", *configPath, statErr)
+			slog.Error("config file not found", "path", *configPath, "error", statErr)
+			os.Exit(1)
 		}
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config %s: %v", *configPath, err)
+		slog.Error("load config failed", "path", *configPath, "error", err)
+		os.Exit(1)
 	}
 
 	roots = mergeRoots(roots, explicit["root"], cfg.Roots)
@@ -80,8 +96,29 @@ func main() {
 	*socket = mergeSetting(*socket, explicit["socket"], cfg.Socket)
 	*tcp = mergeSetting(*tcp, explicit["tcp"], cfg.TCP)
 	*statePath = mergeSetting(*statePath, explicit["state"], cfg.State)
-	*interval = clampInterval(mergeSetting(*interval, explicit["interval"], cfg.Interval))
 	*watchMode = mergeSetting(*watchMode, explicit["watch"], cfg.Watch)
+	*logFormat = mergeSetting(*logFormat, explicit["log-format"], cfg.LogFormat)
+	*logLevel = mergeSetting(*logLevel, explicit["log-level"], cfg.LogLevel)
+
+	// Unknown values are refused, same as a malformed config file: silently
+	// running at the wrong verbosity or format is worse than a restart.
+	if *logFormat != "text" && *logFormat != "json" {
+		fmt.Fprintf(os.Stderr, "wtd: invalid log-format %q (want text or json)\n", *logFormat)
+		os.Exit(1)
+	}
+	switch *logLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		fmt.Fprintf(os.Stderr, "wtd: invalid log-level %q (want debug, info, warn, or error)\n", *logLevel)
+		os.Exit(1)
+	}
+
+	// The logger must exist before clampInterval's possible warning below (and
+	// everything else in main), so it's set up as soon as the settings it
+	// itself depends on (log-format/log-level) are resolved.
+	slog.SetDefault(newLogger(*logFormat, *logLevel, os.Stderr))
+
+	*interval = clampInterval(mergeSetting(*interval, explicit["interval"], cfg.Interval))
 
 	if len(roots) == 0 {
 		if cwd, err := os.Getwd(); err == nil {
@@ -92,7 +129,8 @@ func main() {
 
 	st, err := store.OpenJSON(*statePath)
 	if err != nil {
-		log.Fatalf("open state: %v", err)
+		slog.Error("open state failed", "path", *statePath, "error", err)
+		os.Exit(1)
 	}
 	reg := registry.New()
 	gr := guardrail.New(cfg.RulesOr(guardrail.DefaultRules()))
@@ -116,7 +154,8 @@ func main() {
 	case "poll":
 		wch = &watcher.Poller{Interval: *interval}
 	default:
-		log.Fatalf("unknown -watch value %q (want fsnotify or poll)", *watchMode)
+		slog.Error("unknown -watch value", "watch", *watchMode, "want", "fsnotify or poll")
+		os.Exit(1)
 	}
 	go wch.Run(ctx, func(path string) {
 		var err error
@@ -126,21 +165,29 @@ func main() {
 			err = eng.RefreshOne(ctx, path)
 		}
 		if err != nil && ctx.Err() == nil {
-			log.Printf("refresh: %v", err)
+			slog.Error("refresh failed", "error", err)
 		}
 	})
 
-	srv := &server{eng: eng}
+	srv := &server{
+		eng:         eng,
+		socketPath:  *socket,
+		watcherMode: *watchMode,
+		roots:       roots,
+		statePath:   *statePath,
+		startedAt:   time.Now(),
+	}
 	handler := srv.routes()
 
 	// Listen on the unix socket (primary transport).
 	_ = os.Remove(*socket)
 	ln, err := net.Listen("unix", *socket)
 	if err != nil {
-		log.Fatalf("listen unix %s: %v", *socket, err)
+		slog.Error("listen unix failed", "socket", *socket, "error", err)
+		os.Exit(1)
 	}
 	defer os.Remove(*socket)
-	log.Printf("wtd listening on %s (roots: %s)", *socket, roots.String())
+	slog.Info("wtd starting", "version", version, "socket", *socket, "roots", roots.String(), "watcherMode", *watchMode, "statePath", *statePath)
 
 	httpSrv := &http.Server{Handler: handler}
 	go func() { _ = httpSrv.Serve(ln) }()
@@ -148,9 +195,10 @@ func main() {
 	if *tcp != "" {
 		tln, err := net.Listen("tcp", *tcp)
 		if err != nil {
-			log.Fatalf("listen tcp %s: %v", *tcp, err)
+			slog.Error("listen tcp failed", "tcp", *tcp, "error", err)
+			os.Exit(1)
 		}
-		log.Printf("wtd also listening on http://%s", *tcp)
+		slog.Info("wtd also listening", "tcp", *tcp)
 		go func() { _ = httpSrv.Serve(tln) }()
 	}
 
@@ -158,7 +206,50 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
-	log.Print("wtd stopped")
+	slog.Info("wtd stopped")
+}
+
+// printVersion writes the build-time version string to w. Pulled out of the
+// -version flag branch (same rationale as mergeSetting/clampInterval living
+// outside main) so the flag's actual behaviour is unit-testable without
+// exercising flag.Parse or os.Exit.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "wtd %s (%s)\n", version, runtime.Version())
+}
+
+// newLogger builds the slog.Logger wtd runs with for the rest of its life. w
+// is os.Stderr in main; taking it as a parameter (like printVersion takes an
+// io.Writer) is what makes -log-format json testable without redirecting the
+// process's real stderr. slog.SetDefault makes the result the target both for
+// slog's own top-level functions and for anything still logging via the
+// standard "log" package — including internal/watcher's warnings and any
+// future dependency that only knows about log.Print (see
+// TestSlogSetDefaultBridgesStandardLogPackage).
+func newLogger(format, level string, w io.Writer) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLogLevel(level)}
+	var h slog.Handler
+	if format == "json" {
+		h = slog.NewJSONHandler(w, opts)
+	} else {
+		h = slog.NewTextHandler(w, opts)
+	}
+	return slog.New(h)
+}
+
+// parseLogLevel maps the -log-level flag/config value to a slog.Level. An
+// unrecognised value (unreachable after main's validation) falls back to Info
+// rather than refusing to start over a logging nicety.
+func parseLogLevel(level string) slog.Level {
+	switch level {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // mergeSetting resolves one setting's final value under flags > config >
@@ -197,7 +288,7 @@ func mergeSetting[T comparable](flagVal T, explicit bool, cfgVal T) T {
 func clampInterval(d time.Duration) time.Duration {
 	const floor = time.Second
 	if d > 0 && d < floor {
-		log.Printf("interval %s is below the %s floor; using %s instead", d, floor, floor)
+		slog.Warn("interval below floor; clamping", "interval", d, "floor", floor)
 		return floor
 	}
 	return d
@@ -256,11 +347,23 @@ func expandHome(p string) string {
 	return p
 }
 
-type server struct{ eng *engine.Engine }
+// server holds everything an HTTP handler needs. socketPath/watcherMode/
+// roots/statePath/startedAt only exist for /api/status to report — main is
+// otherwise the sole owner of those settings, as resolved flags.
+type server struct {
+	eng         *engine.Engine
+	socketPath  string
+	watcherMode string
+	roots       []string
+	statePath   string
+	startedAt   time.Time
+}
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	mux.HandleFunc("/api/version", s.handleVersion)
+	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/worktrees", s.handleWorktrees)
 	mux.HandleFunc("/api/diff", s.handleDiff)
 	mux.HandleFunc("/api/review", s.handleReview)
@@ -273,6 +376,66 @@ func (s *server) routes() http.Handler {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// versionPayload is the protocol handshake body: every client checks it (GET
+// /api/version, and the SSE stream's first "hello" event) before trusting
+// anything else the daemon says. Protocol is model.ProtocolVersion — a wt
+// built from a different checkout that disagrees on it refuses to proceed.
+type versionPayload struct {
+	Protocol  int    `json:"protocol"`
+	Version   string `json:"version"`
+	GoVersion string `json:"goVersion"`
+}
+
+func currentVersion() versionPayload {
+	return versionPayload{Protocol: model.ProtocolVersion, Version: version, GoVersion: runtime.Version()}
+}
+
+func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, currentVersion())
+}
+
+// statusPayload is wt status's raw payload: a human-rendered block by
+// default, or exactly this shape with --json. Repo/worktree/file counts come
+// straight off the existing registry snapshot (s.eng.List()) — cheap, and no
+// new engine/registry accessor needed for it.
+type statusPayload struct {
+	Version       string   `json:"version"`
+	Protocol      int      `json:"protocol"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	SocketPath    string   `json:"socketPath"`
+	WatcherMode   string   `json:"watcherMode"`
+	Roots         []string `json:"roots"`
+	StatePath     string   `json:"statePath"`
+	RepoCount     int      `json:"repoCount"`
+	WorktreeCount int      `json:"worktreeCount"`
+	ReviewedFiles int      `json:"reviewedFiles"`
+	TotalFiles    int      `json:"totalFiles"`
+}
+
+func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	wts := s.eng.List()
+	repos := map[string]bool{}
+	var reviewed, total int
+	for _, wt := range wts {
+		repos[wt.Repo] = true
+		reviewed += wt.Reviewed
+		total += wt.Stats.Files
+	}
+	writeJSON(w, statusPayload{
+		Version:       version,
+		Protocol:      model.ProtocolVersion,
+		UptimeSeconds: time.Since(s.startedAt).Seconds(),
+		SocketPath:    s.socketPath,
+		WatcherMode:   s.watcherMode,
+		Roots:         s.roots,
+		StatePath:     s.statePath,
+		RepoCount:     len(repos),
+		WorktreeCount: len(wts),
+		ReviewedFiles: reviewed,
+		TotalFiles:    total,
+	})
 }
 
 func (s *server) handleWorktrees(w http.ResponseWriter, r *http.Request) {
@@ -321,7 +484,24 @@ func (s *server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Snapshot repo/file-count before Approve runs: on success it removes the
+	// worktree from the registry, so this is the last point they're available.
+	// Approve is the product's only mutation — it must leave a log trail
+	// regardless of whether the gates let it through.
+	var repo string
+	var files int
+	if pre := s.eng.Registry().Get(req.ID); pre != nil {
+		repo, files = pre.Repo, pre.Stats.Files
+	}
+
 	res, err := s.eng.Approve(req.ID)
+	outcome := "ok"
+	if err != nil {
+		outcome = "denied: " + err.Error()
+	}
+	slog.Info("AUDIT approve", "worktree", req.ID, "repo", repo, "files", files, "outcome", outcome)
+
 	if err != nil {
 		// 409 Conflict: the request was well-formed but a gate (review/clean/merge)
 		// refused it. The client prints the message verbatim.
@@ -339,7 +519,13 @@ func (s *server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-// handleEvents streams the live event bus as Server-Sent Events.
+// handleEvents streams the live event bus as Server-Sent Events. The very
+// first frame is always a named "hello" event carrying the same payload as
+// GET /api/version, ahead of the snapshot marker and the live stream (see
+// currentVersion and model.ProtocolVersion). wt's watch parser recognises and
+// skips it — it already checked the handshake via GET /api/version before
+// running any command — but this keeps the SSE stream self-describing for
+// any future client that only ever consumes it directly.
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -349,6 +535,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	sendSSEEvent(w, "hello", currentVersion())
+	flusher.Flush()
 
 	ch, cancel := s.eng.Registry().Subscribe(64)
 	defer cancel()
@@ -376,4 +565,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 func sendSSE(w http.ResponseWriter, e model.Event) {
 	b, _ := json.Marshal(e)
 	fmt.Fprintf(w, "data: %s\n\n", b)
+}
+
+// sendSSEEvent writes a *named* SSE event ("event: <name>" then "data: ..."),
+// unlike sendSSE's unnamed data-only frames — it's how the hello handshake
+// preamble distinguishes itself on the wire from an ordinary model.Event.
+func sendSSEEvent(w http.ResponseWriter, name string, v any) {
+	b, _ := json.Marshal(v)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
 }
