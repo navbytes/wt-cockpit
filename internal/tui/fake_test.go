@@ -38,6 +38,10 @@ type fakeAPI struct {
 	worktrees    []model.Worktree
 	worktreesErr error
 
+	diff    model.Diff
+	diffErr error
+	diffFn  func(ctx context.Context, id string) (model.Diff, error)
+
 	refreshErr error
 
 	// events/errs are returned as-is by Events on every call — tests that
@@ -62,8 +66,15 @@ func (f *fakeAPI) Worktrees(context.Context) ([]model.Worktree, error) {
 	return f.worktrees, f.worktreesErr
 }
 
-func (f *fakeAPI) Diff(context.Context, string) (model.Diff, error) {
-	return model.Diff{}, nil
+func (f *fakeAPI) Diff(ctx context.Context, id string) (model.Diff, error) {
+	f.mu.Lock()
+	fn := f.diffFn
+	d, err := f.diff, f.diffErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, id)
+	}
+	return d, err
 }
 
 func (f *fakeAPI) SetReviewed(context.Context, string, string, bool, string) error {

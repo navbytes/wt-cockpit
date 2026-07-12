@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -15,11 +17,18 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
+// updateGolden regenerates testdata/radar_frame.golden from the currently
+// rendered frame instead of comparing against it: `go test ./internal/tui/
+// -run TestRunRadarDiffPaneMatchesGoldenFrame -update`.
+var updateGolden = flag.Bool("update", false, "update golden files")
+
 // newTestModel builds a bare appModel for pure Update()/View() table tests —
 // no conn.go goroutine involved (connCh stays nil; nothing in these tests
-// invokes the Cmd that would block reading it).
+// invokes the Cmd that would block reading it). radar is initialized the
+// same way runProgram does it (a real highlightCache, not a nil one) since
+// WP2's Up/Down/listMsg/Enter paths all reach into it.
 func newTestModel(api apiClient) appModel {
-	return appModel{api: api, ctx: context.Background(), retryCh: make(chan struct{}, 1)}
+	return appModel{api: api, ctx: context.Background(), retryCh: make(chan struct{}, 1), radar: newRadarView()}
 }
 
 // ---- resize / min-size guard ----
@@ -146,6 +155,190 @@ func TestHandleKeyEscReturnsToRadar(t *testing.T) {
 	if got := updated.(appModel); got.screen != screenRadar {
 		t.Errorf("screen = %v, want screenRadar after esc", got.screen)
 	}
+}
+
+// ---- diff-pane focus (⏎ / esc) and scroll-key routing ----
+
+func TestHandleKeyEnterFocusesDiffPaneWhenWorktreeSelected(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := updated.(appModel); !got.diffFocused {
+		t.Error("⏎ should focus the diff pane when a worktree is selected")
+	}
+}
+
+func TestHandleKeyEnterNoOpWhenNothingSelected(t *testing.T) {
+	m := newTestModel(&fakeAPI{}) // empty sidebar
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := updated.(appModel); got.diffFocused {
+		t.Error("⏎ with nothing selected must not focus the diff pane")
+	}
+}
+
+func TestHandleKeyEnterNoOpInReviewScreen(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
+	m.screen = screenReview
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := updated.(appModel); got.diffFocused {
+		t.Error("⏎ is Radar's own focus toggle in WP2; Review's own is WP3")
+	}
+}
+
+func TestHandleKeyEscWhileDiffFocusedUnfocusesWithoutChangingScreen(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
+	m.diffFocused = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	got := updated.(appModel)
+	if got.diffFocused {
+		t.Error("esc while diff-focused should un-focus first")
+	}
+	if got.screen != screenRadar {
+		t.Errorf("screen = %v, want unchanged screenRadar", got.screen)
+	}
+}
+
+func TestHandleKeyQuitWorksWhileDiffFocused(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.diffFocused = true
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if !isQuitCmd(cmd) {
+		t.Fatal("q must quit even while the diff pane is focused")
+	}
+}
+
+func TestHandleKeyReviewResetsDiffFocused(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
+	m.diffFocused = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	got := updated.(appModel)
+	if got.screen != screenReview {
+		t.Errorf("screen = %v, want screenReview", got.screen)
+	}
+	if got.diffFocused {
+		t.Error("entering Review should reset diffFocused (its own focus model is WP3)")
+	}
+}
+
+// TestDiffFocusedRoutesScrollKeysToThePaneNotTheSidebar pins the whole point
+// of the focus model: j/k must scroll the diff, not move sidebar selection.
+func TestDiffFocusedRoutesScrollKeysToThePaneNotTheSidebar(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "api", Name: "one", LastChange: fixedTime(2)},
+		{ID: "a2", Repo: "api", Name: "two", LastChange: fixedTime(1)},
+	})
+	m.radar.pane.setDiff(manyLineDiff(50))
+	m.radar.pane.setHeight(10)
+	selectedBefore, _ := m.sidebar.selected()
+	m.diffFocused = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	got := updated.(appModel)
+	if got.radar.pane.offset != 1 {
+		t.Errorf("pane offset = %d, want 1 after j while diff-focused", got.radar.pane.offset)
+	}
+	selectedAfter, _ := got.sidebar.selected()
+	if selectedAfter.ID != selectedBefore.ID {
+		t.Errorf("sidebar selection changed from %q to %q; j while diff-focused must not move it", selectedBefore.ID, selectedAfter.ID)
+	}
+}
+
+// TestSidebarFocusedUpDownStillMovesSelectionNotThePane is the converse:
+// unfocused, j/k must behave exactly as before WP2 (sidebar movement).
+func TestSidebarFocusedUpDownStillMovesSelectionNotThePane(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "api", Name: "one", LastChange: fixedTime(2)},
+		{ID: "a2", Repo: "api", Name: "two", LastChange: fixedTime(1)},
+	})
+	m.radar.pane.setDiff(manyLineDiff(50))
+	m.radar.pane.setHeight(10)
+
+	before, _ := m.sidebar.selected()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	got := updated.(appModel)
+	if got.radar.pane.offset != 0 {
+		t.Errorf("pane offset = %d, want 0 (j moves the sidebar, not the pane, while unfocused)", got.radar.pane.offset)
+	}
+	sel, _ := got.sidebar.selected()
+	if sel.ID == before.ID {
+		t.Errorf("selected = %q, want it to have moved off the initial selection %q", sel.ID, before.ID)
+	}
+}
+
+// ---- radar diff pane: selection -> fetch, diffMsg/diffErrMsg application ----
+
+// TestSelectingAWorktreeDispatchesADiffFetch pins "radar screen completion:
+// selection -> enter opens the diff pane for that worktree" at the fetch
+// layer: even before ⏎, moving the sidebar selection primes the diff pane.
+func TestSelectingAWorktreeDispatchesADiffFetch(t *testing.T) {
+	api := &fakeAPI{diff: model.Diff{WorktreeID: "a1", Hash: "h1"}}
+	m := newTestModel(api)
+	updated, cmd := m.Update(listMsg{{ID: "a1", Repo: "api", Name: "one"}})
+	got := updated.(appModel)
+	if got.radar.currentID != "a1" {
+		t.Fatalf("radar.currentID = %q, want a1 once it's the selection", got.radar.currentID)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil command to fetch a1's diff")
+	}
+
+	// Drive the fetch and apply through Update(), exactly as bubbletea would.
+	var dm diffMsg
+	var found bool
+	for _, msg := range runBatch(t, cmd) {
+		if d, ok := msg.(diffMsg); ok {
+			dm, found = d, true
+		}
+	}
+	if !found || dm.ID != "a1" {
+		t.Fatalf("expected a diffMsg for a1 among the dispatched commands")
+	}
+	updated2, _ := got.Update(dm)
+	final := updated2.(appModel)
+	if final.radar.pane.diff.WorktreeID != "a1" {
+		t.Errorf("pane.diff.WorktreeID = %q, want a1 after applying the fetch result", final.radar.pane.diff.WorktreeID)
+	}
+}
+
+func TestDiffMsgUpdatesRadarPane(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "one"}})
+	m.radar.currentID = "a1"
+
+	updated, _ := m.Update(diffMsg{ID: "a1", Diff: model.Diff{WorktreeID: "a1", Hash: "h1"}})
+	got := updated.(appModel)
+	if got.radar.pane.diff.WorktreeID != "a1" {
+		t.Errorf("pane.diff.WorktreeID = %q, want a1", got.radar.pane.diff.WorktreeID)
+	}
+}
+
+func TestDiffErrMsgSurfacesInRadarView(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "one"}})
+	m.radar.currentID = "a1"
+
+	updated, _ := m.Update(diffErrMsg{ID: "a1", Err: errUnknownWorktree})
+	got := updated.(appModel)
+	if got.radar.diffErr == "" {
+		t.Error("diffErrMsg for the current selection should set radar.diffErr")
+	}
+}
+
+var errUnknownWorktree = errors.New("unknown worktree id")
+
+// fixedTime avoids relying on time.Now() ordering flakiness in sidebar
+// most-recent-first sort assertions.
+func fixedTime(minutesAgo int) time.Time {
+	return time.Now().Add(-time.Duration(minutesAgo) * time.Minute)
 }
 
 // ---- version / protocol handshake ----
@@ -382,6 +575,109 @@ func TestRunSmokeStartsRendersFixturesAndQuitsCleanly(t *testing.T) {
 	if !strings.Contains(frame, "feature-x") {
 		t.Errorf("rendered output does not contain the fixture worktree name %q:\n%s", "feature-x", frame)
 	}
+}
+
+// TestRunRadarDiffPaneMatchesGoldenFrame is WP2's "teatest golden frame of a
+// small fixed diff at 80×24 ascii profile" (P3-design.md's WP2 test list):
+// drive a real tea.Program against a fake client seeded with a small
+// two-file diff, focus the diff pane with ⏎, and byte-compare the rendered
+// frame against a checked-in golden. Unlike the real-terminal expect/pty
+// smoke (P3-design.md §5, which explicitly warns full-frame goldens there
+// are flaky on escape-sequence timing), this harness is a plain buffer with
+// no real tty involved — same deterministic fixtures in, same bytes out
+// every run — so an exact comparison is the right bar here, not just
+// substrings. Update the golden with `go test -run TestRunRadarDiffPane
+// -update` after an intentional layout change.
+func TestRunRadarDiffPaneMatchesGoldenFrame(t *testing.T) {
+	d := model.Diff{WorktreeID: "auth", Base: "main", Files: []model.DiffFile{
+		{
+			Path: "internal/auth/token.go", Status: model.FileModified, Hash: "hgo",
+			Stats: model.Stats{Add: 2, Del: 1},
+			Hunks: []model.Hunk{{
+				Header: "@@ -18,3 +18,4 @@ func NewToken(",
+				Lines: []model.Line{
+					line(model.LineContext, 18, 18, "func NewToken(uid string) (*Token, error) {"),
+					line(model.LineDel, 19, 0, "\texp := time.Now().Add(15 * time.Minute)"),
+					line(model.LineAdd, 0, 19, "\texp := time.Now().Add(30 * time.Minute)"),
+					line(model.LineContext, 20, 20, "\treturn sign(claims)"),
+				},
+			}},
+		},
+		{
+			Path: "README.md", Status: model.FileAdded, Hash: "hmd",
+			Stats: model.Stats{Add: 2},
+			Hunks: []model.Hunk{{
+				Header: "@@ -0,0 +1,2 @@",
+				Lines: []model.Line{
+					line(model.LineAdd, 0, 1, "# wt cockpit"),
+					line(model.LineAdd, 0, 2, ""),
+				},
+			}},
+		},
+	}}
+	api := &fakeAPI{
+		protocol:  model.ProtocolVersion,
+		version:   "v0.3.0-test",
+		worktrees: []model.Worktree{{ID: "auth", Repo: "api-server", Name: "auth-refactor", Base: "main", Stats: model.Stats{Files: 2, Add: 4, Del: 1}}},
+		diff:      d,
+		events:    make(chan model.Event),
+		errs:      make(chan error, 1),
+	}
+
+	inR, _ := io.Pipe()
+	var outBuf safeBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runProgram("/tmp/does-not-matter.sock", api, func(p *tea.Program) {
+			p.Send(tea.WindowSizeMsg{Width: 80, Height: 24})
+			time.Sleep(200 * time.Millisecond) // let Init's fetches + the diff fetch + async highlight land
+			p.Send(tea.KeyMsg{Type: tea.KeyEnter})
+			time.Sleep(150 * time.Millisecond)
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+		},
+			tea.WithInput(inR),
+			tea.WithOutput(&outBuf),
+			tea.WithoutSignalHandler(),
+			tea.WithoutCatchPanics(),
+		)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() returned %v, want nil after a plain q quit", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("program did not exit within 5s of sending q")
+	}
+
+	frame := normalizeFrameForGolden(outBuf.String())
+	const goldenPath = "testdata/radar_frame.golden"
+	if *updateGolden {
+		if err := os.WriteFile(goldenPath, []byte(frame), 0o644); err != nil {
+			t.Fatalf("writing golden file %s: %v", goldenPath, err)
+		}
+		return
+	}
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("reading golden file %s: %v", goldenPath, err)
+	}
+	if frame != string(want) {
+		t.Errorf("rendered frame does not match %s.\ngot:\n%s\nwant:\n%s", goldenPath, frame, string(want))
+	}
+}
+
+// normalizeFrameForGolden strips ANSI (already-forced-Ascii-profile, so this
+// is mostly cursor/screen control codes) and collapses bubbletea's "\r\n"/
+// stray "\r" line-ending artifacts down to plain "\n" — an incidental detail
+// of how the renderer paints a full frame, not part of what this test means
+// to pin (the diff pane's actual content and column alignment).
+func normalizeFrameForGolden(s string) string {
+	s = stripANSI(s)
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
 }
 
 // safeBuffer is a concurrency-safe io.Writer: the Program renders on its own

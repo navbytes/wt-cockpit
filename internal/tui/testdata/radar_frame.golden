@@ -1,0 +1,24 @@
+WORKTREES · LIVE                  api-server / auth-refactor   base main   2 fil
+api-server                        internal/auth/token.go  +2 -1                 
+│ ● auth-refactor      +4 -1      @@ -18,3 +18,4 @@ func NewToken(              
+                                    18   18 func NewToken(uid string) (*Token, e
+                                    19          exp := time.Now().Add(15 * time.
+                                         19     exp := time.Now().Add(30 * time.
+                                    20   20     return sign(claims)             
+                                  README.md  added  +2 -0                       
+                                  @@ -0,0 +1,2 @@                               
+                                          1 # wt cockpit                        
+                                          2                                     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+↑↓/jk move  ⏎ diff  r review  t tmux  a approve  / search  f active  R refresh  
+q quit                                                                          

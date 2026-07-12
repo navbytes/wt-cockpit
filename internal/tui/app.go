@@ -31,8 +31,8 @@ const (
 const sidebarWidth = 34
 
 // screenID selects which of the two views (P3-design.md §1.1) app.go routes
-// to. A real radar.go/review.go composition arrives in WP2/WP3; WP1's main
-// pane is a placeholder that still proves the routing/selection wiring.
+// to. Radar's real composition (radar.go) landed in WP2; Review's rail
+// (review.go) is still WP3's stub.
 type screenID int
 
 const (
@@ -65,8 +65,8 @@ const eventTypeSnapshot model.EventType = "snapshot"
 
 // appModel is the one root Elm-architecture model: shared state plus a
 // screen selector, per P3-design.md §2.3 ("one appModel owning shared state
-// and two lightweight view structs" — the view structs proper land with
-// WP2/WP3's radar.go/review.go; WP1 renders both inline below).
+// and two lightweight view structs" — radar.go's radarView is the first of
+// those; review.go's reviewView is still WP3).
 type appModel struct {
 	api    apiClient
 	ctx    context.Context
@@ -84,8 +84,10 @@ type appModel struct {
 	fatal   string // non-empty => fatal full-screen card; any key quits non-zero
 	exitErr error
 
-	sidebar sidebar
-	toast   string
+	sidebar     sidebar
+	radar       radarView
+	diffFocused bool // true once ⏎ has focused the diff pane (scroll keys act on it)
+	toast       string
 }
 
 // Run resolves the real client and runs the program until the user quits.
@@ -113,7 +115,7 @@ func runProgram(socket string, api apiClient, ready func(*tea.Program), opts ...
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := appModel{api: api, ctx: ctx, socket: socket, retryCh: make(chan struct{}, 1)}
+	m := appModel{api: api, ctx: ctx, socket: socket, retryCh: make(chan struct{}, 1), radar: newRadarView()}
 	p := tea.NewProgram(m, opts...)
 	if ready != nil {
 		go ready(p)
@@ -141,7 +143,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		return m, nil
+		return m, m.radar.ensureHighlightsCmd() // resize can bring a new file card into view
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -180,6 +182,18 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case listMsg:
 		m.sidebar.setWorktrees([]model.Worktree(msg))
+		return m, m.ensureDiffForSelection()
+
+	case diffMsg:
+		m.radar.applyDiffMsg(msg)
+		return m, m.radar.ensureHighlightsCmd()
+
+	case diffErrMsg:
+		m.radar.applyDiffErrMsg(msg)
+		return m, nil
+
+	case highlightedMsg:
+		m.radar.applyHighlighted(msg)
 		return m, nil
 
 	case listErrMsg:
@@ -208,10 +222,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleKey is Update's tea.KeyMsg branch. When a fatal condition is showing,
-// every key exits non-zero (P3-design.md §1.4); otherwise only the subset of
-// P3-design.md §1.3 that WP1 actually wires (movement, view routing, quit,
-// refresh) does anything — the rest (t/a/f, diff-pane scrolling) are
-// defined in keys.go for the keybar text but are WP2/WP3 behavior.
+// every key exits non-zero (P3-design.md §1.4). A few keys act the same
+// regardless of focus (quit, review, refresh); everything else routes on
+// m.diffFocused, WP2's Radar-scoped focus model (⏎ focuses the diff pane so
+// scroll keys act on it; esc un-focuses before falling back to view
+// routing). t/a/f and Review's own key handling remain WP3 behavior.
 func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.fatal != "" {
 		m.exitErr = errors.New(m.fatal)
@@ -220,19 +235,11 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
-	case key.Matches(msg, keys.Up):
-		m.sidebar.moveUp()
-		return m, nil
-	case key.Matches(msg, keys.Down):
-		m.sidebar.moveDown()
-		return m, nil
 	case key.Matches(msg, keys.Review):
 		if _, ok := m.sidebar.selected(); ok {
 			m.screen = screenReview
+			m.diffFocused = false
 		}
-		return m, nil
-	case key.Matches(msg, keys.Esc):
-		m.screen = screenRadar
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
 		// Also skip an in-progress reconnect backoff wait (the down-card's
@@ -244,15 +251,81 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, refreshCmd(m.ctx, m.api)
 	}
+
+	if m.diffFocused {
+		return m.handleDiffKey(msg)
+	}
+	switch {
+	case key.Matches(msg, keys.Up):
+		m.sidebar.moveUp()
+		return m, m.ensureDiffForSelection()
+	case key.Matches(msg, keys.Down):
+		m.sidebar.moveDown()
+		return m, m.ensureDiffForSelection()
+	case key.Matches(msg, keys.Enter):
+		if _, ok := m.sidebar.selected(); ok && m.screen == screenRadar {
+			m.diffFocused = true
+			return m, m.radar.ensureHighlightsCmd()
+		}
+	case key.Matches(msg, keys.Esc):
+		m.screen = screenRadar
+	}
 	return m, nil
 }
 
+// handleDiffKey is P3-design.md §1.3's diff-pane scrolling set, active only
+// while m.diffFocused (Radar view; Review's own rail/file-nav is WP3).
+func (m appModel) handleDiffKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, keys.Esc):
+		m.diffFocused = false
+		return m, nil
+	case key.Matches(msg, keys.Up):
+		m.radar.pane.LineUp()
+	case key.Matches(msg, keys.Down):
+		m.radar.pane.LineDown()
+	case key.Matches(msg, keys.HalfPageDown):
+		m.radar.pane.HalfPageDown()
+	case key.Matches(msg, keys.HalfPageUp):
+		m.radar.pane.HalfPageUp()
+	case key.Matches(msg, keys.PageDown):
+		m.radar.pane.PageDown()
+	case key.Matches(msg, keys.PageUp):
+		m.radar.pane.PageUp()
+	case key.Matches(msg, keys.Top):
+		m.radar.pane.Top()
+	case key.Matches(msg, keys.Bottom):
+		m.radar.pane.Bottom()
+	case key.Matches(msg, keys.PrevFile):
+		m.radar.pane.PrevFile()
+	case key.Matches(msg, keys.NextFile):
+		m.radar.pane.NextFile()
+	case key.Matches(msg, keys.ToggleFold):
+		m.radar.pane.ToggleFold()
+	}
+	return m, m.radar.ensureHighlightsCmd()
+}
+
+// ensureDiffForSelection keeps the Radar diff pane in sync with the sidebar:
+// called after anything that can change which worktree is selected. A no-op
+// when nothing is selected (empty workspace).
+func (m *appModel) ensureDiffForSelection() tea.Cmd {
+	w, ok := m.sidebar.selected()
+	if !ok {
+		return nil
+	}
+	fetch := m.radar.ensureDiff(m.ctx, m.api, w.ID)
+	return tea.Batch(fetch, m.radar.ensureHighlightsCmd())
+}
+
 // applyEvent applies one SSE delta to the shared model (P3-design.md §2.4):
-// upsert/remove update the sidebar in place; a snapshot (sent on every
-// (re)connect) re-runs the startup fetches — the resync story: reconnect
-// cannot miss state because connect always snapshots. Everything else
-// (diff.ready, guardrail.tripped, review.changed, and any future type) is
-// WP2/WP3 territory or forward-compat-ignored (§2.8).
+// upsert/remove update the sidebar in place (and, since either can change
+// which worktree is selected, re-check the diff pane); a snapshot (sent on
+// every (re)connect) re-runs the startup fetches — the resync story:
+// reconnect cannot miss state because connect always snapshots. diff.ready
+// is the diff pane's own hash-gated refetch (radar.go). guardrail.tripped
+// and any future type are forward-compat-ignored (§2.8); review.changed is
+// WP3 territory.
 func (m *appModel) applyEvent(e model.Event) tea.Cmd {
 	switch e.Type {
 	case model.EventWorktreeUpserted:
@@ -261,10 +334,12 @@ func (m *appModel) applyEvent(e model.Event) tea.Cmd {
 		}
 	case model.EventWorktreeRemoved:
 		m.sidebar.remove(e.ID)
+	case model.EventDiffReady:
+		return m.radar.applyDiffReady(m.ctx, m.api, e)
 	case eventTypeSnapshot:
 		return tea.Batch(fetchVersion(m.ctx, m.api), fetchList(m.ctx, m.api))
 	}
-	return nil
+	return m.ensureDiffForSelection()
 }
 
 func isUnreachable(err error) bool {
@@ -370,18 +445,17 @@ func (m appModel) shellView() string {
 	return lipgloss.JoinVertical(lipgloss.Left, top, body, keybar)
 }
 
-// mainPaneView is WP1's stub: the virtualized unified-diff pane is WP2
-// (flatten.go/diffview.go/radar.go); WP3 adds the Review rail. For now it
-// names the selected worktree so the routing/selection wiring is visibly
-// exercised end to end.
+// mainPaneView renders Radar's real diff pane (flatten.go/diffview.go/
+// radar.go); Review's rail is still WP3's stub.
 func (m appModel) mainPaneView(width, height int) string {
-	style := lipgloss.NewStyle().Width(width).Height(height)
 	w, ok := m.sidebar.selected()
 	if !ok {
+		style := lipgloss.NewStyle().Width(width).Height(height)
 		return style.Render(styles.Dim.Render("no worktree selected"))
 	}
 	if m.screen == screenReview {
+		style := lipgloss.NewStyle().Width(width).Height(height)
 		return style.Render(styles.Txt.Render(fmt.Sprintf("%s / %s   base %s   review: WP3", w.Repo, w.Name, w.Base)))
 	}
-	return style.Render(styles.Txt.Render(fmt.Sprintf("%s / %s   base %s   diff view: WP2", w.Repo, w.Name, w.Base)))
+	return m.radar.view(width, height, w)
 }
