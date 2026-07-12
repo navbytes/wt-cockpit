@@ -64,7 +64,7 @@ go install github.com/navbytes/wt-cockpit/cmd/wt@latest
 # or from a checkout:
 make build   # → bin/wtd, bin/wt
 
-# start the daemon over one or more roots
+# start the daemon over one or more roots (uses fsnotify watcher by default)
 wtd -root ~/code -interval 1s &
 
 # the client (defaults to ~/.wtcockpit/wtd.sock; override with WTD_SOCKET)
@@ -78,6 +78,32 @@ wt refresh                  # force a rescan
 
 `wtd -tcp 127.0.0.1:7799` additionally serves the same API over TCP (bind to a Tailscale
 interface for remote/phone viewing).
+
+## Configuration
+
+Config file `~/.config/wtcockpit/config.toml` (or `$XDG_CONFIG_HOME/wtcockpit/config.toml`)
+defines roots, per-repo base branch overrides, guardrail rules, and daemon options.
+Precedence: explicit flags > config file > built-in defaults. Malformed TOML is a fatal error.
+
+Example:
+```toml
+roots = ["~/code", "~/work"]
+base = "main"
+watch = "fsnotify"          # or "poll" to disable file watching
+interval = "2s"
+
+[repos."/home/user/code/api"]
+base = "develop"            # per-repo override
+
+[[rules]]
+name = "example-rule"
+severity = "warn"
+path_glob = "**/*.yaml"
+```
+
+See [docs/config.example.toml](docs/config.example.toml) for the full reference.
+Use `-config /path/to/config.toml` to specify a custom location, or `-watch fsnotify|poll`
+to override the watcher backend at runtime.
 
 ## What the engine does each refresh
 
@@ -95,6 +121,9 @@ clean (all work committed — you cannot merge uncommitted or untracked changes)
 then merges the worktree's branch into the base branch (in whichever worktree has
 base checked out) and removes the worktree. If the merge hits a conflict it is
 aborted, leaving the base branch untouched — a failed approve never corrupts main.
+
+Review marks survive commits: only files whose content actually changed flip back to
+unreviewed, so committing work no longer resets the review state of other files.
 
 ## Tests
 
