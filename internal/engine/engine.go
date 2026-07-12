@@ -558,6 +558,8 @@ func fileHash(f model.DiffFile) string {
 	var b strings.Builder
 	b.WriteString(f.Path)
 	b.WriteByte('\n')
+	b.WriteString(f.OldPath)
+	b.WriteByte('\n')
 	b.WriteString(string(f.Status))
 	b.WriteByte('\n')
 	b.WriteString(f.OldBlob)
