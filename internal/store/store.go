@@ -22,11 +22,14 @@ type Comment struct {
 	At         time.Time `json:"at"`
 }
 
-// Store is the persistence contract.
+// Store is the persistence contract. Review identity is per file: SetReviewed
+// records the diff hash the file had when it was reviewed, and a caller decides
+// separately (by comparing against the file's current hash) whether that mark
+// still holds.
 type Store interface {
-	SetReviewed(worktreeID, file string, reviewed bool) error
-	ReviewedFiles(worktreeID string) (map[string]bool, error)
-	ReviewedCount(worktreeID string) int
+	SetReviewed(worktreeID, file, hash string) error
+	Unreview(worktreeID, file string) error
+	ReviewedFiles(worktreeID string) (map[string]string, error)
 	ClearWorktree(worktreeID string) error
 	AddComment(c Comment) error
 	Comments(worktreeID string) ([]Comment, error)
@@ -40,22 +43,27 @@ type jsonStore struct {
 }
 
 type persisted struct {
-	// Reviewed[worktreeID][file] = true
-	Reviewed map[string]map[string]bool `json:"reviewed"`
-	Comments map[string][]Comment       `json:"comments"`
+	// ReviewedFiles[worktreeID][path] = the diff hash path had when it was last
+	// marked reviewed.
+	//
+	// v0.1 stored a bool under a "reviewed" key instead; that key is simply not
+	// read by this struct, so loading an old state file drops old review marks
+	// rather than erroring — the whole of that migration.
+	ReviewedFiles map[string]map[string]string `json:"reviewed_files"`
+	Comments      map[string][]Comment         `json:"comments"`
 }
 
 // OpenJSON loads (or creates) a JSON-backed store at path.
 func OpenJSON(path string) (Store, error) {
 	s := &jsonStore{path: path, data: persisted{
-		Reviewed: map[string]map[string]bool{},
-		Comments: map[string][]Comment{},
+		ReviewedFiles: map[string]map[string]string{},
+		Comments:      map[string][]Comment{},
 	}}
 	b, err := os.ReadFile(path)
 	if err == nil {
 		_ = json.Unmarshal(b, &s.data)
-		if s.data.Reviewed == nil {
-			s.data.Reviewed = map[string]map[string]bool{}
+		if s.data.ReviewedFiles == nil {
+			s.data.ReviewedFiles = map[string]map[string]string{}
 		}
 		if s.data.Comments == nil {
 			s.data.Comments = map[string][]Comment{}
@@ -66,42 +74,39 @@ func OpenJSON(path string) (Store, error) {
 	return s, nil
 }
 
-func (s *jsonStore) SetReviewed(worktreeID, file string, reviewed bool) error {
+func (s *jsonStore) SetReviewed(worktreeID, file, hash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m := s.data.Reviewed[worktreeID]
+	m := s.data.ReviewedFiles[worktreeID]
 	if m == nil {
-		m = map[string]bool{}
-		s.data.Reviewed[worktreeID] = m
+		m = map[string]string{}
+		s.data.ReviewedFiles[worktreeID] = m
 	}
-	if reviewed {
-		m[file] = true
-	} else {
-		delete(m, file)
-	}
+	m[file] = hash
 	return s.flush()
 }
 
-func (s *jsonStore) ReviewedFiles(worktreeID string) (map[string]bool, error) {
+func (s *jsonStore) Unreview(worktreeID, file string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := map[string]bool{}
-	for k, v := range s.data.Reviewed[worktreeID] {
+	delete(s.data.ReviewedFiles[worktreeID], file)
+	return s.flush()
+}
+
+func (s *jsonStore) ReviewedFiles(worktreeID string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range s.data.ReviewedFiles[worktreeID] {
 		out[k] = v
 	}
 	return out, nil
 }
 
-func (s *jsonStore) ReviewedCount(worktreeID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.data.Reviewed[worktreeID])
-}
-
 func (s *jsonStore) ClearWorktree(worktreeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data.Reviewed, worktreeID)
+	delete(s.data.ReviewedFiles, worktreeID)
 	return s.flush()
 }
 

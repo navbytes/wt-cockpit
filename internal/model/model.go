@@ -102,6 +102,11 @@ type DiffFile struct {
 	Stats   Stats      `json:"stats"`
 	Hunks   []Hunk     `json:"hunks"`
 	Binary  bool       `json:"binary"`
+	// Hash is a stable per-file identity: sha1(path + status + every hunk line).
+	// Unlike the whole-diff hash it survives a commit inside the worktree (the
+	// content doesn't change), which is what lets review state be keyed per file
+	// instead of resetting whenever anything in the worktree changes.
+	Hash string `json:"hash"`
 }
 
 // Diff is the full structured diff for a worktree.

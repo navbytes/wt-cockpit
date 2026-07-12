@@ -8,9 +8,11 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,15 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/registry"
 	"github.com/navbytes/wt-cockpit/internal/store"
 )
+
+// ErrFileNotFound is returned by SetReviewed when the worktree is unknown or the
+// file is not part of its current diff.
+var ErrFileNotFound = errors.New("file not found in current diff")
+
+// ErrFileChanged is returned by SetReviewed when the caller's expectedHash no
+// longer matches the file's current diff hash: the file changed since it was
+// viewed, so the review request is stale.
+var ErrFileChanged = errors.New("file changed since it was reviewed")
 
 // Config holds engine settings.
 type Config struct {
@@ -99,17 +110,65 @@ func (e *Engine) WorktreePath(id string) (string, bool) {
 }
 
 // SetReviewed records a per-file review toggle and republishes the worktree so the
-// reviewed count updates live for every client.
-func (e *Engine) SetReviewed(id, file string, reviewed bool) error {
-	if err := e.st.SetReviewed(id, file, reviewed); err != nil {
+// reviewed count updates live for every client. file must be part of the
+// worktree's current diff, or ErrFileNotFound is returned. If expectedHash is
+// non-empty it must match the file's current diff hash, or ErrFileChanged is
+// returned — the file changed since the caller last looked at it. Marking
+// reviewed=true records the file's current hash; reviewed=false unreviews it.
+func (e *Engine) SetReviewed(id, file string, reviewed bool, expectedHash string) error {
+	e.mu.RLock()
+	m, ok := e.cache[id]
+	e.mu.RUnlock()
+	if !ok {
+		return ErrFileNotFound
+	}
+	cur := findDiffFile(m.diff.Files, file)
+	if cur == nil {
+		return ErrFileNotFound
+	}
+	if expectedHash != "" && expectedHash != cur.Hash {
+		return ErrFileChanged
+	}
+
+	var err error
+	if reviewed {
+		err = e.st.SetReviewed(id, file, cur.Hash)
+	} else {
+		err = e.st.Unreview(id, file)
+	}
+	if err != nil {
 		return err
 	}
+
 	if w := e.reg.Get(id); w != nil {
-		w.Reviewed = e.st.ReviewedCount(id)
+		rf, _ := e.st.ReviewedFiles(id)
+		w.Reviewed = reviewedCount(m.diff.Files, rf)
 		e.reg.Upsert(*w)
 		e.reg.Publish(model.Event{Type: model.EventReviewChanged, ID: id, At: time.Now()})
 	}
 	return nil
+}
+
+// findDiffFile looks up a file by path within a diff's files.
+func findDiffFile(files []model.DiffFile, path string) *model.DiffFile {
+	for i := range files {
+		if files[i].Path == path {
+			return &files[i]
+		}
+	}
+	return nil
+}
+
+// reviewedCount counts files whose stored review hash matches their current
+// diff hash — a stale hash (the file changed since it was reviewed) doesn't count.
+func reviewedCount(files []model.DiffFile, reviewed map[string]string) int {
+	n := 0
+	for _, f := range files {
+		if reviewed[f.Path] == f.Hash {
+			n++
+		}
+	}
+	return n
 }
 
 // ApproveResult summarises a completed approve.
@@ -137,14 +196,15 @@ func (e *Engine) Approve(id string) (ApproveResult, error) {
 		return ApproveResult{}, fmt.Errorf("no changes to approve")
 	}
 
-	// Gate 1: fully reviewed.
+	// Gate 1: fully reviewed — every file's stored hash must match its current
+	// hash (a stale hash means the file changed since it was reviewed).
 	reviewed, err := e.st.ReviewedFiles(id)
 	if err != nil {
 		return ApproveResult{}, err
 	}
 	var unreviewed int
 	for _, f := range m.diff.Files {
-		if !reviewed[f.Path] {
+		if reviewed[f.Path] != f.Hash {
 			unreviewed++
 		}
 	}
@@ -253,16 +313,22 @@ func (e *Engine) Refresh(ctx context.Context) error {
 
 // refreshWorktree recomputes one worktree's diff and updates the registry. Under
 // the polling watcher we recompute the diff each scan (cheap for normal repos, and
-// correct — a content edit to an already-dirty file must be detected). The diff
-// *hash* is the authority on "did anything change": lastChange only advances, and
-// review state only resets, when the hash actually moves. A future fsnotify watcher
-// can reinstate a skip-if-unchanged fast path keyed on .git/index + worktree mtimes.
+// correct — a content edit to an already-dirty file must be detected). The whole-
+// diff *hash* only drives lastChange/the diff.ready event; review state lives at
+// the per-file level (see model.DiffFile.Hash) and survives a whole-diff hash
+// change on its own — notably a commit inside the worktree, which doesn't alter
+// any file's content and so leaves every per-file hash exactly where it was. A
+// future fsnotify watcher can reinstate a skip-if-unchanged fast path keyed on
+// .git/index + worktree mtimes.
 func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, base, id string) {
 	diffText, derr := e.be.DiffAgainstBase(ref.Path, base)
 	if derr != nil {
 		diffText = "" // treat as no diff rather than dropping the worktree
 	}
 	files := diffparse.Parse(diffText)
+	for i := range files {
+		files[i].Hash = fileHash(files[i])
+	}
 	hash := hashString(diffText)
 
 	e.mu.RLock()
@@ -293,16 +359,34 @@ func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, ba
 	e.cache[id] = m
 	e.mu.Unlock()
 
+	// Files that dropped out of the diff (deleted, merged away, or edited back
+	// to match base) can never be hash-matched again — drop their stale review
+	// records rather than let them linger in the store forever.
+	e.pruneReviews(id, files)
+
 	if changed {
-		// Only reset review state when we had a prior diff that actually differs —
-		// on a fresh daemon start (cached == false) we preserve persisted reviews.
-		if cached {
-			_ = e.st.ClearWorktree(id)
-		}
 		e.reg.Publish(model.Event{Type: model.EventDiffReady, ID: id, Hash: hash, At: now})
 	}
 
 	e.reg.Upsert(e.buildWorktree(m, ref))
+}
+
+// pruneReviews removes stored review records whose path is no longer present in
+// the current diff.
+func (e *Engine) pruneReviews(id string, files []model.DiffFile) {
+	reviewed, err := e.st.ReviewedFiles(id)
+	if err != nil || len(reviewed) == 0 {
+		return
+	}
+	keep := make(map[string]bool, len(files))
+	for _, f := range files {
+		keep[f.Path] = true
+	}
+	for path := range reviewed {
+		if !keep[path] {
+			_ = e.st.Unreview(id, path)
+		}
+	}
 }
 
 // buildWorktree assembles the public model from cached meta + live review state.
@@ -315,7 +399,7 @@ func (e *Engine) buildWorktree(m *meta, ref gitbackend.WorktreeRef) model.Worktr
 	stats.Files = len(m.diff.Files)
 
 	hits := e.gr.Eval(m.diff)
-	reviewed := e.st.ReviewedCount(m.id)
+	reviewed, _ := e.st.ReviewedFiles(m.id)
 	dirty, _ := e.be.IsDirty(m.path)
 
 	return model.Worktree{
@@ -331,7 +415,7 @@ func (e *Engine) buildWorktree(m *meta, ref gitbackend.WorktreeRef) model.Worktr
 		LastChange: m.lastChange,
 		DiffHash:   m.diff.Hash,
 		Guardrails: hits,
-		Reviewed:   reviewed,
+		Reviewed:   reviewedCount(m.diff.Files, reviewed),
 	}
 }
 
@@ -384,4 +468,32 @@ func worktreeID(path string) string {
 func hashString(s string) string {
 	sum := sha1.Sum([]byte(s))
 	return hex.EncodeToString(sum[:8])
+}
+
+// fileHash computes a per-file diff identity: sha1 over the file's path, status,
+// and every hunk line (kind + content). Unlike the whole-diff hash it is
+// unaffected by any other file changing, and — because it doesn't include hunk
+// start line numbers — by unrelated shifts elsewhere in the same file's hunks;
+// it only moves when this file's own content actually changes.
+func fileHash(f model.DiffFile) string {
+	var b strings.Builder
+	b.WriteString(f.Path)
+	b.WriteByte('\n')
+	b.WriteString(string(f.Status))
+	b.WriteByte('\n')
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			switch l.Kind {
+			case model.LineAdd:
+				b.WriteByte('+')
+			case model.LineDel:
+				b.WriteByte('-')
+			default:
+				b.WriteByte(' ')
+			}
+			b.WriteString(l.Content)
+			b.WriteByte('\n')
+		}
+	}
+	return hashString(b.String())
 }
