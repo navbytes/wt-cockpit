@@ -147,3 +147,23 @@ func TestPrintVersionPrintsInjectedVersionString(t *testing.T) {
 		t.Errorf("printVersion output = %q, want it to contain the injected version %q", got, "v0.2.0-test")
 	}
 }
+
+// ---- bare `wt` TTY-default dispatch (P3-design.md §2.1, WP4) ----
+
+// TestDefaultCommandTTYRunsTUI pins the routing decision at the function
+// level (faking the "is a TTY" input, not a real terminal): a TTY makes bare
+// `wt` the daily-driver full-screen TUI.
+func TestDefaultCommandTTYRunsTUI(t *testing.T) {
+	if got := defaultCommand(true); got != "tui" {
+		t.Errorf("defaultCommand(true) = %q, want %q", got, "tui")
+	}
+}
+
+// TestDefaultCommandNonTTYRunsLs is the other half: a pipe, redirect, or any
+// other non-terminal stdout keeps today's `ls` text output so `wt | grep`
+// and scripts never break.
+func TestDefaultCommandNonTTYRunsLs(t *testing.T) {
+	if got := defaultCommand(false); got != "ls" {
+		t.Errorf("defaultCommand(false) = %q, want %q", got, "ls")
+	}
+}

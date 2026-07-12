@@ -125,6 +125,48 @@ func TestWtExitsOneOnProtocolMismatchAndMentionsBothNumbers(t *testing.T) {
 	}
 }
 
+// TestWtWithNoArgsAndNonTTYStdoutPrintsLsText is P3-design.md §5 phase-
+// acceptance item 5 ("wt | cat still prints the ls radar, exit 0") and the
+// other half of TestDefaultCommand*'s function-level seam-faking in
+// main_test.go: cmd.Stdout below is a plain buffer (exec wires it through an
+// OS pipe), so the real isTerminal() seam sees a genuine non-terminal fd —
+// this exercises the production isatty check end to end, not a faked one.
+func TestWtWithNoArgsAndNonTTYStdoutPrintsLsText(t *testing.T) {
+	bin := requireWtBin(t)
+	sockPath := filepath.Join(shortSocketDir(t), "wtd.sock")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"protocol": model.ProtocolVersion, "version": "x", "goVersion": "go1.24"})
+	})
+	mux.HandleFunc("/api/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]model.Worktree{{ID: "a1", Repo: "api-server", Name: "feature-x", Base: "main"}})
+	})
+	ts := unixSocketServer(t, sockPath, mux)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin) // bare `wt`, no args
+	cmd.Env = append(os.Environ(), "WTD_SOCKET="+sockPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("bare wt with piped stdout = %v, want exit 0; stderr=%s", err, stderr.String())
+	}
+
+	got := stdout.String()
+	if !strings.Contains(got, "wt cockpit") {
+		t.Errorf("stdout = %q, want the ls radar header — bare wt with non-TTY stdout must behave exactly like `wt ls`", got)
+	}
+	if !strings.Contains(got, "feature-x") {
+		t.Errorf("stdout = %q, want the fixture worktree name", got)
+	}
+	if strings.Contains(got, "\x1b[?1049h") {
+		t.Errorf("stdout contains an alt-screen escape sequence; want plain ls text (never the TUI) when stdout isn't a terminal")
+	}
+}
+
 // TestWtStatusAgainstDownDaemonExitsNonZero pins the CLI's observable failure
 // mode when wtd isn't running at all: `wt status` must exit nonzero with an
 // actionable stderr message, not hang or succeed silently. WTD_SOCKET points

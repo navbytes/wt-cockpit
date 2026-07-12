@@ -75,6 +75,19 @@ func TestHighlightCachePutOverwritesExistingHashAndRecomputesSize(t *testing.T) 
 	}
 }
 
+// TestNewHighlightCacheDefaultCapMatchesDesignBudget pins the *production*
+// default against P3-design.md §6's budget-table row ("Highlight memory
+// ≤ 16 MB cache") — the eviction tests above deliberately use a tiny
+// synthetic cap for speed, so nothing else in this file asserts the real
+// constant a shipped binary actually runs with hasn't drifted.
+func TestNewHighlightCacheDefaultCapMatchesDesignBudget(t *testing.T) {
+	c := newHighlightCache()
+	const want = 16 * 1024 * 1024
+	if c.maxBytes != want {
+		t.Errorf("newHighlightCache().maxBytes = %d, want %d (16MB, P3-design.md §6)", c.maxBytes, want)
+	}
+}
+
 // TestHighlightCacheConcurrentAccessIsRaceFree exercises the cache the way
 // real usage does (many files' highlightCmds landing around the same time)
 // under `go test -race`.

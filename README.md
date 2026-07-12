@@ -1,7 +1,7 @@
 # wt cockpit
 
 [![CI](https://github.com/navbytes/wt-cockpit/actions/workflows/ci.yml/badge.svg)](https://github.com/navbytes/wt-cockpit/actions/workflows/ci.yml)
-[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8?logo=go)](go.mod)
+[![Go 1.25+](https://img.shields.io/badge/go-1.25+-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A read-only, agent-agnostic **diff cockpit**: watch, catch mistakes in, and review the
@@ -23,7 +23,7 @@ HTTP API on a Unix socket. This is the anti-bottleneck decision: the TUI, a futu
 or git library can be swapped without touching them.
 
 ```
-frontends (thin clients)          wt (CLI/radar) · web · menu-bar
+frontends (thin clients)          wt (CLI/radar/TUI) · web · menu-bar
         │  events (SSE)  │  commands (JSON/HTTP)
         ▼                ▼
 wtd — daemon/engine     discovery · registry+bus · diff · guardrails · review store
@@ -53,8 +53,12 @@ richer drop-in later:
 - `internal/registry` — in-memory state + pub/sub event bus, emits deltas not full state.
 - `internal/watcher` — refresh driver (`Poller`).
 - `internal/engine` — orchestration + query/command surface.
+- `internal/client` — shared thin HTTP/SSE client (the only talker to `wtd`; `wt`'s CLI
+  and TUI both sit on top of it).
+- `internal/tui` — the full-screen Bubble Tea cockpit (`wt tui`): Radar + Review views,
+  virtualized diff pane, chroma syntax highlighting.
 - `cmd/wtd` — daemon: engine + HTTP/SSE over a Unix socket (+ optional TCP).
-- `cmd/wt` — terminal client: `ls`, `watch`, `diff`, `review`, `approve`, `refresh`.
+- `cmd/wt` — terminal client: `ls`, `watch`, `diff`, `review`, `approve`, `refresh`, `tui`.
 
 ## Install & run
 
@@ -68,6 +72,8 @@ make build   # → bin/wtd, bin/wt
 wtd -root ~/code -interval 1s &
 
 # the client (defaults to ~/.wtcockpit/wtd.sock; override with WTD_SOCKET)
+wt                          # on a terminal: full-screen TUI; piped/redirected: same as wt ls
+wt tui                      # explicit: always the full-screen TUI
 wt ls                       # radar: all worktrees, most-recently-changed first
 wt watch                    # live radar, re-renders on every change (SSE)
 wt diff <id>                # a worktree's structured diff
@@ -78,6 +84,64 @@ wt refresh                  # force a rescan
 
 `wtd -tcp 127.0.0.1:7799` additionally serves the same API over TCP (bind to a Tailscale
 interface for remote/phone viewing).
+
+## Terminal UI (`wt tui`)
+
+The daily-driver view: a live sidebar (Radar) plus a virtualized, syntax-highlighted
+unified diff, and a Review mode for marking files reviewed and approving a merge —
+all over the same daemon API the CLI uses (thin client, zero git logic; the only
+`exec` it ever does is jumping to a `tmux` pane).
+
+```
+wt              # on a terminal: opens the TUI (the "daily driver" default)
+                # piped/redirected (wt | less, wt > out.txt, cron, CI): prints the
+                # same text radar as `wt ls` — scripts and pipelines keep working
+wt tui          # explicit: always opens the TUI
+wt ls           # explicit: always prints the text radar, even on a terminal
+```
+
+![tui](docs/ux/tui-radar.png)
+*(placeholder — a real terminal screenshot goes here once one's captured; the mock
+this was built from lives at [docs/ux/mock.html](docs/ux/mock.html))*
+
+Colors degrade automatically — truecolor → 256 → 16 — and `NO_COLOR=1` (or a
+non-color `TERM`) renders plain, uncolored text; no flags needed either way.
+
+### Keybindings
+
+Synced by hand from [`internal/tui/keys.go`](internal/tui/keys.go) — update both if a
+binding changes.
+
+Radar view:
+
+| Key | Action |
+|---|---|
+| `↑`/`k`, `↓`/`j` | move selection in the sidebar |
+| `⏎` | focus the diff pane (scroll keys below act on it) |
+| `esc` | back: diff focus → sidebar; clears an active search/filter first if one is set |
+| `r` | open Review for the selected worktree |
+| `t` | jump to the tmux pane `cd`'d into this worktree |
+| `a` | approve & merge — opens the confirm modal |
+| `/` | fuzzy-substring search across repo/name/branch |
+| `f` | toggle "active worktrees only" filter |
+| `R` | force refresh |
+| `q`, `ctrl-c` | quit |
+
+Review view:
+
+| Key | Action |
+|---|---|
+| `j`/`k` | next / previous **file** |
+| `space` | toggle reviewed on the file under the cursor |
+| `a` | approve & merge — same confirm modal |
+| `esc` | back to Radar |
+| `↑`/`↓`, `ctrl-d`/`ctrl-u`, `pgup`/`pgdn`, `g`/`G` | fine-scroll the diff |
+| `t`, `q` | same as Radar |
+
+Diff-pane scrolling (either view, once the pane is focused): `j`/`k` line,
+`ctrl-d`/`ctrl-u` half page, `pgup`/`pgdn`/`space` page, `g`/`G` top/bottom, `[`/`]`
+previous/next file, `o` expand/collapse the file under the cursor (very large diffs
+and lockfiles collapse by default).
 
 ## Configuration
 
@@ -148,7 +212,7 @@ config change, not code.
 
 ## Not yet built (deliberately, next phases)
 
-Bubble Tea TUI (richer than the ANSI client), the web reading-room with side-by-side
-diffs, an fsnotify watcher, and a SQLite store — all drop in behind the interfaces above
-without reworking the engine. (These need external modules; this build is pure stdlib
-because the module proxy was unavailable when it was written.)
+The web reading-room with side-by-side diffs and a SQLite store — see
+[ROADMAP.md](ROADMAP.md) for the full path. Both drop in behind the interfaces above
+without reworking the engine (the Bubble Tea TUI and the fsnotify watcher shipped in
+v0.2/v0.3, following the same pattern).

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
@@ -343,5 +344,43 @@ func BenchmarkDiffviewRenderFrame(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		v.offset = i % (maxOffset + 1)
 		_ = v.render(120, 60, hl, danger)
+	}
+}
+
+// TestDiffviewRenderFrameStaysWithinBudget is a deterministic regression
+// guard alongside BenchmarkDiffviewRenderFrame above: same 5k-line/60-row
+// fixture, but a plain pass/fail wall-clock assertion — `go test -bench`
+// isn't part of `go test`'s pass/fail signal, so a benchmark alone can't
+// "enforce" a budget (P3-design.md §6) in CI, only report it. The 8ms
+// ceiling sits well above the ~576µs actually measured (headroom for a
+// loaded CI box) yet comfortably inside the design's 16ms/frame scroll
+// budget, so a real virtualization regression (e.g. accidentally
+// re-styling the whole diff instead of just the visible window) trips it
+// without flaking on ordinary timing noise. Takes the best of several runs
+// to avoid a one-off GC/scheduler blip failing the build.
+func TestDiffviewRenderFrameStaysWithinBudget(t *testing.T) {
+	d := bigRealisticDiff(5000)
+	v := newTestPane(d)
+	v.setHeight(60)
+
+	hl := newHighlightCache()
+	hl.maxBytes = 64 * 1024 * 1024 // enough to hold every file without evicting
+	for _, f := range d.Files {
+		hl.put(f.Hash, strings.Split(concatFileContent(f), "\n"))
+	}
+	danger := map[string]bool{}
+
+	const budget = 8 * time.Millisecond
+	best := time.Hour
+	for i := 0; i < 5; i++ {
+		v.offset = i
+		start := time.Now()
+		_ = v.render(120, 60, hl, danger)
+		if elapsed := time.Since(start); elapsed < best {
+			best = elapsed
+		}
+	}
+	if best > budget {
+		t.Errorf("best-of-5 render() took %v, want under %v (design budget: <16ms; WP2 measured ~576µs)", best, budget)
 	}
 }

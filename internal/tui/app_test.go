@@ -31,6 +31,52 @@ func newTestModel(api apiClient) appModel {
 	return appModel{api: api, ctx: context.Background(), retryCh: make(chan struct{}, 1), radar: newRadarView()}
 }
 
+// ---- startup budget (P3-design.md §6: "< 150ms to first paint... Init only
+// *dispatches* cmds") ----
+
+// TestInitReturnsImmediatelyEvenWithASlowBackend pins the startup-budget
+// mitigation literally: Init must hand back a tea.Cmd batch (deferred
+// closures bubbletea's own runtime invokes later, concurrently, off this
+// call) rather than ever calling the API synchronously inline. A fakeAPI
+// whose Worktrees blocks for well over a "human-perceptible" delay proves
+// the difference — a regression that inlined the fetch (defeating the
+// whole "shell paints before any I/O" contract) would make this test time
+// out, not just run slow.
+func TestInitReturnsImmediatelyEvenWithASlowBackend(t *testing.T) {
+	block := make(chan struct{})
+	api := &fakeAPI{
+		worktreesFn: func(ctx context.Context) ([]model.Worktree, error) {
+			<-block // never closed in this test: Init must not wait on this
+			return nil, nil
+		},
+	}
+	m := newTestModel(api)
+
+	start := time.Now()
+	cmd := m.Init()
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
+		t.Errorf("Init() took %v to return, want well under 20ms regardless of backend latency", elapsed)
+	}
+	if cmd == nil {
+		t.Fatal("Init() returned a nil Cmd")
+	}
+}
+
+// TestViewRendersBeforeInitsCommandsHaveRun is the View half of the same
+// budget: the very first frame (P3-design.md §1.4's "loading" state) must
+// not depend on any data having arrived yet.
+func TestViewRendersBeforeInitsCommandsHaveRun(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	start := time.Now()
+	out := m.View()
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
+		t.Errorf("View() took %v before any msg arrived, want well under 20ms", elapsed)
+	}
+	if out == "" {
+		t.Error("View() before any size/data message rendered nothing, want the loading placeholder")
+	}
+}
+
 // ---- resize / min-size guard ----
 
 func TestUpdateWindowSizeMsgSetsDimensions(t *testing.T) {

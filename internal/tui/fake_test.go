@@ -37,6 +37,7 @@ type fakeAPI struct {
 
 	worktrees    []model.Worktree
 	worktreesErr error
+	worktreesFn  func(ctx context.Context) ([]model.Worktree, error)
 
 	diff    model.Diff
 	diffErr error
@@ -69,10 +70,15 @@ func (f *fakeAPI) Version(context.Context) (int, string, error) {
 	return f.protocol, f.version, f.versionErr
 }
 
-func (f *fakeAPI) Worktrees(context.Context) ([]model.Worktree, error) {
+func (f *fakeAPI) Worktrees(ctx context.Context) ([]model.Worktree, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.worktrees, f.worktreesErr
+	fn := f.worktreesFn
+	wts, err := f.worktrees, f.worktreesErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return wts, err
 }
 
 func (f *fakeAPI) Diff(ctx context.Context, id string) (model.Diff, error) {
