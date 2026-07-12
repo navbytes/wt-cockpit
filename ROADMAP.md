@@ -28,16 +28,16 @@ What exists today, built test-first (39 tests, `-race` clean, pure stdlib):
 
 Goal: the daemon becomes something you leave running for weeks.
 
-- **fsnotify watcher** behind the existing `Watcher` interface: git-state-first
+- ✅ **fsnotify watcher** behind the existing `Watcher` interface: git-state-first
   (`.git/HEAD`, `.git/index`, refs) + `.gitignore`-aware working-tree watches;
   debounce (~150ms); bounded re-diff worker pool. Polling stays as the fallback
   for network mounts.
-- **Config file** `~/.config/wtcockpit/config.toml`: roots, per-repo base branch,
+- ✅ **Config file** `~/.config/wtcockpit/config.toml`: roots, per-repo base branch,
   guardrail rules (the engine already treats rules as data), activity window.
-- **Protocol handshake** with `protocolVersion`; clients refuse a major mismatch.
-- **Review identity fix**: key review state per-file on (path, content hash) rather
+- ✅ **Review identity fix**: key review state per-file on (path, content hash) rather
   than whole-diff hash, so committing work or touching one file no longer resets
   review on the others.
+- **Protocol handshake** with `protocolVersion`; clients refuse a major mismatch.
 - **Service files**: launchd plist (macOS) + systemd unit (Linux), `wtd install`.
 - Structured logging, `wt status` (daemon health, watch counts, scan timings).
 

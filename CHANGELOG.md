@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Per-file review identity: review marks now survive commits. Only files whose content actually changed flip back to unreviewed; each file's hash includes git blob IDs for real content identity (including binary files).
+- fsnotify git-state-first watcher: watches `.git/HEAD`, `.git/index`, and refs for changes (with fallback to polling for network mounts). Enabled by default; use `-watch fsnotify|poll` to select.
+- Config file `~/.config/wtcockpit/config.toml` (or `$XDG_CONFIG_HOME/wtcockpit/config.toml`): define roots, per-repo base branch overrides, guardrail rules, and daemon options. Precedence: explicit flags > config file > built-in defaults. Config file present-but-malformed is a fatal error (typos in guardrails won't silently fail).
+- `-config` flag to specify an alternate config file path.
+
+### Fixed
+- Unicode and space-containing filenames in diffs are now decoded correctly (core.quotePath handling).
+- Approve gate now re-diffs the worktree under lock before merging, preventing a commit landing between review and approve from bypassing the gated write path.
+
+### Changed
+- Review state schema is new (`reviewed_files` field); v0.1 review state is dropped silently on first load (migration is automatic, no user action needed).
+- `[[rules]]` section in the config file replaces the built-in defaults entirely (append-only would make defaults non-disableable). Omit the section to keep built-in rules.
+- Committing work no longer resets review state on other files in the same worktree.
+
 ## v0.1.0 — 2026-07-12
 
 Initial release: the engine MVP, built test-first (39 tests, race-clean, pure
