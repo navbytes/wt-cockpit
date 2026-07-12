@@ -130,6 +130,12 @@ type Diff struct {
 	Base       string     `json:"base"`
 	Hash       string     `json:"hash"`
 	Files      []DiffFile `json:"files"`
+	// Reviewed maps each file's path to whether it is currently marked
+	// reviewed (WP3 addition: cmd/wtd's handleDiff computes this from the
+	// engine's existing per-file hash matching, engine.Engine.ReviewedMap).
+	// Additive JSON (omitempty) — a pre-WP3 client simply never sees the
+	// field, per docs/02-stack-decision.md's forward-compat policy.
+	Reviewed map[string]bool `json:"reviewed,omitempty"`
 }
 
 // GuardrailHit records a tripped guardrail rule against a worktree/file.

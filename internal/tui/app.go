@@ -86,6 +86,8 @@ type appModel struct {
 
 	sidebar     sidebar
 	radar       radarView
+	review      reviewView
+	approve     approveModal
 	diffFocused bool // true once ⏎ has focused the diff pane (scroll keys act on it)
 	toast       string
 }
@@ -196,6 +198,36 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.radar.applyHighlighted(msg)
 		return m, nil
 
+	case reviewOKMsg:
+		m.radar.applyReviewOK(msg)
+		return m, nil
+
+	case reviewErrMsg:
+		cmd := m.radar.applyReviewErr(m.ctx, m.api, msg)
+		if msg.Conflict {
+			m.toast = fmt.Sprintf("%s changed since you viewed it — diff refreshed", msg.File)
+		} else {
+			m.toast = msg.Err.Error()
+		}
+		return m, tea.Batch(cmd, expireToastAfter(4*time.Second))
+
+	case approveOKMsg:
+		m.approve = approveModal{}
+		m.screen = screenRadar
+		m.toast = fmt.Sprintf("✓ merged %s → %s, worktree removed", msg.Res.Merged, msg.Res.Into)
+		return m, expireToastAfter(4 * time.Second)
+
+	case approveErrMsg:
+		m = m.applyApproveErr(msg)
+		return m, nil
+
+	case tmuxDoneMsg:
+		if msg.Err != nil {
+			m.toast = msg.Err.Error()
+			return m, expireToastAfter(4 * time.Second)
+		}
+		return m, nil
+
 	case listErrMsg:
 		if !isUnreachable(msg.Err) {
 			m.toast = msg.Err.Error()
@@ -222,25 +254,29 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleKey is Update's tea.KeyMsg branch. When a fatal condition is showing,
-// every key exits non-zero (P3-design.md §1.4). A few keys act the same
-// regardless of focus (quit, review, refresh); everything else routes on
-// m.diffFocused, WP2's Radar-scoped focus model (⏎ focuses the diff pane so
-// scroll keys act on it; esc un-focuses before falling back to view
-// routing). t/a/f and Review's own key handling remain WP3 behavior.
+// every key exits non-zero (P3-design.md §1.4). The approve modal and the
+// sidebar's search input each capture the keyboard entirely while active
+// (checked first, in that order — search can only be entered from Radar, so
+// the two never overlap). A few keys act the same regardless of screen/focus
+// (quit, refresh, tmux jump, approve); Review routes to its own handler;
+// everything else in Radar routes on m.diffFocused, WP2's focus model (⏎
+// focuses the diff pane so scroll keys act on it; esc un-focuses before
+// falling back to view routing, but clears an active sidebar filter first if
+// one is set).
 func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.fatal != "" {
 		m.exitErr = errors.New(m.fatal)
 		return m, tea.Quit
 	}
+	if m.approve.open {
+		return m.handleApproveKey(msg)
+	}
+	if m.sidebar.searching() {
+		return m.handleSearchKey(msg)
+	}
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
-	case key.Matches(msg, keys.Review):
-		if _, ok := m.sidebar.selected(); ok {
-			m.screen = screenReview
-			m.diffFocused = false
-		}
-		return m, nil
 	case key.Matches(msg, keys.Refresh):
 		// Also skip an in-progress reconnect backoff wait (the down-card's
 		// "R retry now") — a non-blocking send since retryCh is 1-buffered
@@ -250,6 +286,34 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 		}
 		return m, refreshCmd(m.ctx, m.api)
+	case key.Matches(msg, keys.TmuxJump):
+		if w, ok := m.sidebar.selected(); ok {
+			return m, tmuxJumpCmd(w.Path)
+		}
+		return m, nil
+	case key.Matches(msg, keys.Approve):
+		return m.openApprove()
+	}
+
+	if m.screen == screenReview {
+		return m.handleReviewKey(msg)
+	}
+
+	switch {
+	case key.Matches(msg, keys.Review):
+		if _, ok := m.sidebar.selected(); ok {
+			m.screen = screenReview
+			m.diffFocused = false
+		}
+		return m, nil
+	case key.Matches(msg, keys.Search):
+		m.sidebar.startSearch()
+		m.diffFocused = false
+		return m, nil
+	case key.Matches(msg, keys.FilterActive):
+		m.sidebar.activeOnly = !m.sidebar.activeOnly
+		m.sidebar.fixSelection()
+		return m, m.ensureDiffForSelection()
 	}
 
 	if m.diffFocused {
@@ -268,9 +332,108 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.radar.ensureHighlightsCmd()
 		}
 	case key.Matches(msg, keys.Esc):
+		if m.sidebar.hasFilter() {
+			m.sidebar.clearFilter()
+			return m, m.ensureDiffForSelection()
+		}
 		m.screen = screenRadar
 	}
 	return m, nil
+}
+
+// handleSearchKey routes keys while the sidebar's search input has focus
+// (P3-design.md §1.3's "/"): ⏎ commits the query (stays filtered, exits
+// input mode), esc clears it entirely, ctrl+c still quits; every other
+// key — including the literal rune "q", normally Quit — goes to the text
+// input itself ("q inert while search input is focused").
+func (m appModel) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "enter":
+		m.sidebar.commitSearch()
+		return m, m.ensureDiffForSelection()
+	case "esc":
+		m.sidebar.cancelSearch()
+		return m, m.ensureDiffForSelection()
+	}
+	cmd := m.sidebar.updateSearchInput(msg)
+	return m, tea.Batch(cmd, m.ensureDiffForSelection())
+}
+
+// handleReviewKey routes tea.KeyMsg while m.screen == screenReview
+// (P3-design.md §1.3's Review keybindings): j/k walk files — reusing the
+// same PrevFile/NextFile the diff pane already exposes for Radar's `[`/`]`
+// — space optimistically toggles the file under the cursor, esc returns to
+// Radar, and the remaining keys fine-scroll the same shared pane Radar
+// uses. j/k are matched on the raw key string rather than key.Matches,
+// since keys.Up/Down bind those same runes to line-scrolling for Radar's
+// diff-focused mode — Review needs the two split apart.
+func (m appModel) handleReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "j":
+		m.radar.pane.NextFile()
+		return m, m.radar.ensureHighlightsCmd()
+	case "k":
+		m.radar.pane.PrevFile()
+		return m, m.radar.ensureHighlightsCmd()
+	}
+	switch {
+	case key.Matches(msg, keys.Esc):
+		m.screen = screenRadar
+		return m, nil
+	case key.Matches(msg, keys.ToggleReview):
+		return m.toggleReviewedCurrentFile()
+	case key.Matches(msg, keys.Up):
+		m.radar.pane.LineUp()
+	case key.Matches(msg, keys.Down):
+		m.radar.pane.LineDown()
+	case key.Matches(msg, keys.HalfPageDown):
+		m.radar.pane.HalfPageDown()
+	case key.Matches(msg, keys.HalfPageUp):
+		m.radar.pane.HalfPageUp()
+	case key.Matches(msg, keys.PageDown):
+		m.radar.pane.PageDown()
+	case key.Matches(msg, keys.PageUp):
+		m.radar.pane.PageUp()
+	case key.Matches(msg, keys.Top):
+		m.radar.pane.Top()
+	case key.Matches(msg, keys.Bottom):
+		m.radar.pane.Bottom()
+	}
+	return m, m.radar.ensureHighlightsCmd()
+}
+
+// toggleReviewedCurrentFile optimistically flips the file under the diff
+// pane's cursor and fires the request carrying the currently-displayed hash
+// (P3-design.md §1.5's conflict contract: a 409 means the file changed
+// since it was viewed). No-ops if nothing is selected or the diff has no
+// files under the cursor (e.g. still loading).
+func (m appModel) toggleReviewedCurrentFile() (tea.Model, tea.Cmd) {
+	w, ok := m.sidebar.selected()
+	if !ok {
+		return m, nil
+	}
+	f, ok := m.radar.pane.currentFile()
+	if !ok {
+		return m, nil
+	}
+	next := !m.radar.pane.diff.Reviewed[f.Path]
+	m.radar.pane.setReviewed(f.Path, next)
+	return m, setReviewedCmd(m.ctx, m.api, w.ID, f.Path, next, f.Hash)
+}
+
+func setReviewedCmd(ctx context.Context, api apiClient, id, file string, reviewed bool, hash string) tea.Cmd {
+	return func() tea.Msg {
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		err := api.SetReviewed(reqCtx, id, file, reviewed, hash)
+		if err == nil {
+			return reviewOKMsg{ID: id, File: file, Reviewed: reviewed}
+		}
+		var conflict *client.ConflictError
+		return reviewErrMsg{ID: id, File: file, Conflict: errors.As(err, &conflict), Err: err}
+	}
 }
 
 // handleDiffKey is P3-design.md §1.3's diff-pane scrolling set, active only
@@ -323,9 +486,11 @@ func (m *appModel) ensureDiffForSelection() tea.Cmd {
 // which worktree is selected, re-check the diff pane); a snapshot (sent on
 // every (re)connect) re-runs the startup fetches — the resync story:
 // reconnect cannot miss state because connect always snapshots. diff.ready
-// is the diff pane's own hash-gated refetch (radar.go). guardrail.tripped
-// and any future type are forward-compat-ignored (§2.8); review.changed is
-// WP3 territory.
+// is the diff pane's own hash-gated refetch (radar.go). review.changed
+// refetches the whole worktree list — it's the only source of the aggregate
+// Reviewed/Stats.Files counts the topbar and approve modal show, and the
+// event itself carries no counts. guardrail.tripped and any future type are
+// forward-compat-ignored (§2.8).
 func (m *appModel) applyEvent(e model.Event) tea.Cmd {
 	switch e.Type {
 	case model.EventWorktreeUpserted:
@@ -336,6 +501,8 @@ func (m *appModel) applyEvent(e model.Event) tea.Cmd {
 		m.sidebar.remove(e.ID)
 	case model.EventDiffReady:
 		return m.radar.applyDiffReady(m.ctx, m.api, e)
+	case model.EventReviewChanged:
+		return fetchList(m.ctx, m.api)
 	case eventTypeSnapshot:
 		return tea.Batch(fetchVersion(m.ctx, m.api), fetchList(m.ctx, m.api))
 	}
@@ -405,6 +572,8 @@ func (m appModel) View() string {
 	case m.fatal != "":
 		card := styles.FatalCard.Render("protocol mismatch\n\n" + m.fatal + "\n\nany key exits")
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, card)
+	case m.approve.open:
+		return renderApproveModal(m.width, m.height, m.approve)
 	case !m.sidebar.hasData && (m.conn == connDown || m.conn == connReconnecting):
 		return m.downCardView()
 	default:
@@ -445,8 +614,8 @@ func (m appModel) shellView() string {
 	return lipgloss.JoinVertical(lipgloss.Left, top, body, keybar)
 }
 
-// mainPaneView renders Radar's real diff pane (flatten.go/diffview.go/
-// radar.go); Review's rail is still WP3's stub.
+// mainPaneView renders Radar's diff pane (flatten.go/diffview.go/radar.go)
+// or, in Review, the same diff plus the right rail (review.go).
 func (m appModel) mainPaneView(width, height int) string {
 	w, ok := m.sidebar.selected()
 	if !ok {
@@ -454,8 +623,7 @@ func (m appModel) mainPaneView(width, height int) string {
 		return style.Render(styles.Dim.Render("no worktree selected"))
 	}
 	if m.screen == screenReview {
-		style := lipgloss.NewStyle().Width(width).Height(height)
-		return style.Render(styles.Txt.Render(fmt.Sprintf("%s / %s   base %s   review: WP3", w.Repo, w.Name, w.Base)))
+		return m.review.view(width, height, w, &m.radar)
 	}
 	return m.radar.view(width, height, w)
 }

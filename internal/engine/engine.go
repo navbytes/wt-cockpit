@@ -150,6 +150,31 @@ func (e *Engine) SetReviewed(id, file string, reviewed bool, expectedHash string
 	return nil
 }
 
+// ReviewedMap returns, for worktree id's current diff, whether each file is
+// currently marked reviewed: true when the file's stored review hash
+// matches its present diff hash (the same per-file rule reviewedCount's
+// aggregate uses) — a stale hash, i.e. the file changed since it was
+// reviewed, reads as false, same as a file that was never reviewed at all.
+// Read-only; added so cmd/wtd's GET /api/diff can serve a per-file reviewed
+// map (P3-design.md's sanctioned WP3 addition: WP2 found the diff pane's
+// per-file ✓ had nothing to key on, since Worktree.Reviewed is only an
+// aggregate count). ok=false for an unknown worktree, mirroring Diff's own
+// contract.
+func (e *Engine) ReviewedMap(id string) (map[string]bool, bool) {
+	e.mu.RLock()
+	m, ok := e.cache[id]
+	e.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	reviewed, _ := e.st.ReviewedFiles(id) // jsonStore's ReviewedFiles never errors
+	out := make(map[string]bool, len(m.diff.Files))
+	for _, f := range m.diff.Files {
+		out[f.Path] = reviewed[f.Path] == f.Hash
+	}
+	return out, true
+}
+
 // findDiffFile looks up a file by path within a diff's files.
 func findDiffFile(files []model.DiffFile, path string) *model.DiffFile {
 	for i := range files {

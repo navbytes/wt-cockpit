@@ -207,6 +207,62 @@ func TestDiffviewToggleFoldNoOpOnNonCollapsedFile(t *testing.T) {
 	}
 }
 
+// ---- WP3: per-file reviewed state (setReviewed/currentFile, ✓ in the header) ----
+
+func TestRenderFileHeaderShowsCheckmarkWhenReviewed(t *testing.T) {
+	v := newTestPane(manyLineDiff(3))
+	v.setReviewed("big.go", true)
+	out := stripANSI(v.renderFileHeader(0, 80, nil))
+	if !strings.Contains(out, "✓") {
+		t.Errorf("header = %q, want a ✓ for a reviewed file", out)
+	}
+}
+
+func TestRenderFileHeaderNoCheckmarkWhenNotReviewed(t *testing.T) {
+	v := newTestPane(manyLineDiff(3))
+	out := stripANSI(v.renderFileHeader(0, 80, nil))
+	if strings.Contains(out, "✓") {
+		t.Errorf("header = %q, want no ✓ for an unreviewed file", out)
+	}
+}
+
+func TestCurrentFileReturnsFileUnderCursor(t *testing.T) {
+	d := model.Diff{WorktreeID: "w1", Files: []model.DiffFile{
+		{Path: "a.go", Hash: "ha"}, {Path: "b.go", Hash: "hb"},
+	}}
+	v := newTestPane(d)
+	v.setHeight(1) // each file is a bare 1-row header here (no hunks); height must be < total rows or clampOffset undoes the jump
+	v.NextFile()   // jump to b.go's header
+	f, ok := v.currentFile()
+	if !ok || f.Path != "b.go" {
+		t.Errorf("currentFile() = %+v, %v, want b.go", f, ok)
+	}
+}
+
+func TestCurrentFileEmptyDiffReturnsFalse(t *testing.T) {
+	var v diffview
+	v.setDiff(model.Diff{WorktreeID: "w1"})
+	if _, ok := v.currentFile(); ok {
+		t.Error("currentFile() ok = true for an empty diff, want false")
+	}
+}
+
+func TestSetReviewedInitializesNilMapAndIsReadableViaDiffReviewed(t *testing.T) {
+	var v diffview
+	v.setDiff(model.Diff{WorktreeID: "w1", Files: []model.DiffFile{{Path: "a.go"}}})
+	if v.diff.Reviewed != nil {
+		t.Fatal("precondition: a freshly loaded diff should have a nil Reviewed map")
+	}
+	v.setReviewed("a.go", true)
+	if !v.diff.Reviewed["a.go"] {
+		t.Error("setReviewed(a.go, true) did not stick")
+	}
+	v.setReviewed("a.go", false)
+	if v.diff.Reviewed["a.go"] {
+		t.Error("setReviewed(a.go, false) did not revert")
+	}
+}
+
 // TestDiffviewRenderProducesExactlyHeightLines pins that a render() block is
 // always exactly `height` lines tall, whether the diff over- or under-fills
 // the viewport — required for lipgloss.JoinHorizontal alongside the sidebar

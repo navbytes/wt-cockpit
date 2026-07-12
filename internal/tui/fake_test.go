@@ -42,6 +42,15 @@ type fakeAPI struct {
 	diffErr error
 	diffFn  func(ctx context.Context, id string) (model.Diff, error)
 
+	setReviewedErr   error
+	setReviewedFn    func(ctx context.Context, id, file string, reviewed bool, hash string) error
+	setReviewedCalls []setReviewedCall
+
+	approveResult model.ApproveResult
+	approveErr    error
+	approveFn     func(ctx context.Context, id string) (model.ApproveResult, error)
+	approveCalls  []string
+
 	refreshErr error
 
 	// events/errs are returned as-is by Events on every call — tests that
@@ -77,12 +86,37 @@ func (f *fakeAPI) Diff(ctx context.Context, id string) (model.Diff, error) {
 	return d, err
 }
 
-func (f *fakeAPI) SetReviewed(context.Context, string, string, bool, string) error {
-	return nil
+// setReviewedCall records one SetReviewed invocation for tests that assert
+// on exactly what was sent (notably the displayed hash, per the P1 conflict
+// contract).
+type setReviewedCall struct {
+	id, file string
+	reviewed bool
+	hash     string
 }
 
-func (f *fakeAPI) Approve(context.Context, string) (model.ApproveResult, error) {
-	return model.ApproveResult{}, nil
+func (f *fakeAPI) SetReviewed(ctx context.Context, id, file string, reviewed bool, hash string) error {
+	f.mu.Lock()
+	f.setReviewedCalls = append(f.setReviewedCalls, setReviewedCall{id: id, file: file, reviewed: reviewed, hash: hash})
+	fn := f.setReviewedFn
+	err := f.setReviewedErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, id, file, reviewed, hash)
+	}
+	return err
+}
+
+func (f *fakeAPI) Approve(ctx context.Context, id string) (model.ApproveResult, error) {
+	f.mu.Lock()
+	f.approveCalls = append(f.approveCalls, id)
+	fn := f.approveFn
+	res, err := f.approveResult, f.approveErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, id)
+	}
+	return res, err
 }
 
 func (f *fakeAPI) Refresh(context.Context) error {

@@ -449,6 +449,12 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown worktree id", http.StatusNotFound)
 		return
 	}
+	// ponytail: two separate engine reads rather than one atomic accessor —
+	// a concurrent refresh landing between them can only produce a
+	// momentarily-stale reviewed flag, which self-heals on the very next
+	// diff.ready/review.changed event; not worth a wider lock for a
+	// read-only display field.
+	d.Reviewed, _ = s.eng.ReviewedMap(id)
 	writeJSON(w, d)
 }
 

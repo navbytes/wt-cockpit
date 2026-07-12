@@ -140,6 +140,33 @@ func (r *radarView) ensureHighlightsCmd() tea.Cmd {
 	return ensureHighlightCmds(&r.pane, r.hl, r.pending)
 }
 
+// applyReviewOK reconciles the pane's optimistic toggle with the server's
+// confirmation (P3-design.md §1.5's "server truth reconciliation") — a
+// no-op in the common case (it already matches what was optimistically
+// set), self-correcting if a rapid double-toggle raced it.
+func (r *radarView) applyReviewOK(msg reviewOKMsg) {
+	if msg.ID != r.currentID {
+		return
+	}
+	r.pane.setReviewed(msg.File, msg.Reviewed)
+}
+
+// applyReviewErr reverts the optimistic toggle for any failure (reviewErrMsg
+// carries no "requested value" field to invert against — flipping whatever
+// is currently set undoes exactly that earlier optimistic write), and —
+// only for the 409 conflict case — also refetches the diff, since the
+// file's *content* changed too, not just its reviewed flag (P3-design.md
+// §1.4's "diff refreshed").
+func (r *radarView) applyReviewErr(ctx context.Context, api apiClient, msg reviewErrMsg) tea.Cmd {
+	if msg.ID == r.currentID {
+		r.pane.setReviewed(msg.File, !r.pane.diff.Reviewed[msg.File])
+	}
+	if msg.Conflict {
+		return fetchDiffCmd(ctx, api, msg.ID)
+	}
+	return nil
+}
+
 // view renders the Radar main pane for the selected worktree w: header,
 // guardrail banner (when tripped), then the virtualized diff (or a loading/
 // error placeholder while the pane isn't yet showing w's diff).

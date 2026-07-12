@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
@@ -28,6 +30,14 @@ type sidebar struct {
 	rows       []sidebarRow
 	selectedID string
 	hasData    bool // Worktrees() has succeeded at least once (even if empty)
+
+	// WP3 filtering (P3-design.md §1.3 "/" and "f"). filterInput.Value() is
+	// the live fuzzy-substring query regardless of focus state — committing
+	// (⏎) just blurs it, clearing (esc) blanks it; reading Value() on a
+	// never-initialized zero-value Model is safe (always ""), so no explicit
+	// constructor is needed for a plain `var s sidebar`/zero-value appModel.
+	filterInput textinput.Model
+	activeOnly  bool // "f" toggle — active-only worktrees
 }
 
 // setWorktrees replaces the full worktree set (a fresh GET /api/worktrees or
@@ -90,18 +100,21 @@ func (s *sidebar) worktrees() []model.Worktree {
 	return wts
 }
 
-// fixSelection keeps selectedID pointing at a real row when possible: if it
-// still exists after a rebuild, leave it; otherwise pick the first
-// selectable row, or "" if there are none (empty workspace).
+// fixSelection keeps selectedID pointing at a real, currently-*visible* row
+// when possible: if it still exists in the filtered view after a rebuild
+// (or after the filter itself changed), leave it; otherwise pick the first
+// visible row, or "" if there are none (empty workspace, or everything
+// filtered out).
 func (s *sidebar) fixSelection() {
+	rows := s.filtered()
 	if s.selectedID != "" {
-		for _, r := range s.rows {
+		for _, r := range rows {
 			if !r.header && r.wt.ID == s.selectedID {
 				return
 			}
 		}
 	}
-	for _, r := range s.rows {
+	for _, r := range rows {
 		if !r.header {
 			s.selectedID = r.wt.ID
 			return
@@ -147,20 +160,27 @@ func (s *sidebar) moveDown() { s.move(1) }
 func (s *sidebar) moveUp()   { s.move(-1) }
 
 func (s *sidebar) move(delta int) {
-	idx := s.selectedIndex()
+	rows := s.filtered()
+	idx := -1
+	for i, r := range rows {
+		if !r.header && r.wt.ID == s.selectedID {
+			idx = i
+			break
+		}
+	}
 	if idx < 0 {
 		return
 	}
-	for i := idx + delta; i >= 0 && i < len(s.rows); i += delta {
-		if !s.rows[i].header {
-			s.selectedID = s.rows[i].wt.ID
+	for i := idx + delta; i >= 0 && i < len(rows); i += delta {
+		if !rows[i].header {
+			s.selectedID = rows[i].wt.ID
 			return
 		}
 	}
 }
 
 func (s *sidebar) selectedIndex() int {
-	for i, r := range s.rows {
+	for i, r := range s.filtered() {
 		if !r.header && r.wt.ID == s.selectedID {
 			return i
 		}
@@ -169,9 +189,9 @@ func (s *sidebar) selectedIndex() int {
 }
 
 // selected returns the currently selected worktree, or false if there is
-// none (empty workspace).
+// none (empty workspace, or the selection has been filtered out).
 func (s *sidebar) selected() (model.Worktree, bool) {
-	for _, r := range s.rows {
+	for _, r := range s.filtered() {
 		if !r.header && r.wt.ID == s.selectedID {
 			return r.wt, true
 		}
@@ -179,22 +199,157 @@ func (s *sidebar) selected() (model.Worktree, bool) {
 	return model.Worktree{}, false
 }
 
+// ---- WP3: "/" search + "f" active-only filter (P3-design.md §1.3) ----
+
+// searching reports whether the search input currently has keyboard focus
+// (app.go routes every key to it while true).
+func (s *sidebar) searching() bool { return s.filterInput.Focused() }
+
+// hasFilter reports whether a query or the active-only toggle would narrow
+// the visible rows right now — the esc ladder's "clears active search/
+// filter first if one is set" rung checks this.
+func (s *sidebar) hasFilter() bool {
+	return s.filterInput.Value() != "" || s.activeOnly
+}
+
+// clearFilter resets both the query and the active-only toggle together —
+// esc's "back to everything" rung.
+func (s *sidebar) clearFilter() {
+	s.filterInput.SetValue("")
+	s.activeOnly = false
+	s.fixSelection()
+}
+
+// startSearch opens the search input, seeded with whatever query was
+// already committed (so re-opening `/` to refine a filter doesn't lose it).
+// A fresh textinput.Model is (re)built here — its zero value has a nil
+// Cursor/KeyMap and isn't safe to Focus/Update/View until textinput.New has
+// run, which this is the one path that ever needs to.
+func (s *sidebar) startSearch() {
+	prev := s.filterInput.Value()
+	s.filterInput = textinput.New()
+	s.filterInput.Prompt = "/ "
+	s.filterInput.SetValue(prev)
+	s.filterInput.CursorEnd()
+	s.filterInput.Focus()
+}
+
+// commitSearch is "/"'s ⏎: stop capturing keys but keep the query applied.
+func (s *sidebar) commitSearch() {
+	s.filterInput.Blur()
+	s.fixSelection()
+}
+
+// cancelSearch is "/"'s esc while typing: blank the query entirely and stop
+// capturing keys (distinct from the general esc ladder's clearFilter, which
+// only fires once you're no longer in the input at all — same end state,
+// reached from a different key context).
+func (s *sidebar) cancelSearch() {
+	s.filterInput.SetValue("")
+	s.filterInput.Blur()
+	s.fixSelection()
+}
+
+// updateSearchInput forwards one keystroke to the text input and re-derives
+// the live filter (P3-design.md: "⏎ keeps filter" implies the filter is
+// already live while typing, not only once committed).
+func (s *sidebar) updateSearchInput(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	s.filterInput, cmd = s.filterInput.Update(msg)
+	s.fixSelection()
+	return cmd
+}
+
+// filtered returns the rows actually shown/navigable given the current
+// query and active-only toggle: a fuzzy-substring match (case-insensitive
+// substring — P3-design.md doesn't specify a scored fuzzy algorithm, and a
+// plain substring check is the simplest thing satisfying "fuzzy-substring")
+// against repo/name/branch, ANDed with the active-only toggle. A repo's
+// header is kept only if at least one of its worktrees still matches.
+// Returns s.rows unchanged (the fast path, and the only path every pre-WP3
+// caller/test exercises) when neither filter is active.
+func (s *sidebar) filtered() []sidebarRow {
+	query := s.filterInput.Value()
+	if query == "" && !s.activeOnly {
+		return s.rows
+	}
+	var out []sidebarRow
+	var pendingHeader *sidebarRow
+	for i := range s.rows {
+		r := s.rows[i]
+		if r.header {
+			h := r
+			pendingHeader = &h
+			continue
+		}
+		if !matchesFilter(r.wt, query, s.activeOnly) {
+			continue
+		}
+		if pendingHeader != nil {
+			out = append(out, *pendingHeader)
+			pendingHeader = nil
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// filterStatusLine is the dim reminder shown once a filter is applied but
+// the search input isn't currently focused (so the user knows why rows are
+// missing, and that esc clears it).
+func filterStatusLine(query string, activeOnly bool) string {
+	var parts []string
+	if query != "" {
+		parts = append(parts, "/"+query)
+	}
+	if activeOnly {
+		parts = append(parts, "active-only")
+	}
+	return "  " + strings.Join(parts, " · ") + " (esc clears)"
+}
+
+// matchesFilter is filtered()'s per-worktree predicate.
+func matchesFilter(w model.Worktree, query string, activeOnly bool) bool {
+	if activeOnly && w.State != model.StateActive {
+		return false
+	}
+	if query == "" {
+		return true
+	}
+	q := strings.ToLower(query)
+	return strings.Contains(strings.ToLower(w.Repo), q) ||
+		strings.Contains(strings.ToLower(w.Name), q) ||
+		strings.Contains(strings.ToLower(w.Branch), q)
+}
+
 // view renders the sidebar into a width-constrained block. WP1: plain rows
 // (state dot, name, agent chip, relative time, +add -del); the mock's ⚠
 // guardrail badge coloring by worst severity, and virtualized scrolling for
 // more rows than height, are WP2/WP3 polish once the diff pane makes a
-// taller sidebar worth scrolling.
+// taller sidebar worth scrolling. WP3 adds the "/" search input (shown only
+// while focused) and a dim status line once a query/active-only filter is
+// applied but no longer being typed.
 func (s *sidebar) view(width, height int) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, styles.Faint.Render("WORKTREES · LIVE"))
 
 	switch {
+	case s.searching():
+		fmt.Fprintln(&b, s.filterInput.View())
+	case s.hasFilter():
+		fmt.Fprintln(&b, styles.Dim.Render(filterStatusLine(s.filterInput.Value(), s.activeOnly)))
+	}
+
+	rows := s.filtered()
+	switch {
 	case !s.hasData:
 		fmt.Fprint(&b, styles.Dim.Render("  connecting to wtd…"))
-	case len(s.rows) == 0:
+	case len(rows) == 0 && len(s.rows) > 0:
+		fmt.Fprint(&b, styles.Dim.Render("  no worktrees match the filter"))
+	case len(rows) == 0:
 		fmt.Fprint(&b, styles.Dim.Render("  no worktrees — wtd -root <dir>"))
 	default:
-		for i, r := range s.rows {
+		for i, r := range rows {
 			if i > 0 {
 				fmt.Fprintln(&b)
 			}

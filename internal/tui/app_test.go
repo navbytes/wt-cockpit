@@ -524,6 +524,329 @@ func TestHandleKeyRefreshInvokesRefreshAndReportsResult(t *testing.T) {
 	}
 }
 
+// ---- review toggle (space, in Review view) ----
+
+// reviewFixture builds a model with a1 selected, in Review, with a
+// two-file diff already loaded into the shared pane — the common setup for
+// the toggle/reconciliation tests below.
+func reviewFixture(api apiClient) appModel {
+	m := newTestModel(api)
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature", Base: "main"}})
+	m.screen = screenReview
+	m.radar.currentID = "a1"
+	m.radar.pane.setDiff(model.Diff{WorktreeID: "a1", Files: []model.DiffFile{
+		{Path: "a.go", Hash: "ha"}, {Path: "b.go", Hash: "hb"},
+	}})
+	return m
+}
+
+// TestHandleReviewKeySpaceOptimisticallyTogglesAndSendsDisplayedHash pins
+// the whole point of the conflict contract: the request must carry the
+// hash currently on screen, not an empty/stale one.
+func TestHandleReviewKeySpaceOptimisticallyTogglesAndSendsDisplayedHash(t *testing.T) {
+	api := &fakeAPI{}
+	m := reviewFixture(api)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	got := updated.(appModel)
+	if !got.radar.pane.diff.Reviewed["a.go"] {
+		t.Error("space should optimistically mark the file under the cursor (a.go) reviewed immediately")
+	}
+	if cmd == nil {
+		t.Fatal("expected a SetReviewed command")
+	}
+	msg := cmd()
+	ok, isOK := msg.(reviewOKMsg)
+	if !isOK || ok.ID != "a1" || ok.File != "a.go" || !ok.Reviewed {
+		t.Fatalf("cmd() = %#v, want reviewOKMsg{a1, a.go, true}", msg)
+	}
+	if len(api.setReviewedCalls) != 1 {
+		t.Fatalf("SetReviewed calls = %v, want exactly 1", api.setReviewedCalls)
+	}
+	call := api.setReviewedCalls[0]
+	if call.id != "a1" || call.file != "a.go" || !call.reviewed || call.hash != "ha" {
+		t.Errorf("SetReviewed call = %+v, want {a1 a.go true ha} (the displayed hash)", call)
+	}
+}
+
+func TestHandleReviewKeySpaceTogglesBackToUnreviewed(t *testing.T) {
+	m := reviewFixture(&fakeAPI{})
+	m.radar.pane.setReviewed("a.go", true)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	if got := updated.(appModel); got.radar.pane.diff.Reviewed["a.go"] {
+		t.Error("space on an already-reviewed file should toggle it back to unreviewed")
+	}
+}
+
+func TestHandleReviewKeySpaceNoOpWhenNothingSelected(t *testing.T) {
+	m := newTestModel(&fakeAPI{}) // empty sidebar, screenRadar by default
+	m.screen = screenReview
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	if cmd != nil {
+		t.Error("space with nothing selected should not dispatch a request")
+	}
+	_ = updated
+}
+
+// TestReviewOKMsgReconcilesPaneWithServerTruth covers the message actually
+// landing (as opposed to just the optimistic flip pinned above).
+func TestReviewOKMsgReconcilesPaneWithServerTruth(t *testing.T) {
+	m := reviewFixture(&fakeAPI{})
+	updated, _ := m.Update(reviewOKMsg{ID: "a1", File: "a.go", Reviewed: true})
+	if got := updated.(appModel); !got.radar.pane.diff.Reviewed["a.go"] {
+		t.Error("reviewOKMsg should leave the file marked reviewed")
+	}
+}
+
+// TestReviewErrMsgConflictRevertsAndRefetchesDiffWithToast pins the P1
+// conflict contract exercised for real: 409 -> revert the optimistic
+// toggle, toast naming the file, and a diff refetch.
+//
+// Note: this deliberately does NOT run Update()'s own returned command
+// through runBatch — it batches in expireToastAfter(4s), a real
+// tea.Tick that would block this test for 4 real seconds if invoked
+// synchronously. The diff-refetch half is exercised directly against
+// radarView.applyReviewErr instead, which is the exact sub-command Update
+// batches in.
+func TestReviewErrMsgConflictRevertsAndRefetchesDiffWithToast(t *testing.T) {
+	api := &fakeAPI{diff: model.Diff{WorktreeID: "a1", Hash: "h2", Files: []model.DiffFile{{Path: "a.go", Hash: "ha2"}}}}
+	m := reviewFixture(api)
+	m.radar.pane.setReviewed("a.go", true) // the optimistic flip that's about to be told it lost the race
+
+	errMsg := reviewErrMsg{ID: "a1", File: "a.go", Conflict: true, Err: errors.New("file changed since it was viewed: stale hash")}
+	updated, cmd := m.Update(errMsg)
+	got := updated.(appModel)
+	if got.radar.pane.diff.Reviewed["a.go"] {
+		t.Error("a 409 conflict must revert the optimistic toggle")
+	}
+	if !strings.Contains(got.toast, "a.go") || !strings.Contains(got.toast, "changed since you viewed it") {
+		t.Errorf("toast = %q, want it to name the file and explain the conflict", got.toast)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched command (diff refetch + toast expiry)")
+	}
+
+	diffCmd := m.radar.applyReviewErr(m.ctx, api, errMsg)
+	if diffCmd == nil {
+		t.Fatal("expected the conflict to trigger a diff refetch")
+	}
+	if dm, ok := diffCmd().(diffMsg); !ok || dm.ID != "a1" {
+		t.Errorf("applyReviewErr's command = %#v, want a diffMsg for a1", dm)
+	}
+}
+
+// TestReviewErrMsgNonConflictRevertsWithoutForcingRefetch covers a plain
+// failure (e.g. daemon unreachable): still reverts, still toasts, but
+// doesn't need the extra diff round trip a content-changed conflict does.
+func TestReviewErrMsgNonConflictRevertsWithoutForcingRefetch(t *testing.T) {
+	m := reviewFixture(&fakeAPI{})
+	m.radar.pane.setReviewed("a.go", true)
+
+	updated, _ := m.Update(reviewErrMsg{ID: "a1", File: "a.go", Conflict: false, Err: errors.New("boom")})
+	got := updated.(appModel)
+	if got.radar.pane.diff.Reviewed["a.go"] {
+		t.Error("any SetReviewed failure should revert the optimistic toggle")
+	}
+	if got.toast != "boom" {
+		t.Errorf("toast = %q, want the plain error message", got.toast)
+	}
+}
+
+// ---- Review j/k (file nav) vs arrows (line scroll) ----
+
+func TestHandleReviewKeyJKWalkFilesNotLines(t *testing.T) {
+	m := reviewFixture(&fakeAPI{})
+	before := m.radar.pane.offset
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	got := updated.(appModel)
+	if got.radar.pane.offset == before {
+		t.Error("j in Review should move to the next file (offset should change)")
+	}
+	if got.radar.pane.offset != got.radar.pane.fileOffsets[1] {
+		t.Errorf("offset = %d, want the second file's own header offset %d", got.radar.pane.offset, got.radar.pane.fileOffsets[1])
+	}
+}
+
+func TestHandleReviewKeyArrowDownScrollsLinesNotFiles(t *testing.T) {
+	m := reviewFixture(&fakeAPI{})
+	m.radar.pane.setDiff(manyLineDiff(50))
+	m.radar.pane.setHeight(10)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if got := updated.(appModel); got.radar.pane.offset != 1 {
+		t.Errorf("pane offset = %d, want 1 (arrow-down scrolls one line in Review)", got.radar.pane.offset)
+	}
+}
+
+// ---- review.changed SSE -> whole-list refetch ----
+
+// TestApplyEventReviewChangedTriggersListRefetch pins §2.4: the event
+// carries no counts, so the aggregate Reviewed/unreviewed numbers can only
+// come from refetching /api/worktrees.
+func TestApplyEventReviewChangedTriggersListRefetch(t *testing.T) {
+	api := &fakeAPI{worktrees: []model.Worktree{{ID: "a1", Reviewed: 1}}}
+	m := newTestModel(api)
+	cmd := m.applyEvent(model.Event{Type: model.EventReviewChanged, ID: "a1"})
+	if cmd == nil {
+		t.Fatal("review.changed must return a non-nil command")
+	}
+	msg := cmd()
+	lm, ok := msg.(listMsg)
+	if !ok || len(lm) != 1 || lm[0].Reviewed != 1 {
+		t.Fatalf("cmd() = %#v, want a listMsg reflecting the refreshed aggregate", msg)
+	}
+}
+
+// ---- filtering (/ and f) via handleKey ----
+
+func TestHandleKeySearchOpensInputAndTypedRunesFilterLive(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one"},
+		{ID: "z1", Repo: "zeta", Name: "two"},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	got := updated.(appModel)
+	if !got.sidebar.searching() {
+		t.Fatal("/ should open the search input")
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
+	got = updated.(appModel)
+	if sel, ok := got.sidebar.selected(); !ok || sel.ID != "z1" {
+		t.Errorf("typing \"z\" should live-filter down to zeta's z1, got selected=%+v ok=%v", sel, ok)
+	}
+}
+
+func TestHandleKeySearchQIsInertButCtrlCStillQuitsWhileSearching(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.startSearch()
+
+	// Not using isQuitCmd here: textinput.Update's returned Cmd (cursor
+	// blink) is a bare tea.Tick, not wrapped in tea.Batch — calling it
+	// synchronously would block for the real blink interval. The model
+	// state below already proves "q" was fed to the input, not treated as
+	// quit (a real quit would leave the value untouched).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if got := updated.(appModel); got.sidebar.filterInput.Value() != "q" {
+		t.Errorf("filterInput value = %q, want the literal \"q\" to have been typed", got.sidebar.filterInput.Value())
+	}
+
+	_, cmd2 := updated.(appModel).Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if !isQuitCmd(cmd2) {
+		t.Error("ctrl+c must still quit even while searching")
+	}
+}
+
+func TestHandleKeySearchEnterCommitsAndEscClears(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "alpha", Name: "one"}})
+	m.sidebar.startSearch()
+	m.sidebar.filterInput.SetValue("alpha")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(appModel)
+	if got.sidebar.searching() {
+		t.Error("enter should commit (exit input mode)")
+	}
+	if got.sidebar.filterInput.Value() != "alpha" {
+		t.Error("enter should keep the committed query applied")
+	}
+
+	got.sidebar.startSearch()
+	updated2, _ := got.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	got2 := updated2.(appModel)
+	if got2.sidebar.searching() || got2.sidebar.filterInput.Value() != "" {
+		t.Errorf("esc while searching should clear the query, got value=%q searching=%v", got2.sidebar.filterInput.Value(), got2.sidebar.searching())
+	}
+}
+
+func TestHandleKeyFilterActiveTogglesToActiveOnly(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{
+		{ID: "a1", Repo: "alpha", Name: "one", State: model.StateActive},
+		{ID: "a2", Repo: "alpha", Name: "two", State: model.StateIdle},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	got := updated.(appModel)
+	if !got.sidebar.activeOnly {
+		t.Fatal("f should toggle active-only on")
+	}
+	if sel, ok := got.sidebar.selected(); !ok || sel.ID != "a1" {
+		t.Errorf("selected = %+v ok=%v, want a1 (the only active worktree)", sel, ok)
+	}
+
+	updated2, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if got2 := updated2.(appModel); got2.sidebar.activeOnly {
+		t.Error("pressing f again should toggle active-only back off")
+	}
+}
+
+// TestEscClearsActiveFilterBeforeAnythingElse pins the esc ladder's new
+// rung: with a filter applied (but not currently typing), esc clears it
+// rather than being a no-op.
+func TestEscClearsActiveFilterBeforeAnythingElse(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "alpha", Name: "one"}})
+	m.sidebar.activeOnly = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if got := updated.(appModel); got.sidebar.activeOnly {
+		t.Error("esc should clear an active filter")
+	}
+}
+
+// ---- tmux jump (t) ----
+
+func TestHandleKeyTmuxJumpDispatchesCommandForSelectedWorktreePath(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature", Path: "/repo/wt"}})
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if cmd == nil {
+		t.Fatal("t with a worktree selected should dispatch a tmux command")
+	}
+	msg, ok := cmd().(tmuxDoneMsg)
+	if !ok {
+		t.Fatalf("cmd() = %#v, want a tmuxDoneMsg", msg)
+	}
+}
+
+func TestHandleKeyTmuxJumpNoOpWhenNothingSelected(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if cmd != nil {
+		t.Error("t with nothing selected should not dispatch a command")
+	}
+}
+
+func TestTmuxDoneMsgWithErrSetsToast(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	updated, cmd := m.Update(tmuxDoneMsg{Err: errors.New("not inside tmux")})
+	if got := updated.(appModel); got.toast != "not inside tmux" {
+		t.Errorf("toast = %q, want the tmux error surfaced", got.toast)
+	}
+	if cmd == nil {
+		t.Error("expected the toast-expiry command to be armed")
+	}
+}
+
+func TestTmuxDoneMsgWithoutErrIsSilent(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.toast = "" // precondition
+	updated, cmd := m.Update(tmuxDoneMsg{})
+	if got := updated.(appModel); got.toast != "" {
+		t.Errorf("toast = %q, want empty on a successful jump", got.toast)
+	}
+	if cmd != nil {
+		t.Error("a successful jump has nothing to toast, want a nil command")
+	}
+}
+
 // ---- smoke: a real tea.Program, a fake client, fixtures ----
 
 // TestRunSmokeStartsRendersFixturesAndQuitsCleanly drives an actual
@@ -665,6 +988,80 @@ func TestRunRadarDiffPaneMatchesGoldenFrame(t *testing.T) {
 	}
 	if frame != string(want) {
 		t.Errorf("rendered frame does not match %s.\ngot:\n%s\nwant:\n%s", goldenPath, frame, string(want))
+	}
+}
+
+// TestRunReviewFlowMarkFileBackQuitCleanly is WP3's teatest flow (P3-design.md
+// WP3 test list): radar -> `r` -> mark a file reviewed with `space` -> `esc`
+// back to radar -> `q` quits clean. Drives a real tea.Program against a fake
+// client, same harness as the WP1/WP2 smokes above.
+func TestRunReviewFlowMarkFileBackQuitCleanly(t *testing.T) {
+	d := model.Diff{WorktreeID: "auth", Base: "main", Files: []model.DiffFile{
+		{
+			Path: "internal/auth/token.go", Status: model.FileModified, Hash: "hgo",
+			Stats: model.Stats{Add: 2, Del: 1},
+			Hunks: []model.Hunk{{
+				Header: "@@ -18,3 +18,4 @@ func NewToken(",
+				Lines: []model.Line{
+					line(model.LineContext, 18, 18, "func NewToken(uid string) (*Token, error) {"),
+					line(model.LineDel, 19, 0, "\texp := time.Now().Add(15 * time.Minute)"),
+					line(model.LineAdd, 0, 19, "\texp := time.Now().Add(30 * time.Minute)"),
+				},
+			}},
+		},
+	}}
+	api := &fakeAPI{
+		protocol:  model.ProtocolVersion,
+		version:   "v0.3.0-test",
+		worktrees: []model.Worktree{{ID: "auth", Repo: "api-server", Name: "auth-refactor", Base: "main", Stats: model.Stats{Files: 1, Add: 2, Del: 1}}},
+		diff:      d,
+		events:    make(chan model.Event),
+		errs:      make(chan error, 1),
+	}
+
+	inR, _ := io.Pipe()
+	var outBuf safeBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runProgram("/tmp/does-not-matter.sock", api, func(p *tea.Program) {
+			p.Send(tea.WindowSizeMsg{Width: 100, Height: 30})
+			time.Sleep(200 * time.Millisecond) // let Init's fetches + the diff fetch land
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+			time.Sleep(150 * time.Millisecond)
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")}) // mark the file reviewed
+			time.Sleep(150 * time.Millisecond)
+			p.Send(tea.KeyMsg{Type: tea.KeyEscape}) // back to radar
+			time.Sleep(100 * time.Millisecond)
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+		},
+			tea.WithInput(inR),
+			tea.WithOutput(&outBuf),
+			tea.WithoutSignalHandler(),
+			tea.WithoutCatchPanics(),
+		)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() returned %v, want nil after a plain q quit", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("program did not exit within 5s of sending q")
+	}
+
+	frame := stripANSI(outBuf.String())
+	if !strings.Contains(frame, "wt cockpit") {
+		t.Errorf("rendered output does not contain the brand:\n%s", frame)
+	}
+	if !strings.Contains(frame, "auth-refactor") {
+		t.Errorf("rendered output does not contain the fixture worktree name:\n%s", frame)
+	}
+	if len(api.setReviewedCalls) != 1 {
+		t.Fatalf("SetReviewed calls = %v, want exactly 1 (space marked the file reviewed)", api.setReviewedCalls)
+	}
+	if call := api.setReviewedCalls[0]; call.id != "auth" || call.file != "internal/auth/token.go" || !call.reviewed {
+		t.Errorf("SetReviewed call = %+v, want auth/internal/auth/token.go/true", call)
 	}
 }
 
