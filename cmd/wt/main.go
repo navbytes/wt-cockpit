@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,13 +11,14 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	wtclient "github.com/navbytes/wt-cockpit/internal/client"
 	"github.com/navbytes/wt-cockpit/internal/model"
+	"github.com/navbytes/wt-cockpit/internal/tui"
 )
 
 // version is set at build time via -ldflags "-X main.version=...". "dev" is
@@ -42,11 +42,19 @@ func main() {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
-	socket := filepath.Join(home, ".wtcockpit", "wtd.sock")
-	if s := os.Getenv("WTD_SOCKET"); s != "" {
-		socket = s
+	socket := wtclient.SocketFromEnv()
+
+	// wt tui is its own program, not a one-shot request: unlike every other
+	// command, a down daemon is a retryable "connecting…" state, not an
+	// instant fatal error, so it does its own handshake inside Init rather
+	// than going through the blocking pre-flight check below.
+	if args[0] == "tui" {
+		if err := tui.Run(socket); err != nil {
+			fatal("%v", err)
+		}
+		return
 	}
+
 	c := newClient(socket)
 
 	// Every remaining command talks to wtd, so check the protocol handshake
@@ -84,10 +92,10 @@ func main() {
 		}
 		must(c.approve(args[1]))
 	case "refresh":
-		must(c.post("/api/refresh", nil, nil))
+		must(c.cl.Refresh(context.Background()))
 		fmt.Println("refreshed")
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, status)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, status, tui)", args[0])
 	}
 }
 
@@ -99,9 +107,17 @@ func printVersion(w io.Writer) {
 
 // ---- client ----
 
+// client is wt's own thin CLI wrapper. Its low-level checkVersion/get/status
+// (http/base fields included) stay exactly as they've always been — the
+// handshake and status-rendering behavior every existing test pins directly
+// against this struct. The higher-level commands (ls/diff/review/approve/
+// refresh/watch) are re-pointed onto cl, the shared internal/client.Client
+// the TUI also uses (P3-design.md §2.3's "client extraction"): one place for
+// the REST/SSE plumbing instead of two copies drifting apart.
 type client struct {
 	http *http.Client
 	base string
+	cl   *wtclient.Client
 }
 
 func newClient(socket string) *client {
@@ -115,6 +131,7 @@ func newClient(socket string) *client {
 				},
 			},
 		},
+		cl: wtclient.New(socket),
 	}
 }
 
@@ -163,36 +180,9 @@ func (c *client) get(path string, out any) error {
 	return nil
 }
 
-func (c *client) post(path string, in, out any) error {
-	var body *strings.Reader
-	if in != nil {
-		b, _ := json.Marshal(in)
-		body = strings.NewReader(string(b))
-	} else {
-		body = strings.NewReader("")
-	}
-	resp, err := c.http.Post(c.base+path, "application/json", body)
-	if err != nil {
-		return fmt.Errorf("cannot reach wtd (is it running?): %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		// The daemon puts the human-readable reason (e.g. a refused gate) in the body.
-		msg, _ := io.ReadAll(resp.Body)
-		if s := strings.TrimSpace(string(msg)); s != "" {
-			return fmt.Errorf("%s", s)
-		}
-		return fmt.Errorf("wtd returned %s", resp.Status)
-	}
-	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
-	}
-	return nil
-}
-
 func (c *client) ls() error {
-	var wts []model.Worktree
-	if err := c.get("/api/worktrees", &wts); err != nil {
+	wts, err := c.cl.Worktrees(context.Background())
+	if err != nil {
 		return err
 	}
 	renderRadar(wts)
@@ -203,28 +193,18 @@ func (c *client) watch() error {
 	// Re-render on every event. Simple and correct; the fancy TUI would do partial
 	// updates, but this proves the live stream end to end.
 	render := func() {
-		var wts []model.Worktree
-		if err := c.get("/api/worktrees", &wts); err == nil {
+		if wts, err := c.cl.Worktrees(context.Background()); err == nil {
 			fmt.Print("\033[2J\033[H") // clear + home
 			renderRadar(wts)
 			fmt.Printf("\n%swatching — ctrl-c to exit%s\n", dim, reset)
 		}
 	}
 	render()
-	resp, err := c.http.Get(c.base + "/api/events")
-	if err != nil {
-		return fmt.Errorf("cannot reach wtd: %w", err)
+	events, errs := c.cl.Events(context.Background())
+	for range events {
+		render()
 	}
-	defer resp.Body.Close()
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	var event string
-	for sc.Scan() {
-		if shouldRenderSSELine(sc.Text(), &event) {
-			render()
-		}
-	}
-	return sc.Err()
+	return <-errs
 }
 
 // shouldRenderSSELine advances the SSE per-frame event-name state machine (an
@@ -232,9 +212,13 @@ func (c *client) watch() error {
 // and reports whether the just-scanned line is a "data:" payload that should
 // trigger a re-render. Every data line renders except one inside a "hello"
 // frame — the version-handshake preamble handleEvents sends first (see
-// cmd/wtd's handleEvents/currentVersion). wt already verified the handshake
-// via GET /api/version before this command ran, so the hello frame is
-// consumed here with no visible effect rather than causing a spurious render.
+// cmd/wtd's handleEvents/currentVersion).
+//
+// watch() itself no longer scans SSE lines by hand — it re-renders once per
+// internal/client.Events delivery, which already applies this exact same
+// hello-skip rule (see internal/client/sse.go) — but this function stays
+// (and stays covered by its own tests below) as the historical pinned
+// contract for that classification rule, byte-for-byte unchanged.
 func shouldRenderSSELine(line string, event *string) bool {
 	switch {
 	case strings.HasPrefix(line, "event:"):
@@ -251,8 +235,8 @@ func shouldRenderSSELine(line string, event *string) bool {
 }
 
 func (c *client) diff(id string) error {
-	var d model.Diff
-	if err := c.get("/api/diff?id="+id, &d); err != nil {
+	d, err := c.cl.Diff(context.Background(), id)
+	if err != nil {
 		return err
 	}
 	renderDiff(d)
@@ -291,8 +275,7 @@ func (c *client) status(jsonOut bool) error {
 }
 
 func (c *client) review(id, file string, reviewed bool) error {
-	err := c.post("/api/review", map[string]any{"id": id, "file": file, "reviewed": reviewed}, nil)
-	if err != nil {
+	if err := c.cl.SetReviewed(context.Background(), id, file, reviewed, ""); err != nil {
 		return err
 	}
 	state := "reviewed"
@@ -304,12 +287,8 @@ func (c *client) review(id, file string, reviewed bool) error {
 }
 
 func (c *client) approve(id string) error {
-	var res struct {
-		Merged  string `json:"merged"`
-		Into    string `json:"into"`
-		Removed string `json:"removed"`
-	}
-	if err := c.post("/api/approve", map[string]any{"id": id}, &res); err != nil {
+	res, err := c.cl.Approve(context.Background(), id)
+	if err != nil {
 		return err
 	}
 	fmt.Printf("%s✓ merged %s → %s%s and removed the worktree\n", green, res.Merged, res.Into, reset)
@@ -474,6 +453,7 @@ func truncate(s string, n int) string {
 func usage() {
 	fmt.Print(`wt — worktree cockpit client
 
+  wt tui                    full-screen cockpit: radar + review panes, live
   wt ls                     list worktrees (radar)
   wt watch                  live radar, updates on every change
   wt diff <id>              show a worktree's diff
