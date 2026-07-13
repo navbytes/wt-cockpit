@@ -494,7 +494,7 @@ func DefaultRules() []Rule {
 				`-----BEGIN [A-Z ]*PRIVATE KEY-----`,
 				`ghp_[A-Za-z0-9]{36}`,
 				`github_pat_[A-Za-z0-9_]{22,}`,
-				`sk-[A-Za-z0-9]{20,}`,
+				`sk-(?:proj-|svcacct-)?[A-Za-z0-9]{20,}`,
 				`xox[bpars]-[A-Za-z0-9-]{10,}`,
 				`AIza[0-9A-Za-z_-]{35}`,
 			}, "|"),
