@@ -353,3 +353,105 @@ func TestOpenImportsSiblingJSONAfterMovingAsideCorruptDB(t *testing.T) {
 		t.Errorf(".imported backup missing: %v", err)
 	}
 }
+
+// TestMoveAsideCorruptDBUsesUniqueBackupNamesEvenWithinTheSameSecond pins
+// the reviewer NIT fix (P6-fixes.md): moveAsideCorruptDB's backup suffix is
+// UnixNano, not Unix, so two recoveries of the same path within the same
+// wall-clock second get distinct backup files rather than the second
+// silently overwriting the first's forensic copy. Two back-to-back calls
+// in a fast test are exactly the scenario that used to collide under
+// second-resolution timestamps.
+func TestMoveAsideCorruptDBUsesUniqueBackupNamesEvenWithinTheSameSecond(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	if err := os.WriteFile(path, []byte("corrupt-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup1, err := moveAsideCorruptDB(path, fmt.Errorf("boom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte("corrupt-2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup2, err := moveAsideCorruptDB(path, fmt.Errorf("boom again"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if backup1 == backup2 {
+		t.Fatalf("two recoveries within the same second produced the SAME backup name %q — the second overwrote the first's forensic copy", backup1)
+	}
+	b1, err := os.ReadFile(backup1)
+	if err != nil || string(b1) != "corrupt-1" {
+		t.Errorf("backup1 = %q, err=%v, want %q intact", b1, err, "corrupt-1")
+	}
+	b2, err := os.ReadFile(backup2)
+	if err != nil || string(b2) != "corrupt-2" {
+		t.Errorf("backup2 = %q, err=%v, want %q intact", b2, err, "corrupt-2")
+	}
+}
+
+// ---- import-path comment id collision (DEFECT D1 fix, P6-fixes.md) ----
+
+// TestOpenImportWithDuplicateSourceCommentIDsKeepsFirstAndLogsCount pins
+// the import-path half of the D1/D2 fix: a hand-edited or hand-merged
+// state.json that itself carries two comments sharing an id must import
+// exactly ONE of them (the first encountered), not error out the whole
+// import and not (pre-fix) land both as separate rows — and the discarded
+// duplicate is logged at WARN with a count, never silent.
+func TestOpenImportWithDuplicateSourceCommentIDsKeepsFirstAndLogsCount(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "state.json")
+	dbPath := filepath.Join(dir, "state.db")
+	raw := `{"reviewed_files":{},"comments":{"wt1":[
+		{"id":"c-dup","worktreeId":"wt1","file":"a.go","body":"first","state":"open","at":"2026-01-01T00:00:00Z"},
+		{"id":"c-dup","worktreeId":"wt1","file":"a.go","body":"second","state":"open","at":"2026-01-01T00:00:01Z"},
+		{"id":"c-other","worktreeId":"wt1","file":"b.go","body":"unrelated","state":"open","at":"2026-01-01T00:00:02Z"}
+	]}}`
+	writeStateJSON(t, jsonPath, raw)
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("a duplicate comment id within the source must not fail the whole import, got: %v", err)
+	}
+	defer s.(*sqliteStore).Close()
+
+	cs, err := s.Comments("wt1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 2 {
+		t.Fatalf("comments after import = %+v, want exactly 2 (the duplicate id collapses to its first occurrence, plus c-other)", cs)
+	}
+	if commentWithBody(cs, "first") == nil {
+		t.Errorf("the FIRST occurrence of the duplicate id must survive import, got %+v", cs)
+	}
+	if commentWithBody(cs, "second") != nil {
+		t.Errorf("the second occurrence sharing the id must be discarded, not imported as a separate row: %+v", cs)
+	}
+	if commentWithBody(cs, "unrelated") == nil {
+		t.Errorf("an unrelated comment must still import normally: %+v", cs)
+	}
+
+	var sawWarning bool
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["level"] == "WARN" && strings.Contains(fmt.Sprint(rec["msg"]), "duplicate comment id") {
+			sawWarning = true
+		}
+	}
+	if !sawWarning {
+		t.Errorf("a source-side duplicate comment id must be logged at WARN with a count, got log output:\n%s", logs.String())
+	}
+}

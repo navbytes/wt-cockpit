@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -306,5 +307,133 @@ func TestSQLiteRefusesNewerSchemaVersionMessageMentionsBuildSupport(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "schema v2") || !strings.Contains(err.Error(), "supports v1") {
 		t.Errorf("error should name both versions, got: %v", err)
+	}
+}
+
+// ---- comment id uniqueness (DEFECT D1/D2 fix, P6-fixes.md) ----
+
+// TestSQLiteAddCommentDuplicateIDReturnsClearError pins the fix directly:
+// comments.id is UNIQUE, so a second AddComment sharing an id already
+// present anywhere in the store returns ErrDuplicateCommentID — a clear,
+// distinguishable error — rather than silently landing a second row (which
+// used to make ResolveComment/DeleteComment affect both rows instead of
+// just the first, DEFECT D1). The rejected duplicate must not be persisted,
+// and the store must stay fully usable afterward (a different id still
+// succeeds).
+func TestSQLiteAddCommentDuplicateIDReturnsClearError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s := openSQLiteT(t, path)
+
+	if err := s.AddComment(model.Comment{ID: "c-1", WorktreeID: "wt1", File: "a.go", Body: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	// Same id, even in a DIFFERENT worktree: model.Comment.ID is meant to be
+	// globally unique (crypto/rand), not scoped per worktree, so the
+	// constraint is a plain UNIQUE on id, not a composite with worktree_id.
+	err := s.AddComment(model.Comment{ID: "c-1", WorktreeID: "wt2", File: "b.go", Body: "collides"})
+	if !errors.Is(err, ErrDuplicateCommentID) {
+		t.Fatalf("AddComment with a duplicate id = %v, want ErrDuplicateCommentID", err)
+	}
+
+	cs1, err := s.Comments("wt1")
+	if err != nil || len(cs1) != 1 || cs1[0].Body != "first" {
+		t.Errorf("wt1's original comment must be untouched by the rejected duplicate: %+v, err=%v", cs1, err)
+	}
+	cs2, err := s.Comments("wt2")
+	if err != nil || len(cs2) != 0 {
+		t.Errorf("the rejected duplicate must not have been persisted under wt2 either: %+v, err=%v", cs2, err)
+	}
+
+	// The store must still be fully usable after a rejected collision.
+	if err := s.AddComment(model.Comment{ID: "c-2", WorktreeID: "wt2", File: "b.go", Body: "unrelated"}); err != nil {
+		t.Fatalf("a subsequent AddComment with a fresh id should succeed: %v", err)
+	}
+}
+
+// ---- DSN path encoding (reviewer MINOR fix, P6-fixes.md) ----
+
+// TestOpenSQLiteDSNSpecialCharsInPathRoundTrips pins the reviewer's finding:
+// a -state path containing URI-significant characters (?, #, %, space)
+// must open exactly that file, not a truncated or percent-misdecoded one.
+// "%41" is the highest-value case: valid hex for 'A', so an unencoded path
+// containing it would silently open a DIFFERENT file ("...A...") rather
+// than fail loudly — confirmed against the real driver before writing this
+// fix, not assumed from the URI spec (see dsnPath's doc comment).
+func TestOpenSQLiteDSNSpecialCharsInPathRoundTrips(t *testing.T) {
+	for _, name := range []string{
+		"state?weird.db",
+		"state#weird.db",
+		"state%41.db",
+		"state weird.db",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+
+			s, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetReviewed("wt1", "a.go", "h1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.(*sqliteStore).Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("the exact intended path must exist, stat err: %v", err)
+			}
+
+			s2 := openSQLiteT(t, path)
+			rev, err := s2.ReviewedFiles("wt1")
+			if err != nil || rev["a.go"] != "h1" {
+				t.Errorf("review mark did not round-trip through the intended file: rev=%+v err=%v", rev, err)
+			}
+		})
+	}
+}
+
+// ---- transient WAL-init busy retry ----
+
+// TestOpenSQLiteConcurrentFreshOpensNeverSurfaceTransientBusy pins
+// openBusyRetryLimit's fix: N connections racing to open the SAME
+// not-yet-existing WAL-mode db file for the first time can each need to
+// initialize the WAL shared-memory index, and that specific lock was found
+// (empirically, while verifying the DEFECT D2 fix under a stricter test)
+// to fail instantly with "database is locked" regardless of the
+// busy_timeout pragma — a bounded retry at the OpenSQLite level clears it.
+// Every racing OpenSQLite call here must succeed with no error at all.
+func TestOpenSQLiteConcurrentFreshOpensNeverSurfaceTransientBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+
+	const n = 16
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make([]error, n)
+	stores := make([]Store, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			st, err := OpenSQLite(path)
+			errs[i] = err
+			stores[i] = st
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	defer func() {
+		for i, err := range errs {
+			if err == nil {
+				stores[i].(*sqliteStore).Close()
+			}
+		}
+	}()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: unexpected error: %v", i, err)
+		}
 	}
 }
