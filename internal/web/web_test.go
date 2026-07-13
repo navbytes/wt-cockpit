@@ -186,21 +186,30 @@ func TestIndexPageEmbedsCSRFMetaTag(t *testing.T) {
 	}
 }
 
-// ---- room stub ----
+// ---- room: see room_test.go for the full WP3 suite (side-by-side rendering,
+// escaping torture, collapse/expand, 404/empty states, review/approve) ----
 
-func TestRoomHandlerRendersStubForAnyID(t *testing.T) {
-	h, _, _ := buildTestApp(t)
-	for _, id := range []string{"real-or-not", "definitely-unknown"} {
-		rec := getPage(t, h, "/wt/"+id)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("id %q: status = %d, want 200 (WP2's room is a stub for any id); body=%s", id, rec.Code, rec.Body.String())
-		}
-		if !strings.Contains(rec.Body.String(), "reading room: WP3") {
-			t.Errorf("id %q: expected the WP2 stub card text, got:\n%s", id, rec.Body.String())
-		}
-		if !strings.Contains(rec.Body.String(), id) {
-			t.Errorf("id %q: expected the id to appear in the stub card, got:\n%s", id, rec.Body.String())
-		}
+// TestRoomHandlerRendersFixtureWorktree pins the smoke-level contract this
+// file's buildTestApp fixture gives every other page/fragment test: a known
+// id renders 200 with the fixture's own file in it, an unknown id 404s. The
+// deep room-rendering behavior lives in room_test.go, close to sxs/highlight.
+func TestRoomHandlerRendersFixtureWorktree(t *testing.T) {
+	h, feat, _ := buildTestApp(t)
+
+	rec := getPage(t, h, "/wt/"+feat.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("known id: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "app.go") {
+		t.Errorf("expected the fixture's changed file in the room page, got:\n%s", rec.Body.String())
+	}
+
+	rec = getPage(t, h, "/wt/definitely-unknown")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown id: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "definitely-unknown") {
+		t.Errorf("expected the unknown id echoed in the 404 page, got:\n%s", rec.Body.String())
 	}
 }
 
