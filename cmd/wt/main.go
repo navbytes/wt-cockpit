@@ -22,6 +22,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"github.com/navbytes/wt-cockpit/internal/buildinfo"
 	wtclient "github.com/navbytes/wt-cockpit/internal/client"
 	"github.com/navbytes/wt-cockpit/internal/model"
 	"github.com/navbytes/wt-cockpit/internal/tui"
@@ -188,7 +189,7 @@ func parseCommentArgs(rest []string) (side, author, body string) {
 // printVersion writes the build-time version string to w. Pulled out of the
 // -version flag branch so it's unit-testable without exercising os.Args/os.Exit.
 func printVersion(w io.Writer) {
-	fmt.Fprintf(w, "wt %s (%s)\n", version, runtime.Version())
+	fmt.Fprintf(w, "wt %s (%s)\n", buildinfo.Version(version), runtime.Version())
 }
 
 // ---- client ----
