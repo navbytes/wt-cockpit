@@ -79,17 +79,33 @@ func OpenJSON(path string) (Store, error) {
 	}}
 	b, err := os.ReadFile(path)
 	if err == nil {
-		_ = json.Unmarshal(b, &s.data)
-		if s.data.ReviewedFiles == nil {
-			s.data.ReviewedFiles = map[string]map[string]string{}
-		}
-		if s.data.Comments == nil {
-			s.data.Comments = map[string][]model.Comment{}
-		}
+		// The parse error is deliberately discarded: malformed bytes here have
+		// always meant "start empty" (TestLoadV01StateDropsOldReviews's
+		// broader point). store.Open's JSON→SQLite import (open.go) reuses
+		// this exact tolerant shape via tolerantUnmarshal below — the only
+		// difference there is that the import path can *see* the error, to
+		// log it (P6-design.md §4.2 step 7).
+		s.data, _ = tolerantUnmarshal(b)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// tolerantUnmarshal parses b into the persisted shape, defaulting both maps
+// to non-nil empty ones regardless of whether unmarshal succeeded — v0.1's
+// dropped "reviewed" key and pre-P4 comments missing new fields both land
+// here as zero values, never as nils a caller would have to guard against.
+func tolerantUnmarshal(b []byte) (persisted, error) {
+	var p persisted
+	err := json.Unmarshal(b, &p)
+	if p.ReviewedFiles == nil {
+		p.ReviewedFiles = map[string]map[string]string{}
+	}
+	if p.Comments == nil {
+		p.Comments = map[string][]model.Comment{}
+	}
+	return p, err
 }
 
 func (s *jsonStore) SetReviewed(worktreeID, file, hash string) error {

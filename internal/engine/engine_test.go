@@ -79,7 +79,7 @@ func mustResolver(t *testing.T, rules []guardrail.Rule) *guardrail.Resolver {
 func newEngine(t *testing.T, root string) *Engine {
 	t.Helper()
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestPerRepoBaseOverridePicksCorrectMergeBase(t *testing.T) {
 	root, repoPath := buildTwoBranchWorkspace(t)
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestPerRepoBaseOverridePicksCorrectMergeBase(t *testing.T) {
 	// With the override: same workspace, fresh engine/registry/store so caches
 	// don't leak between the two assertions.
 	reg2 := registry.New()
-	st2, err := store.OpenJSON(filepath.Join(t.TempDir(), "state2.json"))
+	st2, err := store.Open(filepath.Join(t.TempDir(), "state2.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

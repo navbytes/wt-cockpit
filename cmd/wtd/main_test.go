@@ -244,7 +244,7 @@ func buildTestServer(t *testing.T) (*server, model.Worktree) {
 	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package app\n\nfunc B() {}\n"), 0o644)
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +620,7 @@ func TestHandleDiffReviewedMapForAWorktreeWithZeroDiffFilesDecodesSafely(t *test
 	testGit(t, repo, "worktree", "add", "-q", "-b", "feature", wt) // no edits at all: clean, identical to main
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,5 +935,57 @@ func TestSlogSetDefaultBridgesStandardLogPackage(t *testing.T) {
 	}
 	if parsed["msg"] != "hello via the stdlib log package" {
 		t.Errorf(`msg = %v, want "hello via the stdlib log package"`, parsed["msg"])
+	}
+}
+
+// ---- WP2 store wiring ----
+
+// TestServerOpensSQLiteStoreByDefaultAndServes pins the WP2 wiring contract
+// end-to-end at the cmd/wtd level (P6-design.md §7): a -state path shaped
+// like main's own built-in default (a ".db" suffix, not ".json") must
+// resolve through store.Open to a real SQLite database file, not silently
+// fall back to the JSON store — and the resulting server must actually
+// serve requests through it.
+func TestServerOpensSQLiteStoreByDefaultAndServes(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db") // same extension as main.go's -state default
+	st, err := store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// store.Open's SQLite branch always creates a real SQLite file at path;
+	// the on-disk magic header proves this test isn't silently exercising
+	// the JSON backend instead (e.g. from a dispatch regression).
+	header := make([]byte, 16)
+	f, err := os.Open(statePath)
+	if err != nil {
+		t.Fatalf("state db file not created at %s: %v", statePath, err)
+	}
+	if _, err := f.Read(header); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if string(header) != "SQLite format 3\x00" {
+		t.Errorf("state file at %s is not a SQLite database (header=%q); store.Open did not dispatch to SQLite", statePath, header)
+	}
+
+	reg := registry.New()
+	be := gitbackend.NewCLIWithEnv(testGitEnv())
+	gr := mustResolver(t, guardrail.DefaultRules())
+	eng := engine.New(engine.Config{Roots: []string{t.TempDir()}, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
+
+	srv := &server{eng: eng, statePath: statePath, startedAt: time.Now()}
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/version = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got versionPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if got.Protocol != model.ProtocolVersion {
+		t.Errorf("Protocol = %d, want %d", got.Protocol, model.ProtocolVersion)
 	}
 }

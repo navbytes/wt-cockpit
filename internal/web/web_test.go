@@ -80,7 +80,7 @@ func buildTestEngine(t *testing.T) (*engine.Engine, model.Worktree) {
 	os.WriteFile(filepath.Join(wt, "app.go"), []byte("package app\n\nfunc B() {}\n"), 0o644)
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestIndexPageContainsFixtureWorktreeName(t *testing.T) {
 func TestIndexPageEmptyWorkspaceMessage(t *testing.T) {
 	root := t.TempDir() // no git repos at all under it
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

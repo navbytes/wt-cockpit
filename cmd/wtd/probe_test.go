@@ -58,7 +58,7 @@ func TestHandleStatusOnEmptyRootReportsZeroCounts(t *testing.T) {
 	root := t.TempDir() // deliberately no `git init` here: zero repos to discover
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

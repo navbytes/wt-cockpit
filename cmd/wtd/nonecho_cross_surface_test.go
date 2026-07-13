@@ -69,7 +69,7 @@ func TestSecretNeverAppearsAcrossHitMessageEventPayloadNotifierArgvAndRulesJSON(
 	testGit(t, repo, "worktree", "add", "-q", "-b", "feature", wt)
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
