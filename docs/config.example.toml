@@ -25,6 +25,9 @@ base = "main"
 # these are used as-is (no "~" expansion), so spell out the full path.
 socket = "/Users/nav/.wtcockpit/wtd.sock"
 tcp = ""                 # e.g. "127.0.0.1:7799" to also listen on TCP
+web = ""                 # e.g. "127.0.0.1:7788" for the opt-in web reading room;
+                         # must be loopback (127.0.0.0/8, ::1, or "localhost") —
+                         # anything else refuses to start (remote access is v0.7)
 state = "/Users/nav/.wtcockpit/state.json"
 interval = "2s"          # poll interval / fsnotify reconciliation tick
 watch = "fsnotify"       # "fsnotify" (default) or "poll"

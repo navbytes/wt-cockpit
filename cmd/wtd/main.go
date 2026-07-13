@@ -30,6 +30,7 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/registry"
 	"github.com/navbytes/wt-cockpit/internal/store"
 	"github.com/navbytes/wt-cockpit/internal/watcher"
+	"github.com/navbytes/wt-cockpit/internal/web"
 )
 
 type multiFlag []string
@@ -56,6 +57,7 @@ func main() {
 	flag.Var(&roots, "root", "root directory to scan for repos (repeatable, comma-ok)")
 	socket := flag.String("socket", filepath.Join(dataDir, "wtd.sock"), "unix socket path")
 	tcp := flag.String("tcp", "", "optional TCP address to also listen on (e.g. 127.0.0.1:7799)")
+	webAddr := flag.String("web", "", "optional loopback web UI address (e.g. 127.0.0.1:7788); refuses non-loopback binds (remote access is v0.7)")
 	statePath := flag.String("state", filepath.Join(dataDir, "state.json"), "review state file")
 	base := flag.String("base", "", "diff baseline branch (default: each repo's own default)")
 	interval := flag.Duration("interval", 2*time.Second, "poll interval (also governs the fsnotify reconciliation tick)")
@@ -95,6 +97,7 @@ func main() {
 	*base = mergeSetting(*base, explicit["base"], cfg.Base)
 	*socket = mergeSetting(*socket, explicit["socket"], cfg.Socket)
 	*tcp = mergeSetting(*tcp, explicit["tcp"], cfg.TCP)
+	*webAddr = mergeSetting(*webAddr, explicit["web"], cfg.Web)
 	*statePath = mergeSetting(*statePath, explicit["state"], cfg.State)
 	*watchMode = mergeSetting(*watchMode, explicit["watch"], cfg.Watch)
 	*logFormat = mergeSetting(*logFormat, explicit["log-format"], cfg.LogFormat)
@@ -117,6 +120,18 @@ func main() {
 	// everything else in main), so it's set up as soon as the settings it
 	// itself depends on (log-format/log-level) are resolved.
 	slog.SetDefault(newLogger(*logFormat, *logLevel, os.Stderr))
+
+	// -web is loopback-only, full stop: remote access to a listener that
+	// renders agent-authored bytes into a browser is a v0.7 problem (auth),
+	// not this phase's. Validated as soon as the logger exists so the
+	// refusal message goes through the normal slog path like every other
+	// startup failure below.
+	if *webAddr != "" {
+		if err := validateWebAddr(*webAddr); err != nil {
+			slog.Error("invalid -web address", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	*interval = clampInterval(mergeSetting(*interval, explicit["interval"], cfg.Interval))
 
@@ -169,6 +184,23 @@ func main() {
 		}
 	})
 
+	// The web listener is opened before srv exists (and so before any
+	// handler goroutine can start reading srv.webAddr concurrently): doing
+	// it here is also what resolves an ephemeral "127.0.0.1:0" -web bind to
+	// its real, effective port, which /api/status must then report exactly
+	// (P4-design.md §1.1, §1.6).
+	var webLn net.Listener
+	var resolvedWebAddr string
+	if *webAddr != "" {
+		var werr error
+		webLn, werr = net.Listen("tcp", *webAddr)
+		if werr != nil {
+			slog.Error("listen web failed", "web", *webAddr, "error", werr)
+			os.Exit(1)
+		}
+		resolvedWebAddr = webLn.Addr().String()
+	}
+
 	srv := &server{
 		eng:         eng,
 		socketPath:  *socket,
@@ -176,6 +208,7 @@ func main() {
 		roots:       roots,
 		statePath:   *statePath,
 		startedAt:   time.Now(),
+		webAddr:     resolvedWebAddr,
 	}
 	handler := srv.routes()
 
@@ -189,23 +222,53 @@ func main() {
 	defer os.Remove(*socket)
 	slog.Info("wtd starting", "version", version, "socket", *socket, "roots", roots.String(), "watcherMode", *watchMode, "statePath", *statePath)
 
-	httpSrv := &http.Server{Handler: handler}
-	go func() { _ = httpSrv.Serve(ln) }()
+	// Three listeners can now share the one API mux (handler), each with its
+	// own http.Server because each wants different middleware wrapped
+	// around the identical, unmodified handler value (P4-design.md §1.1):
+	// the socket stays completely tokenless (filesystem perms are its trust
+	// boundary, as always), -tcp gains Host+Origin validation, and -web gets
+	// the full browser-security stack plus the served pages.
+	socketSrv := &http.Server{Handler: handler}
+	go func() { _ = socketSrv.Serve(ln) }()
 
+	var tcpSrv *http.Server
 	if *tcp != "" {
 		tln, err := net.Listen("tcp", *tcp)
 		if err != nil {
 			slog.Error("listen tcp failed", "tcp", *tcp, "error", err)
 			os.Exit(1)
 		}
+		tcpSrv = &http.Server{Handler: web.HostOriginOnly(handler, *tcp)}
 		slog.Info("wtd also listening", "tcp", *tcp)
-		go func() { _ = httpSrv.Serve(tln) }()
+		go func() { _ = tcpSrv.Serve(tln) }()
+	}
+
+	var webSrv *http.Server
+	if webLn != nil {
+		webSrv = &http.Server{
+			Handler: web.New(eng, handler, web.Config{
+				BoundAddr: resolvedWebAddr,
+				CSRFToken: web.NewCSRFToken(),
+				Roots:     roots,
+			}),
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			// No WriteTimeout: it would kill the SSE stream.
+		}
+		slog.Info("wtd also listening", "web", resolvedWebAddr)
+		go func() { _ = webSrv.Serve(webLn) }()
 	}
 
 	<-ctx.Done()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = httpSrv.Shutdown(shutCtx)
+	_ = socketSrv.Shutdown(shutCtx)
+	if tcpSrv != nil {
+		_ = tcpSrv.Shutdown(shutCtx)
+	}
+	if webSrv != nil {
+		_ = webSrv.Shutdown(shutCtx)
+	}
 	slog.Info("wtd stopped")
 }
 
@@ -294,6 +357,36 @@ func clampInterval(d time.Duration) time.Duration {
 	return d
 }
 
+// validateWebAddr enforces -web's loopback-only bind (P4-design.md §1.1):
+// the host half of addr must be 127.0.0.0/8, ::1, or the literal "localhost"
+// — anything else (0.0.0.0, a public/LAN IP, an arbitrary hostname, or a
+// malformed address) is refused with a message naming exactly why and
+// pointing at the version that lifts the restriction, matching this
+// package's other "refuse loudly, name the value, say what to do" startup
+// checks (see e.g. the -log-format/-log-level validation above). Port 0 is
+// deliberately allowed here (ephemeral bind, e.g. for tests) — only the host
+// is judged.
+func validateWebAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || !isLoopbackHost(host) {
+		return fmt.Errorf("-web must bind loopback (got %q); remote access is v0.7", addr)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host (the host half of a "host:port"
+// address, so no brackets around an IPv6 literal) names loopback: the
+// literal "localhost", or an IP that net.IP.IsLoopback agrees is loopback
+// (127.0.0.0/8 or ::1). An empty host (as in ":7788", which net.Listen
+// treats as "every interface") is never loopback.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // mergeRoots applies the same flags > config > built-in-default precedence
 // for -root, except an explicit -root *replaces* config roots entirely rather
 // than merging with them — no surprise unions of CLI and config roots.
@@ -357,6 +450,7 @@ type server struct {
 	roots       []string
 	statePath   string
 	startedAt   time.Time
+	webAddr     string // "" when -web is off; else the actual bound address (correct under port 0)
 }
 
 func (s *server) routes() http.Handler {
@@ -411,6 +505,7 @@ type statusPayload struct {
 	WatcherMode   string   `json:"watcherMode"`
 	Roots         []string `json:"roots"`
 	StatePath     string   `json:"statePath"`
+	WebAddr       string   `json:"webAddr"` // "" when -web is off; see wt open (P4-design.md §1.6)
 	RepoCount     int      `json:"repoCount"`
 	WorktreeCount int      `json:"worktreeCount"`
 	ReviewedFiles int      `json:"reviewedFiles"`
@@ -434,6 +529,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		WatcherMode:   s.watcherMode,
 		Roots:         s.roots,
 		StatePath:     s.statePath,
+		WebAddr:       s.webAddr,
 		RepoCount:     len(repos),
 		WorktreeCount: len(wts),
 		ReviewedFiles: reviewed,

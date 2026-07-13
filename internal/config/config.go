@@ -28,6 +28,7 @@ type Config struct {
 	Base      string                `toml:"base"`
 	Socket    string                `toml:"socket"`
 	TCP       string                `toml:"tcp"`
+	Web       string                `toml:"web"`
 	State     string                `toml:"state"`
 	Interval  time.Duration         `toml:"interval"`
 	Watch     string                `toml:"watch"`
