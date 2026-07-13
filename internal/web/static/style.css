@@ -130,6 +130,13 @@ code { font-family: var(--mono); }
   align-items: flex-start;
 }
 .alert b { color: var(--warn); }
+/* danger-severity guardrail hit: same red tint as the file card's own
+   ".tag.danger"/".file-h.flag" treatment, not a third color family — the
+   featured hit's severity now flows all the way to the banner (P5-design.md,
+   WP3: "the richer hits...show with correct severity" applies here exactly
+   as it already does the sidebar/TUI badge). */
+.alert.danger { border-color: rgba(248, 81, 73, .4); background: var(--delbg); color: #ffb3af; }
+.alert.danger b { color: var(--del); }
 .banner {
   margin: 10px 16px 0;
   padding: 8px 12px;
@@ -295,3 +302,12 @@ code { font-family: var(--mono); }
 .composer-body { width: 100%; resize: vertical; background: var(--bg2); color: var(--txt); border: 1px solid var(--line2); border-radius: 5px; font: inherit; font-size: 12px; padding: 6px 8px; }
 .composer-actions { margin-top: 6px; display: flex; justify-content: flex-end; }
 .composer-error { color: var(--del); font-size: 11px; margin-top: 6px; }
+
+/* ---- guardrail.tripped toast (P5-design.md WP3): transient, danger-only,
+   fixed top-right. Reuses the same red palette as .alert.danger/.tag.danger
+   rather than a third color family. app.js appends/removes these — the
+   region itself (in layout.tmpl) is always present, on every page. */
+.toast-region { position: fixed; top: 12px; right: 12px; z-index: 100; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
+.toast { display: flex; gap: 8px; align-items: flex-start; padding: 9px 12px; border-radius: 7px; border: 1px solid var(--delln); background: var(--delbg); color: #ffb3af; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, .4); animation: toast-in .15s ease-out; }
+.toast-icon { color: var(--del); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }

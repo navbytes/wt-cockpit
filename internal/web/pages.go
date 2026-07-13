@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -126,8 +127,9 @@ type roomView struct {
 	Stats                    model.Stats
 	DiffHash                 string
 
-	GuardrailMsg  string // featured hit's message, "" if none tripped
-	GuardrailMore int    // additional distinct hits beyond the featured one
+	GuardrailMsg      string // featured hit's message, "" if none tripped
+	GuardrailMore     int    // additional distinct hits beyond the featured one
+	GuardrailSeverity string // featured hit's severity ("warn"|"danger"), "" if none tripped
 
 	Files                                []fileCardView
 	ReviewedCount, TotalFiles, LeftCount int
@@ -222,7 +224,7 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	views, _ := a.eng.Comments(id)
 
 	hits := guardrailHitsFor(wt)
-	msg, more := guardrailBanner(hits)
+	msg, more, severity := guardrailBanner(hits)
 	danger := dangerFiles(hits)
 
 	files := make([]fileCardView, len(d.Files))
@@ -236,19 +238,20 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	total := len(d.Files)
 
 	view := roomView{
-		pageHeader:       newPageHeader(roomTitle(wt, id), a.cfg.CSRFToken),
-		ID:               id,
-		Empty:            total == 0,
-		DiffHash:         d.Hash,
-		Files:            files,
-		ReviewedCount:    reviewedCount,
-		TotalFiles:       total,
-		LeftCount:        total - reviewedCount,
-		AllReviewed:      total > 0 && reviewedCount == total,
-		GuardrailMsg:     msg,
-		GuardrailMore:    more,
-		Base:             d.Base,
-		OrphanedComments: orphanedComments(views),
+		pageHeader:        newPageHeader(roomTitle(wt, id), a.cfg.CSRFToken),
+		ID:                id,
+		Empty:             total == 0,
+		DiffHash:          d.Hash,
+		Files:             files,
+		ReviewedCount:     reviewedCount,
+		TotalFiles:        total,
+		LeftCount:         total - reviewedCount,
+		AllReviewed:       total > 0 && reviewedCount == total,
+		GuardrailMsg:      msg,
+		GuardrailMore:     more,
+		GuardrailSeverity: severity,
+		Base:              d.Base,
+		OrphanedComments:  orphanedComments(views),
 	}
 	if wt != nil {
 		view.Repo, view.Name, view.Branch = wt.Repo, wt.Name, wt.Branch
@@ -319,10 +322,24 @@ func guardrailHitsFor(wt *model.Worktree) []model.GuardrailHit {
 
 // guardrailBanner mirrors internal/tui/radar.go's renderGuardrailBanner: the
 // featured hit (the first "danger"-severity hit, else the first hit at all)
-// verbatim, plus how many additional distinct hits there were.
-func guardrailBanner(hits []model.GuardrailHit) (message string, more int) {
+// verbatim, how many additional distinct hits there were, and the featured
+// hit's own severity — so room.tmpl can tint the banner red for a danger hit
+// instead of the one amber style every severity used to share (the "richer
+// hits...show with correct severity" theme applies to the web banner exactly
+// as it already does the TUI's sidebar badge).
+//
+// message runs through diffparse.SanitizeControl first. Diff content/paths
+// are already sanitized upstream by diffparse.Parse, but a hit's Message can
+// instead be hand-authored directly in a repo's own .wtcockpit.toml pack —
+// semi-trusted input (P5-design.md §1.3) that never passes through that
+// pipeline. html/template's contextual escaping alone handles `<script>`-
+// shaped text but not raw control bytes, so without this a control byte
+// smuggled into a pack's Message would reach the response body unescaped —
+// harmless to the DOM itself, but not to a terminal reading the raw response
+// (curl, view-source). Mirrors the identical defense in the TUI's own banner.
+func guardrailBanner(hits []model.GuardrailHit) (message string, more int, severity string) {
 	if len(hits) == 0 {
-		return "", 0
+		return "", 0, ""
 	}
 	featured := hits[0]
 	for _, h := range hits {
@@ -331,7 +348,11 @@ func guardrailBanner(hits []model.GuardrailHit) (message string, more int) {
 			break
 		}
 	}
-	return featured.Message, len(hits) - 1
+	sev := featured.Severity
+	if sev == "" {
+		sev = "warn"
+	}
+	return diffparse.SanitizeControl(featured.Message), len(hits) - 1, sev
 }
 
 // dangerFiles is the set of file paths a guardrail hit names, regardless of

@@ -81,6 +81,17 @@ func main() {
 		return
 	}
 
+	// wt menubar is a plugin-host emitter (SwiftBar/xbar, P5-design.md §1.7),
+	// not an interactive invocation: xbar re-execs it on a schedule and
+	// treats a nonzero exit or empty output as a broken plugin, so a down
+	// daemon must render as a degraded plugin state ("wt ◦"), never fatal()'s
+	// exit(1) — the one command that skips the shared checkVersion-or-fatal
+	// preflight below entirely, exactly like tui's own early return above.
+	if args[0] == "menubar" {
+		renderMenubar(os.Stdout, newClient(socket))
+		return
+	}
+
 	c := newClient(socket)
 
 	// Every remaining command talks to wtd, so check the protocol handshake
@@ -165,7 +176,7 @@ func main() {
 		}
 		must(c.rules(args[1], len(args) > 2 && args[2] == "--json"))
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, rules, status, tui)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, rules, menubar, status, tui)", args[0])
 	}
 }
 
@@ -524,7 +535,15 @@ func (c *client) open(id string) error {
 	if st.WebAddr == "" {
 		return errors.New("wtd is not serving the web UI — start it with -web 127.0.0.1:7788")
 	}
-	return openBrowser(fmt.Sprintf("http://%s/wt/%s", st.WebAddr, url.PathEscape(id)))
+	return openBrowser(roomURL(st.WebAddr, id))
+}
+
+// roomURL builds a worktree's reading-room URL off wtd's actual bound web
+// address (correct even under an ephemeral "-web 127.0.0.1:0"). Shared by
+// open (above) and menubar's per-worktree rows (below) — one place building
+// this URL shape rather than two that could drift.
+func roomURL(webAddr, id string) string {
+	return fmt.Sprintf("http://%s/wt/%s", webAddr, url.PathEscape(id))
 }
 
 // browserCommand picks which program to launch for openBrowser, in priority
@@ -789,6 +808,113 @@ func conditionsSummary(r guardrail.Rule) string {
 	return strings.Join(parts, " ")
 }
 
+// ---- menubar: SwiftBar/xbar plugin emitter (P5-design.md §1.7) ----
+
+// renderMenubar writes wt menubar's plugin text to w: the title line, one
+// row per worktree needing attention, and a trailing "Open cockpit" link —
+// or, when wtd can't be reached (or answers with a stale/incompatible
+// handshake), the minimal degraded block ("wt ◦"). Never returns an error:
+// a plugin host treats a nonzero wt exit as a broken plugin, and "the daemon
+// is down" is an ordinary, expected state to render instead of failing on.
+func renderMenubar(w io.Writer, c *client) {
+	if err := c.checkVersion(); err != nil {
+		writeMenubarDown(w)
+		return
+	}
+	wts, err := c.cl.Worktrees(context.Background())
+	if err != nil {
+		writeMenubarDown(w)
+		return
+	}
+	// webAddr absent — -web off, P4 not merged, or /api/status erroring on an
+	// otherwise-healthy daemon — just means rows/links render without an
+	// href (§1.7's "-web off" degradation); it does not warrant the full
+	// "wtd unreachable" state, since the fleet data above is good.
+	var st statusPayload
+	_ = c.get("/api/status", &st)
+
+	writeMenubar(w, wts, st.WebAddr)
+}
+
+func writeMenubarDown(w io.Writer) {
+	fmt.Fprintln(w, "wt ◦")
+	fmt.Fprintln(w, "---")
+	fmt.Fprintln(w, "wtd not reachable — is it running?")
+}
+
+// writeMenubar formats the SwiftBar/xbar plugin text itself (P5-design.md
+// §1.7's frozen example): title = danger-worktree count (not total danger
+// HIT count — one worktree with several danger hits still counts once) plus
+// reviewed/total files fleet-wide, then one row per worktree that needs
+// attention, then a trailing "Open cockpit" link. Rows/links carry an href
+// only when webAddr is non-empty — the same degradation `wt open` already
+// applies when -web is off.
+func writeMenubar(w io.Writer, wts []model.Worktree, webAddr string) {
+	sorted := append([]model.Worktree(nil), wts...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Repo != sorted[j].Repo {
+			return sorted[i].Repo < sorted[j].Repo
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	dangerWTs, reviewed, total := 0, 0, 0
+	for _, wt := range sorted {
+		total += wt.Stats.Files
+		reviewed += wt.Reviewed
+		if dangerCount(wt.Guardrails) > 0 {
+			dangerWTs++
+		}
+	}
+	fmt.Fprintf(w, "⚠%d ✓%d/%d\n", dangerWTs, reviewed, total)
+	fmt.Fprintln(w, "---")
+
+	for _, wt := range sorted {
+		label := menubarLabel(wt)
+		if label == "" {
+			continue // fully reviewed, no danger hit: nothing to draw attention to
+		}
+		line := wt.Repo + "/" + wt.Name + " — " + label
+		if webAddr != "" {
+			line += " | href=" + roomURL(webAddr, wt.ID)
+		}
+		fmt.Fprintln(w, line)
+	}
+
+	fmt.Fprintln(w, "---")
+	openRow := "Open cockpit"
+	if webAddr != "" {
+		openRow += " | href=http://" + webAddr + "/"
+	}
+	fmt.Fprintln(w, openRow)
+}
+
+// menubarLabel is one worktree's row text, or "" when it needs no attention
+// at all (fully reviewed, no danger hit) — such a worktree gets no row,
+// holding to the same "only what's noteworthy" bar the title's own
+// danger-worktree count applies. A danger hit takes priority over an
+// unreviewed-files count when a worktree has both.
+func menubarLabel(wt model.Worktree) string {
+	switch {
+	case dangerCount(wt.Guardrails) > 0:
+		return fmt.Sprintf("%d danger", dangerCount(wt.Guardrails))
+	case wt.Reviewed < wt.Stats.Files:
+		return fmt.Sprintf("%d files unreviewed", wt.Stats.Files-wt.Reviewed)
+	default:
+		return ""
+	}
+}
+
+func dangerCount(hits []model.GuardrailHit) int {
+	n := 0
+	for _, h := range hits {
+		if h.Severity == "danger" {
+			n++
+		}
+	}
+	return n
+}
+
 func renderStatus(st statusPayload) {
 	uptime := time.Duration(st.UptimeSeconds * float64(time.Second)).Round(time.Second)
 	fmt.Printf("%s%swtd status%s\n", bold, blue, reset)
@@ -844,6 +970,9 @@ func usage() {
   wt rules <id> [--json]    show the effective guardrail rules for a worktree's
                              repo, with provenance (default/global/pack) and
                              any .wtcockpit.toml pack's status
+  wt menubar                 SwiftBar/xbar plugin text (danger-worktree count,
+                             reviewed/total files, per-worktree rows) —
+                             installed as an xbar plugin, not run by hand
   wt -version               print the client's build version
 
 Set WTD_SOCKET to override the daemon socket path.

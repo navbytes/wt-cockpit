@@ -40,10 +40,30 @@ base = "develop"
 # Guardrail rules. If this section is present at all — even with a single
 # rule, as here — it REPLACES the built-in default rule set entirely (an
 # append-only scheme would make the defaults un-disableable). Omit [[rules]]
-# altogether to keep the built-in defaults. Fields match guardrail.Rule; the
-# one below is copied straight from the built-in defaults.
+# altogether to keep the built-in defaults (twelve rules — see README.md's
+# "Guardrails" section for the full list). Fields match guardrail.Rule; the
+# one below is copied straight from the built-in defaults. A rule sets
+# per-file conditions (path_glob/path_globs, exclude_globs, status, binary,
+# min_net_deleted, min_changed_lines, added_pattern, min_token_entropy +
+# min_token_len) OR worktree-wide ones (min_delete_add_ratio,
+# min_files_changed, min_total_changed) — never both; Compile rejects the mix
+# at load, along with any other bad rule (unknown severity, a non-compiling
+# added_pattern, entropy without a token-length floor).
 [[rules]]
 name = "touches-migrations"
 severity = "danger"          # "warn" | "danger"
 message = "touches database migrations"
 path_glob = "**/migrations/**"
+
+# For per-repo tuning instead of replacing the whole set above, use a
+# checked-in .wtcockpit.toml at a repo's root (NOT this file) — see README.md's
+# "Per-repo overrides" section for its shape, precedence, and trust model.
+# `wt rules <id>` shows the fully-resolved set with provenance.
+
+# Desktop notifications on a danger-severity guardrail hit (osascript on
+# macOS, notify-send on Linux; absent this table = enabled with these
+# defaults). See README.md's "Notifications" section.
+[notifications]
+enabled  = true      # default true; an absent [notifications] table also means enabled
+severity = "danger"  # "danger" (default) | "warn" (= warn + danger)
+cooldown = "10m"      # per-(worktree,rule,file) re-notify suppression

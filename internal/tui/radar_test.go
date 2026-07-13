@@ -285,6 +285,55 @@ func TestRenderGuardrailBannerShowsMessageVerbatimAndMoreCount(t *testing.T) {
 	}
 }
 
+// TestRenderGuardrailBannerAppendsFileLineForContentConditionHits pins
+// P5-design.md §1.6's WP3 TUI touch: a content-condition hit (secrets-pattern/
+// secrets-entropy) carries a Line, and the banner appends "· file:line" for
+// it so a secrets hit is jumpable-by-eye.
+func TestRenderGuardrailBannerAppendsFileLineForContentConditionHits(t *testing.T) {
+	hits := []model.GuardrailHit{
+		{Rule: "secrets-pattern", Severity: "danger", Message: "secrets-shaped string", File: "internal/auth/token.go", Line: 42},
+	}
+	// A wide width, not 80: the banner box word-wraps at its own width, and
+	// the point here is the suffix's presence/content, not line-wrapping.
+	got := stripANSI(renderGuardrailBanner(200, hits))
+	if !strings.Contains(got, "· internal/auth/token.go:42") {
+		t.Errorf("banner = %q, want a \"· file:line\" suffix for a hit carrying Line", got)
+	}
+}
+
+// TestRenderGuardrailBannerOmitsFileLineWhenHitHasNoLine pins the other half:
+// a per-file hit with no content condition (e.g. touches-migrations) never
+// set Line, and today's banner has never named a file at all — that must not
+// regress into always showing one now that the field exists.
+func TestRenderGuardrailBannerOmitsFileLineWhenHitHasNoLine(t *testing.T) {
+	hits := []model.GuardrailHit{
+		{Rule: "touches-migrations", Severity: "danger", Message: "touches database migrations", File: "migrations/x.sql"},
+	}
+	got := stripANSI(renderGuardrailBanner(200, hits))
+	if strings.Contains(got, "·") {
+		t.Errorf("banner = %q, want no \"· file:line\" suffix when the featured hit has no Line", got)
+	}
+}
+
+// TestRenderGuardrailBannerSanitizesControlBytesInMessage pins the belt-and-
+// braces control-byte defense: a hit's Message can be hand-authored in a
+// repo's own .wtcockpit.toml pack (semi-trusted, P5-design.md §1.3) and so
+// never passes through diffparse's own sanitizing pass the way diff content
+// does — a raw ESC byte must render as caret notation, never reach the
+// terminal as a live escape sequence.
+func TestRenderGuardrailBannerSanitizesControlBytesInMessage(t *testing.T) {
+	hits := []model.GuardrailHit{
+		{Rule: "hostile-pack-rule", Severity: "danger", Message: "trigger\x1b[31mred\x1b[0m"},
+	}
+	got := renderGuardrailBanner(80, hits)
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("banner contains a raw ESC byte, want it caret-sanitized: %q", got)
+	}
+	if !strings.Contains(stripANSI(got), "^[") {
+		t.Errorf("banner = %q, want the sanitized ESC byte rendered as caret notation \"^[\"", stripANSI(got))
+	}
+}
+
 // ---- diff pane header ----
 
 func TestRenderDiffHeaderContainsRepoNameAndBase(t *testing.T) {
