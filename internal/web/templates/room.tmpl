@@ -49,11 +49,15 @@
           <div class="sxs">
             <div class="side">
               <div class="side-lab">before · {{$.Base}}</div>
-              {{range .Rows}}<div class="srow {{.Left.Kind}}">{{if .Left.Num}}<button type="button" class="ln" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Left.Num}}" data-side="old" title="comment on this line">{{.Left.Num}}</button>{{else}}<span class="ln"></span>{{end}}<span class="code chroma">{{.Left.HTML}}</span></div>{{end}}
+              <div class="srows">
+              {{range .Rows}}<div class="srow {{.Left.Kind}}"><span class="ln">{{if .Left.Num}}<button type="button" class="ln-btn" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Left.Num}}" data-side="old" title="comment on this line">{{.Left.Num}}</button>{{end}}</span><span class="code chroma">{{.Left.HTML}}</span></div>{{end}}
+              </div>
             </div>
             <div class="side">
               <div class="side-lab">after · working tree</div>
-              {{range .Rows}}<div class="srow {{.Right.Kind}}">{{if .Right.Num}}<button type="button" class="ln" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Right.Num}}" data-side="new" title="comment on this line">{{.Right.Num}}</button>{{else}}<span class="ln"></span>{{end}}<span class="code chroma">{{.Right.HTML}}</span></div>{{end}}
+              <div class="srows">
+              {{range .Rows}}<div class="srow {{.Right.Kind}}"><span class="ln">{{if .Right.Num}}<button type="button" class="ln-btn" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Right.Num}}" data-side="new" title="comment on this line">{{.Right.Num}}</button>{{end}}</span><span class="code chroma">{{.Right.HTML}}</span></div>{{end}}
+              </div>
             </div>
           </div>
           {{end}}
