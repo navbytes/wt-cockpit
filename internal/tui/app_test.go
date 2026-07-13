@@ -529,6 +529,53 @@ func TestShellViewReflectsReconnectingBothDirections(t *testing.T) {
 	}
 }
 
+// TestShellViewSidebarNeverCollidesWithMainPaneAcrossTheGutter is the
+// app-level property test for the ux-expert-reported seam regression
+// (p3-frames-2/frame_07): sidebar_test.go's own row-width property test
+// already pins that a sidebar row's content is exactly sidebarWidth cells
+// (packRow/fitWidth) — the actual defect was one level up, in shellView's
+// own composition, which joined the sidebar directly against the main pane
+// with nothing in between, so a row's right-aligned counts/badge landed
+// flush against the main pane's leftmost column ("+5 -3" against "cmd/app/
+// main.go"). Every body row of the composed shell must show the gutter rune
+// at column sidebarWidth (0-indexed) — sidebar content must never reach past
+// it — regardless of width or how long the row's own content runs (reuses
+// sidebar_test.go's own long-name/huge-stats/danger-badge stress fixture).
+func TestShellViewSidebarNeverCollidesWithMainPaneAcrossTheGutter(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.height = 30
+	m.sidebar.setWorktrees([]model.Worktree{{
+		ID: "w1", Repo: "api-server", Name: "a-rather-long-worktree-name-for-budget-stress",
+		Agent: model.AgentClaude, State: model.StateActive, LastChange: time.Now(),
+		Stats:      model.Stats{Add: 999999, Del: 999999, Files: 123456},
+		Guardrails: []model.GuardrailHit{{Severity: "danger"}},
+	}})
+
+	for _, width := range []int{minWidth, 80, 110, 130} {
+		m.width = width
+		bodyH := m.height - 2 // topH=1 + keybarH=1, mirroring shellView's own math
+		if bodyH < 1 {
+			bodyH = 1
+		}
+		lines := strings.Split(stripANSI(m.shellView()), "\n")
+		// Sliced by bodyH rather than "everything but the last line": the
+		// keybar (unlike the topbar) doesn't pre-clip its content before
+		// lipgloss's Width(), so it can itself wrap onto more than one line
+		// at a narrow width — a pre-existing, unrelated quirk this test must
+		// not trip over.
+		body := lines[1 : 1+bodyH]
+		for i, ln := range body {
+			runes := []rune(ln)
+			if len(runes) <= sidebarWidth {
+				continue // shorter than the sidebar's own budget: nothing to collide with yet
+			}
+			if got := string(runes[sidebarWidth]); got != "│" {
+				t.Errorf("width=%d body line %d = %q, column %d (the gutter) = %q, want the separator", width, i, ln, sidebarWidth, got)
+			}
+		}
+	}
+}
+
 // ---- event application ----
 
 // TestApproveViewComposesTopbarAboveTheModal pins ux-expert P3-cheap: the
