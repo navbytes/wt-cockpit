@@ -475,7 +475,91 @@ func TestDownCardNeverShowsOnceDataHasArrived(t *testing.T) {
 	}
 }
 
+// TestDownCardCopyCannotBeMisrunVerbatim pins ux-expert P3-cheap: the old
+// down-card text embedded a literal, copy-pasteable "(wtd -root ~/code)" — a
+// real footgun if the user's actual code lives anywhere else and they run it
+// verbatim. The new copy names the flag and the config alternative, not a
+// specific path.
+func TestDownCardCopyCannotBeMisrunVerbatim(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	m.socket = "/tmp/wtd.sock"
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m2 := updated.(appModel)
+	m2.conn = connDown
+	m2.connAttempt = 1
+
+	view := m2.View()
+	if strings.Contains(view, "~/code") {
+		t.Errorf("down card = %q, must not embed a specific, copy-pasteable path", view)
+	}
+	if !strings.Contains(view, "wtd -root <dir>") || !strings.Contains(view, "config.toml") {
+		t.Errorf("down card = %q, want the flag + config.toml hint", view)
+	}
+}
+
+// TestShellViewReflectsReconnectingBothDirections is the app.go wiring check
+// for ux-expert P2-4: the render-level contracts for the sidebar header and
+// topbar are pinned in sidebar_test.go/statusbar_test.go; this proves
+// shellView actually threads a real mid-session m.conn transition (and its
+// reverse) through to both.
+func TestShellViewReflectsReconnectingBothDirections(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	// 130 cols (this team's own standard capture width) leaves enough room
+	// for the topbar's counts + reconnecting note + chip + view indicator to
+	// all render at once — see statusbar_test.go's 80-col degradation test
+	// for the narrower case, where the note is the first thing dropped.
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 130, Height: 30})
+	m2 := updated.(appModel)
+	m2.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
+
+	m2.conn = connReconnecting
+	m2.connAttempt = 3
+	view := stripANSI(m2.View())
+	if !strings.Contains(view, "WORKTREES · PAUSED") {
+		t.Errorf("view while reconnecting = %q, want the PAUSED sidebar header", view)
+	}
+	if !strings.Contains(view, "showing last known state") || !strings.Contains(view, "reconnecting (3)") {
+		t.Errorf("view while reconnecting = %q, want the topbar note and attempt count", view)
+	}
+
+	m2.conn = connLive
+	restored := stripANSI(m2.View())
+	if strings.Contains(restored, "PAUSED") || strings.Contains(restored, "showing last known state") {
+		t.Errorf("view after reconnect = %q, want LIVE restored with no stale reconnect cues", restored)
+	}
+}
+
 // ---- event application ----
+
+// TestApproveViewComposesTopbarAboveTheModal pins ux-expert P3-cheap: the
+// confirm modal must not fully replace the screen — the topbar (and its
+// connection chip) stays visible so a daemon drop mid-confirm is observable
+// rather than hidden behind a full-screen modal that shows no connection
+// state at all.
+func TestApproveViewComposesTopbarAboveTheModal(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m2 := updated.(appModel)
+	m2.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature", Branch: "feature", Base: "main"}})
+	m2.conn = connLive
+
+	updated2, _ := m2.openApprove()
+	m3 := updated2.(appModel)
+	if !m3.approve.open {
+		t.Fatal("precondition: modal should be open")
+	}
+
+	view := stripANSI(m3.View())
+	if !strings.Contains(view, "wt cockpit") {
+		t.Errorf("approve view = %q, want the topbar (brand) still visible above the modal", view)
+	}
+	if !strings.Contains(view, "● live") {
+		t.Errorf("approve view = %q, want the connection chip still visible", view)
+	}
+	if !strings.Contains(view, "merge feature") {
+		t.Errorf("approve view = %q, want the modal's merge line", view)
+	}
+}
 
 func TestApplyEventUpsertAddsWorktreeToSidebar(t *testing.T) {
 	m := newTestModel(&fakeAPI{})
@@ -497,6 +581,59 @@ func TestApplyEventRemoveDropsWorktreeFromSidebar(t *testing.T) {
 	got := updated.(appModel)
 	if _, ok := got.sidebar.selected(); ok {
 		t.Error("removed worktree must no longer be selectable")
+	}
+}
+
+// TestSSERemoveWhileApproveModalOpenStaysSafeToSubmit pins an adversarial
+// Update() storm: a worktree.removed SSE delta lands for the exact worktree
+// the confirm modal is open for (e.g. approved concurrently from another
+// client, or a duplicate/late removal event) -- "the row vanishes under the
+// modal." approveModal captures its own id/branch/base at openApprove time,
+// independent of the sidebar, and View() replaces the whole screen while the
+// modal is open (never a partial overlay), so there is no rendering hazard;
+// this pins that submitting afterwards is still safe -- it just becomes the
+// daemon's problem ("the daemon is the authority", P3-design.md), not a
+// crash or a stuck client-side state.
+func TestSSERemoveWhileApproveModalOpenStaysSafeToSubmit(t *testing.T) {
+	api := &fakeAPI{}
+	m := newTestModel(api)
+	m.connCh = make(chan connEvent)
+	m.sidebar.setWorktrees([]model.Worktree{{ID: "w1", Repo: "r", Name: "n", Branch: "feature", Base: "main"}})
+
+	updated, _ := m.openApprove()
+	m = updated.(appModel)
+	if !m.approve.open {
+		t.Fatal("precondition: modal should be open")
+	}
+
+	updated, _ = m.Update(eventMsg{Type: model.EventWorktreeRemoved, ID: "w1"})
+	m = updated.(appModel)
+
+	if !m.approve.open || m.approve.id != "w1" {
+		t.Errorf("modal state = %+v, want it to stay open on its own captured id (not silently reset by an unrelated sidebar change)", m.approve)
+	}
+	if _, ok := m.sidebar.selected(); ok {
+		t.Error("the sidebar should no longer show the removed worktree, even though the modal (a separate replace-the-whole-screen state) is still showing it")
+	}
+
+	// View() must render without panicking even though the modal's worktree
+	// is gone from the sidebar underneath it.
+	_ = m.View()
+
+	// Submitting must still be safe: it goes to the daemon, which is the
+	// only authority on whether the worktree still exists.
+	updated, cmd := m.handleApproveKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(appModel)
+	if !m.approve.submitting || cmd == nil {
+		t.Fatal("enter should still submit (dispatch approveCmd) rather than getting stuck")
+	}
+	switch msg := cmd().(type) {
+	case approveOKMsg, approveErrMsg:
+		// Either is fine -- a fake API always succeeds; a real daemon would
+		// answer with an error for an id it no longer recognizes. The point
+		// is that this resolves to a normal message, not a panic or a hang.
+	default:
+		t.Errorf("approveCmd() = %#v (%T), want approveOKMsg or approveErrMsg", msg, msg)
 	}
 }
 
@@ -660,7 +797,7 @@ func TestReviewErrMsgConflictRevertsAndRefetchesDiffWithToast(t *testing.T) {
 	m := reviewFixture(api)
 	m.radar.pane.setReviewed("a.go", true) // the optimistic flip that's about to be told it lost the race
 
-	errMsg := reviewErrMsg{ID: "a1", File: "a.go", Conflict: true, Err: errors.New("file changed since it was viewed: stale hash")}
+	errMsg := reviewErrMsg{ID: "a1", File: "a.go", Conflict: true, Reviewed: true, Err: errors.New("file changed since it was viewed: stale hash")}
 	updated, cmd := m.Update(errMsg)
 	got := updated.(appModel)
 	if got.radar.pane.diff.Reviewed["a.go"] {
@@ -689,13 +826,61 @@ func TestReviewErrMsgNonConflictRevertsWithoutForcingRefetch(t *testing.T) {
 	m := reviewFixture(&fakeAPI{})
 	m.radar.pane.setReviewed("a.go", true)
 
-	updated, _ := m.Update(reviewErrMsg{ID: "a1", File: "a.go", Conflict: false, Err: errors.New("boom")})
+	updated, _ := m.Update(reviewErrMsg{ID: "a1", File: "a.go", Conflict: false, Reviewed: true, Err: errors.New("boom")})
 	got := updated.(appModel)
 	if got.radar.pane.diff.Reviewed["a.go"] {
 		t.Error("any SetReviewed failure should revert the optimistic toggle")
 	}
 	if got.toast != "boom" {
 		t.Errorf("toast = %q, want the plain error message", got.toast)
+	}
+}
+
+// TestReviewErrMsgConflictRevertCanClobberFresherDiffFetchedInBetween was
+// DEFECT D3 (fixed). radar.go's applyReviewErr used to revert an optimistic
+// toggle by "flipping whatever Reviewed[file] is currently set to", which
+// assumed nothing else had touched that key in between. An unrelated
+// diff.ready refetch (e.g. the agent edited a different file in the same
+// worktree) can land first, replacing the whole diff — including Reviewed —
+// with fresh server truth. A STALE 409 for the original, now-superseded
+// toggle then arriving used to blindly invert that fresh truth. Fix:
+// reviewErrMsg now carries Reviewed (the fixed, originally-attempted value),
+// and applyReviewErr inverts *that* instead of "whatever's current" — so the
+// fresher, independently-fetched Reviewed state wins; a stale
+// conflict-revert can no longer clobber it.
+func TestReviewErrMsgConflictRevertCanClobberFresherDiffFetchedInBetween(t *testing.T) {
+	api := &fakeAPI{}
+	m := reviewFixture(api) // a1/a.go@ha, a1/b.go@hb, screenReview
+
+	// User optimistically toggles a.go reviewed (space); hash ha in flight.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	m = updated.(appModel)
+	if !m.radar.pane.diff.Reviewed["a.go"] {
+		t.Fatal("precondition: optimistic toggle should have set a.go reviewed=true")
+	}
+
+	// An unrelated diff.ready refetch lands BEFORE the 409: a.go's content
+	// changed (new hash ha2), and the server's own fresh Reviewed map
+	// correctly says it is NOT reviewed under that new content.
+	fresh := model.Diff{
+		WorktreeID: "a1", Hash: "d2",
+		Files:    []model.DiffFile{{Path: "a.go", Hash: "ha2"}, {Path: "b.go", Hash: "hb"}},
+		Reviewed: map[string]bool{"a.go": false},
+	}
+	updated, _ = m.Update(diffMsg{ID: "a1", Diff: fresh})
+	m = updated.(appModel)
+	if m.radar.pane.diff.Reviewed["a.go"] {
+		t.Fatal("precondition: the fresh refetch should show a.go unreviewed under its new content")
+	}
+
+	// The STALE 409 for the original (superseded) toggle finally arrives,
+	// carrying the value that ORIGINAL optimistic toggle attempted (true) —
+	// fixed on the message itself, unaffected by the fresh refetch in between.
+	updated, _ = m.Update(reviewErrMsg{ID: "a1", File: "a.go", Conflict: true, Reviewed: true, Err: errors.New("stale hash")})
+	m = updated.(appModel)
+
+	if m.radar.pane.diff.Reviewed["a.go"] {
+		t.Errorf("a.go reviewed = true, want false: a stale conflict-revert clobbered the fresher diff.ready truth")
 	}
 }
 
@@ -890,6 +1075,82 @@ func TestTmuxDoneMsgWithoutErrIsSilent(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("a successful jump has nothing to toast, want a nil command")
+	}
+}
+
+// ---- toast generation guard ----
+
+// TestStaleToastExpiryCannotClobberANewerToast pins the toastGen guard: two
+// toasts set in quick succession each arm their own 4s expiry, but an OLDER
+// timer firing (its full 4s having elapsed) must not clear a toast set
+// *after* it — only that toast's own, later expiry may. Bypasses the real
+// tea.Tick (a genuine sleep, see TestReviewErrMsgConflictRevertsAndRefetchesDiffWithToast's
+// note) by constructing the fired toastExpiredMsg directly.
+func TestStaleToastExpiryCannotClobberANewerToast(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+
+	updated, _ := m.Update(listErrMsg{Err: errors.New("first")})
+	m = updated.(appModel)
+	if m.toast != "first" {
+		t.Fatalf("precondition: toast = %q, want first", m.toast)
+	}
+	staleGen := m.toastGen
+
+	updated, _ = m.Update(listErrMsg{Err: errors.New("second")})
+	m = updated.(appModel)
+	if m.toast != "second" {
+		t.Fatalf("precondition: toast = %q, want second", m.toast)
+	}
+	if m.toastGen == staleGen {
+		t.Fatalf("precondition: second toast should have advanced toastGen past %d", staleGen)
+	}
+
+	// The FIRST toast's own expiry finally fires (as it legitimately would,
+	// 4s after it was set) — it must leave the newer "second" toast alone.
+	updated, _ = m.Update(toastExpiredMsg{Gen: staleGen})
+	m = updated.(appModel)
+	if m.toast != "second" {
+		t.Errorf("toast = %q after a stale expiry fired, want the newer toast left alone", m.toast)
+	}
+
+	// The SECOND toast's own expiry, once it fires, does clear it.
+	updated, _ = m.Update(toastExpiredMsg{Gen: m.toastGen})
+	m = updated.(appModel)
+	if m.toast != "" {
+		t.Errorf("toast = %q after its own expiry fired, want cleared", m.toast)
+	}
+}
+
+// ---- toastOK: success vs. warn styling (ux-expert P3-cheap) ----
+
+// TestApproveOKSetsSuccessToast and TestRefreshDoneSuccessSetsSuccessToast
+// pin the two success-toast call sites; TestListErrSetsNonSuccessToast pins
+// that an ordinary error toast is not accidentally marked as a success.
+func TestApproveOKSetsSuccessToast(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	updated, _ := m.Update(approveOKMsg{Res: model.ApproveResult{Merged: "feature", Into: "main"}})
+	if got := updated.(appModel); !got.toastOK {
+		t.Error("a successful approve should set toastOK")
+	}
+}
+
+func TestRefreshDoneSuccessSetsSuccessToast(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	updated, _ := m.Update(refreshDoneMsg{})
+	got := updated.(appModel)
+	if !got.toastOK {
+		t.Error("a successful refresh should set toastOK")
+	}
+	if got.toast != "refreshed" {
+		t.Errorf("toast = %q, want %q", got.toast, "refreshed")
+	}
+}
+
+func TestListErrSetsNonSuccessToast(t *testing.T) {
+	m := newTestModel(&fakeAPI{})
+	updated, _ := m.Update(listErrMsg{Err: errors.New("boom")})
+	if got := updated.(appModel); got.toastOK {
+		t.Error("an error toast must not be marked toastOK")
 	}
 }
 

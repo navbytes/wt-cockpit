@@ -151,15 +151,18 @@ func (r *radarView) applyReviewOK(msg reviewOKMsg) {
 	r.pane.setReviewed(msg.File, msg.Reviewed)
 }
 
-// applyReviewErr reverts the optimistic toggle for any failure (reviewErrMsg
-// carries no "requested value" field to invert against — flipping whatever
-// is currently set undoes exactly that earlier optimistic write), and —
-// only for the 409 conflict case — also refetches the diff, since the
-// file's *content* changed too, not just its reviewed flag (P3-design.md
-// §1.4's "diff refreshed").
+// applyReviewErr reverts the optimistic toggle for any failure by inverting
+// msg.Reviewed — the fixed value that toggle attempted to set, carried on
+// the message itself — rather than whatever Reviewed[file] currently holds
+// (DEFECT D3: an interleaved diff.ready refetch can have already replaced
+// that with fresher, unrelated server truth by the time a stale error
+// arrives, so inverting "current" can clobber it). Only for the 409
+// conflict case, also refetches the diff, since the file's *content*
+// changed too, not just its reviewed flag (P3-design.md §1.4's "diff
+// refreshed").
 func (r *radarView) applyReviewErr(ctx context.Context, api apiClient, msg reviewErrMsg) tea.Cmd {
 	if msg.ID == r.currentID {
-		r.pane.setReviewed(msg.File, !r.pane.diff.Reviewed[msg.File])
+		r.pane.setReviewed(msg.File, !msg.Reviewed)
 	}
 	if msg.Conflict {
 		return fetchDiffCmd(ctx, api, msg.ID)
@@ -169,9 +172,15 @@ func (r *radarView) applyReviewErr(ctx context.Context, api apiClient, msg revie
 
 // view renders the Radar main pane for the selected worktree w: header,
 // guardrail banner (when tripped), then the virtualized diff (or a loading/
-// error placeholder while the pane isn't yet showing w's diff).
-func (r *radarView) view(width, height int, w model.Worktree) string {
-	header := renderDiffHeader(width, w)
+// error placeholder while the pane isn't yet showing w's diff). focused
+// accents the header title as a focus cue when the diff pane (rather than
+// the sidebar) holds the keyboard (ux-expert P2-3); reviewing swaps the
+// header's base segment to Review's "reviewing <branch> vs <base>" phrasing
+// (ux-expert P3-cheap) — Radar's own call passes false/false, Review's
+// passes false/true (its own screen has no separate diff-focus state to
+// track, so there's nothing for that pane to further distinguish).
+func (r *radarView) view(width, height int, w model.Worktree, focused, reviewing bool) string {
+	header := renderDiffHeader(width, w, focused, reviewing)
 	banner := renderGuardrailBanner(width, w.Guardrails)
 
 	paneH := height - lipgloss.Height(header)
@@ -214,10 +223,28 @@ func (r *radarView) errorView(width, height int) string {
 }
 
 // renderDiffHeader is the mock's "pane-h": repo/name, base branch, and the
-// files/±/agent summary (P3-design.md §1.1).
-func renderDiffHeader(width int, w model.Worktree) string {
-	title := styles.Txt.Bold(true).Render(fmt.Sprintf("%s / %s", w.Repo, w.Name))
-	base := styles.Dim.Render("base ") + styles.Accent.Render(w.Base)
+// files/±/agent summary (P3-design.md §1.1). focused accents the title as a
+// lightweight focus cue (ux-expert P2-3): Radar's two focus states (sidebar
+// vs. diff pane) otherwise look identical, so the one owning the keyboard
+// gets the accent color the rest of the app already uses for "this is what
+// you're driving" (selection, links). reviewing swaps the base segment to
+// Review's own "reviewing <branch> vs <base>" phrasing (ux-expert P3-cheap,
+// mock's `#rv-base` treatment) instead of Radar's plain "base <base>".
+func renderDiffHeader(width int, w model.Worktree, focused, reviewing bool) string {
+	titleStyle := styles.Txt.Bold(true)
+	if focused {
+		titleStyle = styles.Accent.Bold(true)
+	}
+	title := titleStyle.Render(fmt.Sprintf("%s / %s", w.Repo, w.Name))
+
+	var base string
+	if reviewing {
+		base = styles.Dim.Render("reviewing ") + styles.Accent.Render(w.Branch) +
+			styles.Dim.Render(" vs ") + styles.Accent.Render(w.Base)
+	} else {
+		base = styles.Dim.Render("base ") + styles.Accent.Render(w.Base)
+	}
+
 	summary := fmt.Sprintf("%d files · %s %s · %s",
 		w.Stats.Files,
 		styles.Add.Render(fmt.Sprintf("+%d", w.Stats.Add)),

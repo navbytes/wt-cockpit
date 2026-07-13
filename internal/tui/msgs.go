@@ -82,9 +82,18 @@ type reviewOKMsg struct {
 // reviewErrMsg is a failed POST /api/review. Conflict distinguishes the 409
 // (file changed since viewed — optimistic-toggle revert) from any other
 // failure. WP3.
+//
+// Reviewed is the value the optimistic toggle attempted to set
+// (toggleReviewedCurrentFile's `next`) — DEFECT D3 fix: radar.go's
+// applyReviewErr inverts this fixed value to revert, rather than whatever
+// Reviewed[File] currently holds, which an interleaved diff.ready refetch
+// can already have replaced with fresher, unrelated server truth by the
+// time a stale error arrives. Additive field on an otherwise-frozen v0.3
+// WP1 message type (CTO-authorized).
 type reviewErrMsg struct {
 	ID, File string
 	Conflict bool
+	Reviewed bool
 	Err      error
 }
 
@@ -107,4 +116,8 @@ type tickMsg time.Time
 
 // toastExpiredMsg clears the keybar's transient status-line message after
 // its display window (P3-design.md §1.5: 4s, one at a time, latest wins).
-type toastExpiredMsg struct{}
+// Gen is the generation stamped when this expiry was armed (appModel.
+// setToast) — Update only clears the toast if Gen still matches the
+// model's current generation, so a still-pending timer from an
+// already-superseded toast can't clobber a newer one that was set after it.
+type toastExpiredMsg struct{ Gen int }

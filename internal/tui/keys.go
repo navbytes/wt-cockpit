@@ -62,7 +62,12 @@ var keys = keyMap{
 // radarKeybar is the Radar view's context-sensitive keybar text (mock's
 // keybar-radar). WP1 renders this verbatim; it does not yet reflect
 // dynamic state (e.g. an active filter) — that's WP3 (search/filter).
-const radarKeybar = "↑↓/jk move  ⏎ diff  r review  t tmux  a approve  / search  f active  R refresh  q quit"
+//
+// Single-spaced between groups (ux-expert P2-2): the original double-spaced
+// text measured 86 display cols, over the ≤78 budget every keybar variant
+// must fit — tightening the separator alone (no word dropped) gets this to
+// exactly 78, pinned by TestKeybarsFitEightyColumnBudget.
+const radarKeybar = "↑↓/jk move ⏎ diff r review t tmux a approve / search f active R refresh q quit"
 
 // reviewKeybar is the Review view's context-sensitive keybar text (mock's
 // keybar-review). j/k walk files; plain ↑/↓ (and ctrl-d/u, pgup/pgdn, g/G,
@@ -70,3 +75,13 @@ const radarKeybar = "↑↓/jk move  ⏎ diff  r review  t tmux  a approve  / se
 // §1.3's Review table splits the two apart, unlike Radar's diff-focused
 // mode where j/k themselves scroll).
 const reviewKeybar = "j/k file  ↑↓ scroll  space toggle  a approve  t tmux  esc back  q quit"
+
+// diffKeybar is Radar's keybar variant while the diff pane holds focus
+// (ux-expert P2-3): the pane's own scroll vocabulary front and center,
+// dropped back to esc/q for navigation. Like reviewKeybar, it doesn't spell
+// out every fine-scroll key (pgup/pgdn/space also work, per handleDiffKey) —
+// same "not all spelled out here" convention, to fit the ≤78 budget. `r`/`/`/
+// `f`/`R` remain live while diff-focused (handleKey checks them before the
+// focus branch) but aren't repeated here; esc already gets you back to the
+// full radarKeybar that names them.
+const diffKeybar = "j/k scroll ctrl-d/u ½pg g/G top/bot [ ] file o fold a approve esc back q quit"

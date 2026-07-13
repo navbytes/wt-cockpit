@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -448,6 +449,58 @@ func TestEventsRespectsContextCancellation(t *testing.T) {
 		t.Fatal("timed out waiting for cancellation to close the events channel")
 	}
 	<-errs // drain; value doesn't matter (context.Canceled or nil race is fine)
+}
+
+// TestEventsGoroutineCleanupOnRepeatedCancelDoesNotLeak strengthens
+// TestEventsRespectsContextCancellation's "both channels close" proof into an
+// actual leak check: opens and immediately cancels many Events() connections
+// against a server that keeps streaming (so a hung reader/watchdog goroutine
+// would show up as a growing count), draining each pair of channels fully
+// before moving on, then asserts the goroutine count settles back near its
+// baseline rather than accumulating one leaked goroutine per call.
+func TestEventsGoroutineCleanupOnRepeatedCancelDoesNotLeak(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		for i := 0; i < 1000; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	defer ts.Close()
+	c := testClient(ts)
+
+	runtime.GC()
+	base := runtime.NumGoroutine()
+
+	const cycles = 30
+	for i := 0; i < cycles; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		events, errs := c.Events(ctx)
+		cancel()
+		for range events { // nolint:revive // draining to proven-closed, not iterating meaningfully
+		}
+		<-errs
+	}
+
+	var after int
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		runtime.GC()
+		after = runtime.NumGoroutine()
+		if after <= base+2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if after > base+2 {
+		t.Errorf("goroutines after %d open+cancel Events() cycles = %d, want <= %d (baseline %d) -- possible leak", cycles, after, base+2, base)
+	}
 }
 
 // ---- New: the real Unix-socket transport ----

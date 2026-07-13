@@ -54,10 +54,18 @@ type styleSet struct {
 	Add  lipgloss.Style
 	Del  lipgloss.Style
 	Warn lipgloss.Style
+	Ok   lipgloss.Style // success confirmations (distinct from Warn — ux-expert P3)
 
 	AddBg  lipgloss.Style
 	DelBg  lipgloss.Style
 	WarnBg lipgloss.Style
+
+	// SelectedBg is the sidebar's subtle selected-row background tint
+	// (ux-expert P3: mock's `.wt.sel{background:...}`) — background-only, no
+	// foreground/bold, applied via tintRow so it survives the row's own
+	// embedded per-segment colors (same trick diffview.go's add/del tint
+	// uses). Reuses tokenPanel2, already frozen but unwired until now.
+	SelectedBg lipgloss.Style
 
 	ChipClaude lipgloss.Style
 	ChipCodex  lipgloss.Style
@@ -66,11 +74,12 @@ type styleSet struct {
 
 	Brand       lipgloss.Style // topbar "wt cockpit"
 	RepoHeader  lipgloss.Style // sidebar group header
-	SelectedRow lipgloss.Style // accent left border + brighter name
+	SelectedRow lipgloss.Style // accent left border + brighter name (review rail's current-file row)
 	Keybar      lipgloss.Style // bottom context bar
 	Topbar      lipgloss.Style // top summary bar
 	FatalCard   lipgloss.Style // protocol-mismatch / too-small full-screen card
 	DownCard    lipgloss.Style // daemon-down-with-backoff full-screen card
+	Card        lipgloss.Style // bordered card (ux-expert P3: approve modal)
 }
 
 func newStyles() styleSet {
@@ -83,10 +92,13 @@ func newStyles() styleSet {
 		Add:  lipgloss.NewStyle().Foreground(lipgloss.Color(tokenAdd)),
 		Del:  lipgloss.NewStyle().Foreground(lipgloss.Color(tokenDel)),
 		Warn: lipgloss.NewStyle().Foreground(lipgloss.Color(tokenWarn)),
+		Ok:   lipgloss.NewStyle().Foreground(lipgloss.Color(tokenAdd)).Bold(true),
 
 		AddBg:  lipgloss.NewStyle().Background(lipgloss.Color(tokenAddBg)),
 		DelBg:  lipgloss.NewStyle().Background(lipgloss.Color(tokenDelBg)),
 		WarnBg: lipgloss.NewStyle().Background(lipgloss.Color(tokenWarnBg)),
+
+		SelectedBg: lipgloss.NewStyle().Background(lipgloss.Color(tokenPanel2)),
 
 		ChipClaude: lipgloss.NewStyle().Foreground(lipgloss.Color(tokenChipClaude)),
 		ChipCodex:  lipgloss.NewStyle().Foreground(lipgloss.Color(tokenChipCodex)),
@@ -102,6 +114,8 @@ func newStyles() styleSet {
 		Topbar:    lipgloss.NewStyle().Foreground(lipgloss.Color(tokenTxt)),
 		FatalCard: lipgloss.NewStyle().Foreground(lipgloss.Color(tokenDel)).Bold(true).Padding(1, 2),
 		DownCard:  lipgloss.NewStyle().Foreground(lipgloss.Color(tokenWarn)).Padding(1, 2),
+		Card: lipgloss.NewStyle().Padding(1, 2).
+			BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(tokenLine2)),
 	}
 }
 

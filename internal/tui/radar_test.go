@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -162,6 +165,39 @@ func TestApplyDiffMsgForCurrentSelectionUpdatesPaneAndClearsError(t *testing.T) 
 	}
 }
 
+// TestApplyDiffMsgPreservesScrollPositionAcrossASameWorktreeRefetch was
+// DEFECT D4 (fixed). diffview.setDiff used to unconditionally reset offset
+// to 0 on every load, and applyDiffMsg calls setDiff for every diffMsg,
+// including a diff.ready-triggered refetch of a worktree already open and
+// scrolled into — not just the first load. A live agent worktree firing
+// diff.ready on every unrelated commit would silently snap the user back to
+// line 1 mid-review. This was inconsistent with the same pane's own
+// fold/expand overrides, which *are* preserved across a refetch (keyed by
+// file hash, per flatten.go/diffview.go) — "where you are" in a file
+// survived, "where you're scrolled to" didn't. Fix: setDiff only resets to
+// the top when the WorktreeID actually changes; a same-worktree refetch now
+// preserves offset (re-clamped against the new line count).
+func TestApplyDiffMsgPreservesScrollPositionAcrossASameWorktreeRefetch(t *testing.T) {
+	r := newRadarView()
+	r.currentID = "w1"
+	r.applyDiffMsg(diffMsg{ID: "w1", Diff: manyLineDiff(500)})
+	r.pane.setHeight(20)
+	r.pane.scroll(300) // scrolled deep into the file, mid-review
+	before := r.pane.offset
+	if before == 0 {
+		t.Fatal("precondition: should have scrolled away from offset 0")
+	}
+
+	// An unrelated diff.ready refetch lands (e.g. a trivial edit elsewhere in
+	// the worktree) while the user is mid-review; the file/line count here is
+	// deliberately unchanged.
+	r.applyDiffMsg(diffMsg{ID: "w1", Diff: manyLineDiff(500)})
+
+	if r.pane.offset != before {
+		t.Errorf("scroll offset = %d after a same-worktree refetch, want it preserved at %d", r.pane.offset, before)
+	}
+}
+
 func TestApplyDiffErrMsgOnlySetsErrorForCurrentSelection(t *testing.T) {
 	r := newRadarView()
 	r.currentID = "w2"
@@ -253,11 +289,54 @@ func TestRenderGuardrailBannerShowsMessageVerbatimAndMoreCount(t *testing.T) {
 
 func TestRenderDiffHeaderContainsRepoNameAndBase(t *testing.T) {
 	w := model.Worktree{Repo: "api-server", Name: "auth-refactor", Base: "main", Stats: model.Stats{Files: 3, Add: 10, Del: 2}}
-	got := stripANSI(renderDiffHeader(80, w))
+	got := stripANSI(renderDiffHeader(80, w, false, false))
 	for _, want := range []string{"api-server", "auth-refactor", "main", "3 files"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("header = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// TestRenderDiffHeaderAccentsTitleWhenFocused pins the ux-expert P2-3 focus
+// cue: Radar's two focus states (sidebar vs. diff pane) otherwise render
+// identically, so the header title is the one visible signal distinguishing
+// them. Compares under TrueColor (the package's TestMain forces Ascii, which
+// renders no escape codes at all — see fake_test.go) so a styling
+// difference is actually observable in the byte output.
+func TestRenderDiffHeaderAccentsTitleWhenFocused(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	w := model.Worktree{Repo: "api-server", Name: "auth-refactor", Base: "main"}
+	unfocused := renderDiffHeader(80, w, false, false)
+	focused := renderDiffHeader(80, w, true, false)
+	if unfocused == focused {
+		t.Error("a focused header should render styled differently from an unfocused one")
+	}
+	if stripANSI(unfocused) != stripANSI(focused) {
+		t.Errorf("focus must only change styling, not content: unfocused=%q focused=%q", stripANSI(unfocused), stripANSI(focused))
+	}
+}
+
+// TestRenderDiffHeaderReviewingShowsBranchVsBase pins the ux-expert P3-cheap
+// review-header seam: Review's call (reviewing=true) reads "reviewing
+// <branch> vs <base>", matching the mock's `#rv-base` treatment, instead of
+// Radar's plain "base <base>".
+func TestRenderDiffHeaderReviewingShowsBranchVsBase(t *testing.T) {
+	w := model.Worktree{Repo: "api", Name: "feature", Branch: "feature-x", Base: "main"}
+
+	reviewing := stripANSI(renderDiffHeader(80, w, false, true))
+	if !strings.Contains(reviewing, "reviewing feature-x vs main") {
+		t.Errorf("reviewing header = %q, want it to contain %q", reviewing, "reviewing feature-x vs main")
+	}
+
+	radar := stripANSI(renderDiffHeader(80, w, false, false))
+	if strings.Contains(radar, "reviewing") {
+		t.Errorf("radar header = %q, must not say \"reviewing\"", radar)
+	}
+	if !strings.Contains(radar, "base main") {
+		t.Errorf("radar header = %q, want the plain \"base main\" segment preserved", radar)
 	}
 }
 
@@ -266,7 +345,7 @@ func TestRenderDiffHeaderContainsRepoNameAndBase(t *testing.T) {
 func TestRadarViewShowsLoadingPlaceholderBeforeDiffArrives(t *testing.T) {
 	r := newRadarView()
 	w := model.Worktree{ID: "w1", Repo: "api", Name: "feature", Base: "main"}
-	out := stripANSI(r.view(80, 24, w))
+	out := stripANSI(r.view(80, 24, w, false, false))
 	if !strings.Contains(out, "loading diff") {
 		t.Errorf("view = %q, want a loading placeholder before any diff has loaded", out)
 	}
@@ -277,7 +356,7 @@ func TestRadarViewShowsErrorInsteadOfPane(t *testing.T) {
 	r.currentID = "w1"
 	r.diffErr = "unknown worktree id"
 	w := model.Worktree{ID: "w1", Repo: "api", Name: "feature", Base: "main"}
-	out := stripANSI(r.view(80, 24, w))
+	out := stripANSI(r.view(80, 24, w, false, false))
 	if !strings.Contains(out, "unknown worktree id") {
 		t.Errorf("view = %q, want the daemon's error message", out)
 	}
@@ -295,7 +374,7 @@ func TestRadarViewRendersLoadedDiffWithGuardrailBanner(t *testing.T) {
 		ID: "w1", Repo: "infra", Name: "migrate", Base: "main",
 		Guardrails: []model.GuardrailHit{{Rule: "big-delete", Severity: "danger", Message: "deletes too much", File: "migrations/x.sql"}},
 	}
-	out := stripANSI(r.view(80, 24, w))
+	out := stripANSI(r.view(80, 24, w, false, false))
 	if !strings.Contains(out, "deletes too much") {
 		t.Errorf("view = %q, want the guardrail banner", out)
 	}
@@ -304,5 +383,41 @@ func TestRadarViewRendersLoadedDiffWithGuardrailBanner(t *testing.T) {
 	}
 	if !strings.Contains(out, "danger") {
 		t.Errorf("view = %q, want the file's danger tag", out)
+	}
+}
+
+// TestRadarViewAtMinimumHeightWithBannerSqueezesPaneWithoutPanicking is the
+// "resize to a 1-row height mid-scroll" edge: app.go's minHeight=10 guard
+// means shellView() (and so radarView.view) never actually sees a height
+// below 10 -- a true 1-row terminal shows the "too small" card instead. The
+// realistic worst case that *does* reach this composition is the documented
+// minimum (10 rows) with a multi-line guardrail banner squeezing the pane
+// itself down to just 1-2 rows, while the user was already scrolled deep
+// into a large diff before the resize. Regression guard: no panic, exact
+// requested height, and the scroll offset is left in a valid (if no longer
+// visibly meaningful) range by setHeight's own clampOffset.
+func TestRadarViewAtMinimumHeightWithBannerSqueezesPaneWithoutPanicking(t *testing.T) {
+	r := newRadarView()
+	r.currentID = "w1"
+	r.applyDiffMsg(diffMsg{ID: "w1", Diff: manyLineDiff(500)})
+	r.pane.setHeight(40)
+	r.pane.scroll(300) // scrolled deep in before the resize
+
+	w := model.Worktree{
+		ID: "w1", Repo: "infra", Name: "migrate", Base: "main",
+		Guardrails: []model.GuardrailHit{{Rule: "r1", Severity: "danger", Message: "a fairly long guardrail message to eat into the pane's height budget", File: "big.go"}},
+	}
+
+	out := r.view(80, minHeight, w, false, false) // minHeight=10: app.go's documented floor
+	lines := strings.Count(out, "\n") + 1
+	if lines != minHeight {
+		t.Errorf("radarView.view height = %d lines, want exactly %d", lines, minHeight)
+	}
+	maxOffset := len(r.pane.lines) - r.pane.height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if r.pane.offset < 0 || r.pane.offset > maxOffset {
+		t.Errorf("pane.offset = %d after the squeeze, want it re-clamped within [0, %d]", r.pane.offset, maxOffset)
 	}
 }

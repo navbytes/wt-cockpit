@@ -5,6 +5,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -82,6 +83,16 @@ func totalHunkLines(f model.DiffFile) int {
 // the `o` fold toggle). Pure function: no I/O, no styling, no lipgloss —
 // diffview.go styles only the rows a frame actually paints. expanded is
 // keyed by DiffFile.Hash (the `o` override for collapsed-by-default files).
+//
+// Hunk header/content text is run through diffparse.SanitizeControl here —
+// the one shared choke point every row kind's content flows through before a
+// render call ever sees it (DEFECT D2). Production diffs already arrive
+// pre-sanitized (wtd's diffparse.Parse call runs the same function before
+// the hash is even computed), so this is belt-and-suspenders for anything
+// that builds a model.Diff by hand; the import is of diffparse's pure,
+// I/O-free text transform only, not git logic, so it doesn't reach past the
+// "thin client" boundary this package's own doc comment describes.
+
 func flattenDiff(d model.Diff, expanded map[string]bool) (lines []renderLine, fileOffsets []int) {
 	for fi, f := range d.Files {
 		fileOffsets = append(fileOffsets, len(lines))
@@ -99,12 +110,12 @@ func flattenDiff(d model.Diff, expanded map[string]bool) (lines []renderLine, fi
 		default:
 			codeIdx := 0
 			for _, h := range f.Hunks {
-				lines = append(lines, renderLine{kind: rowHunkHeader, fileIdx: fi, content: h.Header})
+				lines = append(lines, renderLine{kind: rowHunkHeader, fileIdx: fi, content: diffparse.SanitizeControl(h.Header)})
 				for _, ln := range h.Lines {
 					lines = append(lines, renderLine{
 						kind: rowCode, fileIdx: fi,
 						lineKind: ln.Kind, oldNum: ln.OldNum, newNum: ln.NewNum,
-						content: ln.Content, codeIdx: codeIdx,
+						content: diffparse.SanitizeControl(ln.Content), codeIdx: codeIdx,
 					})
 					codeIdx++
 				}

@@ -433,6 +433,118 @@ func TestHandleDiffReviewedMapOmitsNeverReviewedFiles(t *testing.T) {
 	}
 }
 
+// TestHandleDiffReviewedMapForAWorktreeWithZeroDiffFilesDecodesSafely covers
+// a worktree with no changes at all (a fresh branch, identical to base).
+// engine.ReviewedMap itself returns a real, non-nil (just empty) map here —
+// but model.Diff.Reviewed is `json:"reviewed,omitempty"`, and encoding/json's
+// omitempty treats a zero-length map (nil or not) as "empty" and drops the
+// key entirely; the client then decodes the missing key back to a nil map.
+// This is the same, already-accepted contract client_test.go's
+// TestDiffDecodesMissingReviewedFieldAsNil pins for a pre-WP3 daemon
+// (missing field -> nil map -> reads as false, never panics) — this test
+// confirms a *real* zero-file worktree hits that identical wire shape
+// end-to-end through the actual engine/store/handler, not just a
+// hand-written JSON fixture standing in for "the field is absent."
+func TestHandleDiffReviewedMapForAWorktreeWithZeroDiffFilesDecodesSafely(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	os.MkdirAll(repo, 0o755)
+	testGit(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644)
+	testGit(t, repo, "add", ".")
+	testGit(t, repo, "commit", "-q", "-m", "init")
+
+	wt := filepath.Join(root, "repo-feature")
+	testGit(t, repo, "worktree", "add", "-q", "-b", "feature", wt) // no edits at all: clean, identical to main
+
+	reg := registry.New()
+	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := gitbackend.NewCLIWithEnv(testGitEnv())
+	gr := guardrail.New(guardrail.DefaultRules())
+	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
+	if err := eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var feat *model.Worktree
+	for _, w := range eng.List() {
+		if w.Branch == "feature" {
+			wc := w
+			feat = &wc
+		}
+	}
+	if feat == nil {
+		t.Fatalf("feature worktree not found in %+v", eng.List())
+	}
+
+	// The engine's own read must be a real, non-nil map (just empty) — this
+	// is the half of the contract that lives below the JSON wire.
+	rm, ok := eng.ReviewedMap(feat.ID)
+	if !ok {
+		t.Fatal("ReviewedMap ok = false for a known worktree")
+	}
+	if rm == nil {
+		t.Error("engine.ReviewedMap = nil, want a real (empty) map, not nil, for a known worktree")
+	}
+
+	// Over the wire, `omitempty` drops a zero-length map either way, so the
+	// decoded client-side value is nil -- and must still be safe to read.
+	srv := &server{eng: eng}
+	d := getDiff(t, srv.routes(), feat.ID)
+	if len(d.Files) != 0 {
+		t.Fatalf("precondition: expected zero diff files for an untouched worktree, got %+v", d.Files)
+	}
+	if d.Reviewed != nil {
+		t.Errorf("Reviewed = %+v, want nil after the wire round trip (omitempty drops a zero-length map)", d.Reviewed)
+	}
+	if d.Reviewed["anything"] {
+		t.Error("reading a nil Reviewed map must return false, never panic")
+	}
+}
+
+// TestHandleDiffAfterApproveReturns404NotPanic pins the /api/diff surface's
+// behavior once a worktree is fully gone: engine.Approve's success path
+// clears its store state, deletes the cache entry and removes it from the
+// registry (see engine.go's Approve). GET /api/diff must then answer 404
+// cleanly, exactly as it does for any other unknown id -- ReviewedMap must
+// never even be reached for an id Diff() itself already refused (handleDiff
+// returns before calling it), so there is no risk of it operating on
+// half-torn-down state.
+func TestHandleDiffAfterApproveReturns404NotPanic(t *testing.T) {
+	srv, feat := buildTestServer(t)
+	handler := srv.routes()
+
+	d := getDiff(t, handler, feat.ID)
+	for _, f := range d.Files {
+		if rec := postJSON(t, handler, "/api/review", map[string]any{
+			"id": feat.ID, "file": f.Path, "reviewed": true, "hash": f.Hash,
+		}); rec.Code != http.StatusOK {
+			t.Fatalf("marking %s reviewed: status = %d, body=%s", f.Path, rec.Code, rec.Body.String())
+		}
+	}
+
+	wtPath, ok := srv.eng.WorktreePath(feat.ID)
+	if !ok {
+		t.Fatal("worktree path not found")
+	}
+	testGit(t, wtPath, "add", ".")
+	testGit(t, wtPath, "commit", "-q", "-m", "apply review")
+
+	rec := postJSON(t, handler, "/api/approve", map[string]any{"id": feat.ID})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/diff?id="+feat.ID, nil)
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusNotFound {
+		t.Errorf("GET /api/diff after approve: status = %d, want 404; body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // TestHandleVersionReturnsProtocolAndVersion pins /api/version's contract:
 // the handshake payload every client checks before trusting anything else.
 func TestHandleVersionReturnsProtocolAndVersion(t *testing.T) {

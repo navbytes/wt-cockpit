@@ -36,16 +36,25 @@ type diffview struct {
 	height int // last known viewport height, kept current by render/setHeight
 }
 
-// setDiff loads a freshly-fetched diff, resetting scroll to the top. Expand
-// overrides persist across loads (keyed by file hash, so an unchanged file
-// keeps its `o` state across a refetch of the same worktree).
+// setDiff loads a freshly-fetched diff. Expand overrides persist across
+// loads (keyed by file hash, so an unchanged file keeps its `o` state across
+// a refetch of the same worktree) — scroll position now matches that (DEFECT
+// D4 fix): a refetch of the SAME worktree (e.g. a diff.ready-triggered
+// refresh while mid-review) preserves offset, re-clamped by reflow against
+// the new line count; only switching to a genuinely different worktree
+// resets to the top. An empty incoming WorktreeID never counts as "same" —
+// it can't be positively confirmed, so this falls back to the always-safe
+// reset.
 func (v *diffview) setDiff(d model.Diff) {
+	sameWorktree := d.WorktreeID != "" && d.WorktreeID == v.diff.WorktreeID
 	v.diff = d
 	if v.expanded == nil {
 		v.expanded = map[string]bool{}
 	}
-	v.reflow()
-	v.offset = 0
+	v.reflow() // re-clamps offset against the new line count either way
+	if !sameWorktree {
+		v.offset = 0
+	}
 }
 
 // reflow recomputes lines/fileOffsets/tooLarge from the current diff and

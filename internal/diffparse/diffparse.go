@@ -43,30 +43,48 @@ func Parse(diff string) []model.DiffFile {
 			// Preamble before the first file header; ignore.
 			continue
 
-		case strings.HasPrefix(ln, "new file"):
+		// Every case below down to "@@" only ever appears in a per-file
+		// *header* block: git always emits new/deleted/rename/index/Binary/
+		// ---/+++ lines before a file's first hunk, never after. hunk == nil
+		// means exactly that — "no @@ has been seen yet for cur" — since it's
+		// reset to nil only by flushFile, at the next "diff --git " (or EOF).
+		// Without this guard, a deleted (or added) file's own hunk-body
+		// content can byte-collide with these header prefixes: git marks a
+		// removed content line with a literal leading '-', so a deleted
+		// line whose text itself starts with "-- " (two dashes, a space)
+		// comes out as "--- <text>" — indistinguishable by prefix alone from
+		// a real "--- a/<path>" header — and symmetrically "++ " content on
+		// an added line collides with "+++ ". "new file"/"deleted
+		// file"/"rename from/to "/"index "/"Binary files" can never actually
+		// collide this way in real git output (every hunk-body line carries
+		// a mandatory leading '+'/'-'/' ' marker, and none of those texts
+		// start with one), but they're gated the same way for a uniform,
+		// cheap state machine rather than special-casing just the two that
+		// do collide.
+		case hunk == nil && strings.HasPrefix(ln, "new file"):
 			cur.Status = model.FileAdded
 			cur.OldPath = ""
 
-		case strings.HasPrefix(ln, "deleted file"):
+		case hunk == nil && strings.HasPrefix(ln, "deleted file"):
 			cur.Status = model.FileDeleted
 
-		case strings.HasPrefix(ln, "rename from "):
+		case hunk == nil && strings.HasPrefix(ln, "rename from "):
 			cur.Status = model.FileRenamed
 			// No a/b prefix on this line (unlike ---/+++/diff --git), just the
 			// bare path — only undo quoting/escaping, don't strip a fake prefix.
 			cur.OldPath = unquotePath(strings.TrimPrefix(ln, "rename from "))
 
-		case strings.HasPrefix(ln, "rename to "):
+		case hunk == nil && strings.HasPrefix(ln, "rename to "):
 			cur.Status = model.FileRenamed
 			cur.Path = unquotePath(strings.TrimPrefix(ln, "rename to "))
 
-		case strings.HasPrefix(ln, "index "):
+		case hunk == nil && strings.HasPrefix(ln, "index "):
 			cur.OldBlob, cur.NewBlob = parseIndexLine(ln)
 
-		case strings.HasPrefix(ln, "Binary files"):
+		case hunk == nil && strings.HasPrefix(ln, "Binary files"):
 			cur.Binary = true
 
-		case strings.HasPrefix(ln, "--- "):
+		case hunk == nil && strings.HasPrefix(ln, "--- "):
 			// Old path; "/dev/null" means an add (OldPath is already "" from the
 			// "new file" case above). A real path here is authoritative for a
 			// plain modify or a delete — where Path itself holds the old path,
@@ -81,7 +99,7 @@ func Parse(diff string) []model.DiffFile {
 				}
 			}
 
-		case strings.HasPrefix(ln, "+++ "):
+		case hunk == nil && strings.HasPrefix(ln, "+++ "):
 			p := strings.TrimPrefix(ln, "+++ ")
 			if p != "/dev/null" {
 				cur.Path = stripPrefix(p)
@@ -98,21 +116,21 @@ func Parse(diff string) []model.DiffFile {
 
 		case hunk != nil && strings.HasPrefix(ln, "+"):
 			hunk.Lines = append(hunk.Lines, model.Line{
-				Kind: model.LineAdd, NewNum: newNum, Content: ln[1:],
+				Kind: model.LineAdd, NewNum: newNum, Content: SanitizeControl(ln[1:]),
 			})
 			newNum++
 			cur.Stats.Add++
 
 		case hunk != nil && strings.HasPrefix(ln, "-"):
 			hunk.Lines = append(hunk.Lines, model.Line{
-				Kind: model.LineDel, OldNum: oldNum, Content: ln[1:],
+				Kind: model.LineDel, OldNum: oldNum, Content: SanitizeControl(ln[1:]),
 			})
 			oldNum++
 			cur.Stats.Del++
 
 		case hunk != nil && strings.HasPrefix(ln, " "):
 			hunk.Lines = append(hunk.Lines, model.Line{
-				Kind: model.LineContext, OldNum: oldNum, NewNum: newNum, Content: ln[1:],
+				Kind: model.LineContext, OldNum: oldNum, NewNum: newNum, Content: SanitizeControl(ln[1:]),
 			})
 			oldNum++
 			newNum++
@@ -159,12 +177,15 @@ func unquotePath(p string) string {
 	p = strings.TrimSuffix(p, "\t")
 	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
 		if unquoted, err := strconv.Unquote(p); err == nil {
-			return unquoted
+			// DEFECT D2: an octal escape here can decode straight back to a
+			// raw control byte (e.g. \033 -> a literal ESC) — sanitize the
+			// decoded result, not just the fallback below.
+			return SanitizeControl(unquoted)
 		}
 		// Malformed/unsupported escape: fall through with the tab trimmed but
 		// the quotes left as-is rather than losing the value entirely.
 	}
-	return p
+	return SanitizeControl(p)
 }
 
 // stripPrefix removes a leading a/ or b/ from a diff path — git always adds
@@ -198,7 +219,10 @@ func parseIndexLine(ln string) (oldBlob, newBlob string) {
 
 // parseHunkHeader parses "@@ -oldStart,oldLen +newStart,newLen @@ optional".
 func parseHunkHeader(ln string) model.Hunk {
-	h := model.Hunk{Header: ln}
+	// The trailing "optional" section (git's nearby-function context, e.g.
+	// "@@ -18,3 +18,4 @@ func NewToken(") is copied verbatim from the source
+	// file, same as any hunk line's content — DEFECT D2 applies here too.
+	h := model.Hunk{Header: SanitizeControl(ln)}
 	// Find the two @@ markers.
 	body := ln
 	if i := strings.Index(ln[2:], "@@"); i >= 0 {
@@ -220,4 +244,45 @@ func firstInt(s string) int {
 	}
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// SanitizeControl neutralizes bytes that could otherwise drive a terminal's
+// escape-sequence interpreter once diff output reaches a real screen (DEFECT
+// D2 — a hostile agent worktree's tracked content/paths are untrusted input,
+// and every consumer downstream of Parse, from `wt diff` to the TUI's
+// lipgloss/chroma render path, treats them as plain text to display, not
+// bytes to execute). Replaces C0 controls (0x00-0x1F, tab excepted — it's
+// just whitespace) and DEL (0x7F) with the standard visible caret notation
+// (ESC -> "^[", BEL -> "^G", DEL -> "^?"), and C1 controls (0x80-0x9F, once
+// UTF-8-decoded — git's own path-quoting escapes can resurrect one of these
+// from an octal escape, see unquotePath) with the same notation as their
+// classic 7-bit equivalent. Exported so any other renderer of a parsed diff
+// (internal/tui's flattenDiff, in particular, which must stay safe even for
+// a model.Diff assembled by hand rather than through Parse) can reuse the
+// exact same rule instead of a second, drifting implementation.
+func SanitizeControl(s string) string {
+	if strings.IndexFunc(s, isControlRune) < 0 {
+		return s // fast path: control bytes are rare in real code
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == 0x7f:
+			b.WriteString("^?")
+		case r < 0x20:
+			b.WriteByte('^')
+			b.WriteByte(byte(r) + '@') // 0x00-0x1F -> ^@ .. ^_ (standard caret notation)
+		case r >= 0x80 && r <= 0x9f:
+			b.WriteByte('^')
+			b.WriteByte(byte(r-0x80) + '@') // C1 -> same glyph as its C0/7-bit equivalent
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isControlRune(r rune) bool {
+	return (r < 0x20 && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }

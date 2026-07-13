@@ -71,6 +71,27 @@ func TestOpenApproveFallsBackToAggregateWhenDiffNotLoadedForThisWorktree(t *test
 	}
 }
 
+// TestOpenApprovePopulatesDirtyFromWorktreeState pins the ux-expert P3-cheap
+// pre-warn: the modal's own clean-tree knowledge comes straight from
+// Worktree.State (the one signal the client already has), not a new probe.
+func TestOpenApprovePopulatesDirtyFromWorktreeState(t *testing.T) {
+	for _, tc := range []struct {
+		state model.WorktreeState
+		want  bool
+	}{
+		{model.StateDirty, true},
+		{model.StateActive, false},
+		{model.StateIdle, false},
+	} {
+		m := newTestModel(&fakeAPI{})
+		m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature", State: tc.state}})
+		updated, _ := m.openApprove()
+		if got := updated.(appModel).approve; got.dirty != tc.want {
+			t.Errorf("state=%v: approve.dirty = %v, want %v", tc.state, got.dirty, tc.want)
+		}
+	}
+}
+
 func TestOpenApproveAlreadyOpenDoesNotResetInFlightState(t *testing.T) {
 	m := newTestModel(&fakeAPI{})
 	m.sidebar.setWorktrees([]model.Worktree{{ID: "a1", Repo: "api", Name: "feature"}})
@@ -234,6 +255,32 @@ func TestRenderApproveModalShowsErrorVerbatim(t *testing.T) {
 	out := stripANSI(renderApproveModal(80, 24, a))
 	if !strings.Contains(out, "cannot approve: worktree has uncommitted changes") {
 		t.Errorf("modal = %q, want the daemon's error verbatim", out)
+	}
+}
+
+// TestRenderApproveModalShowsCleanTreeMarkFromDirtyField pins the ux-expert
+// P3-cheap pre-warn line: ✓/✗ clean tree, driven by approveModal.dirty
+// (itself populated from Worktree.State by openApprove).
+func TestRenderApproveModalShowsCleanTreeMarkFromDirtyField(t *testing.T) {
+	clean := stripANSI(renderApproveModal(80, 24, approveModal{branch: "feature", base: "main", dirty: false}))
+	if !strings.Contains(clean, "✓ clean tree") {
+		t.Errorf("clean modal = %q, want a %q line", clean, "✓ clean tree")
+	}
+
+	dirty := stripANSI(renderApproveModal(80, 24, approveModal{branch: "feature", base: "main", dirty: true}))
+	if !strings.Contains(dirty, "✗ clean tree") {
+		t.Errorf("dirty modal = %q, want a %q line", dirty, "✗ clean tree")
+	}
+}
+
+// TestRenderApproveModalHasABorderedCard pins the ux-expert P3-cheap
+// bordered-card polish: border box-drawing characters are drawn regardless
+// of color profile (only their *color* is profile-gated), so this holds
+// even under the package's forced-Ascii test profile.
+func TestRenderApproveModalHasABorderedCard(t *testing.T) {
+	out := renderApproveModal(80, 24, approveModal{branch: "feature", base: "main"})
+	if !strings.Contains(out, "╭") || !strings.Contains(out, "╮") || !strings.Contains(out, "╰") || !strings.Contains(out, "╯") {
+		t.Errorf("modal = %q, want all four rounded-border corners present", out)
 	}
 }
 
