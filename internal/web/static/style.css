@@ -340,3 +340,14 @@ code { font-family: var(--mono); }
   .toast { animation: toast-in .15s ease-out; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
 }
+
+/* The file rail sits beside the diff only when the window can spare its 240px
+   without crushing the two side-by-side code panes. Below ~900px (240 rail +
+   ~330/pane is the floor), row layout squeezes each pane to an unreadable
+   sliver, so stack instead: the rich diff takes the full width, the rail drops
+   underneath as a full-width review-summary + approve footer. The rail's fixed
+   flex-basis/left border are the row-only bits that must reset here. */
+@media (max-width: 900px) {
+  .review-wrap { flex-direction: column; }
+  .rail { width: auto; flex: 0 0 auto; border-left: 0; border-top: 1px solid var(--line); }
+}

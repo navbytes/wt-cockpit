@@ -30,6 +30,7 @@
 - A daemon restart whose very first `Refresh` fails outright (a discovery error, or the context canceling mid-scan) no longer opens the cold-start gate — the next successful scan no longer replays every worktree's standing guardrail hits as "new".
 - A `.wtcockpit.toml` pack whose own `[[rules]]` list contains two entries with the same name now fails to load (falling back to the global rules, same as any other malformed pack) instead of silently keeping only the last entry.
 - Guardrail `Compile` now rejects a negative threshold value (`min_files_changed`, `min_total_changed`, `min_changed_lines`, `min_net_deleted`, `min_delete_add_ratio`, `min_token_entropy`) instead of silently accepting it as a permanent no-op rule.
+- The web reading room now stacks the file rail beneath the diff on viewports narrower than 900px, instead of holding it in a fixed 240px column that squeezed the two side-by-side code panes to an unreadable sliver. Wide windows are unchanged — the rail stays beside the diff whenever there's room for both.
 
 ### Changed
 - Guardrail `Compile`'s validation was already strict about a `[[rules]]` entry's `severity` being one of `""`/`warn`/`danger` — noted here since it was previously undocumented: a v0.2-era `config.toml` (or a `.wtcockpit.toml` pack) using some other severity spelling fails the whole config/pack load rather than silently accepting or defaulting it. Intended tightening, not a regression.
