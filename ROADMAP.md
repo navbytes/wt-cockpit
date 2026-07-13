@@ -89,13 +89,19 @@ Goal: "catch mistakes fast" without watching the screen.
 
 Goal: instant at 100+ worktrees and monorepo-size diffs.
 
-- **SQLite store** behind `Store` (modernc.org/sqlite, still a static binary);
+- ✅ **SQLite store** behind `Store` (modernc.org/sqlite, still a static binary);
   migration from the JSON file on first run.
-- Benchmark suite + profiles as CI artifacts; budgets: <50ms radar refresh with
-  100 worktrees, <1s re-diff p95 on a 1M-file monorepo (git CLI).
-- Evaluate **gitoxide sidecar / libgit2** behind `GitBackend` for status/diff hot
-  paths; adopt only if profiles justify it.
-- Diff pagination in the API (hunk ranges) so huge files stream on demand.
+- ✅ Benchmark suite + profiles as CI artifacts; budgets met with room to spare
+  (store ops sub-ms to low-ms; refresh store-overhead for 100 worktrees ~18ms;
+  radar serve <1ms) — measured budget-vs-actual table in
+  `.claude/company/handoffs/P6-WP3.md`. The remaining roadmap number here,
+  "<1s re-diff p95 on a 1M-file monorepo", is git-CLI-bound rather than
+  store-bound and stays open pending the gitoxide evaluation below.
+- **Follow-up, unstarted**: evaluate **gitoxide sidecar / libgit2** behind
+  `GitBackend` for status/diff hot paths, informed by this phase's bench
+  profiles (CI artifacts); adopt only if they justify it.
+- **Follow-up, unstarted**: diff pagination in the API (hunk ranges) so huge
+  files stream on demand.
 
 ## v0.7 — Remote & fleet
 

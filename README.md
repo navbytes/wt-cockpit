@@ -39,7 +39,7 @@ richer drop-in later:
 |---|---|---|---|
 | git access | `gitbackend.Backend` | shell out to `git` | libgit2 / gitoxide |
 | change detection | `watcher.Watcher` | `Poller` (periodic) | fsnotify, git-state-first |
-| persistence | `store.Store` | JSON file | SQLite |
+| persistence | `store.Store` | SQLite (`modernc.org/sqlite`, CGO-free) | JSON escape hatch (`-state foo.json`) |
 | frontend | HTTP/SSE client | `wt` ANSI radar | Bubble Tea TUI, web |
 
 ## Packages
@@ -52,7 +52,7 @@ richer drop-in later:
   no shell), coalesced and cooled down.
 - `internal/gitbackend` — `Backend` interface + git-CLI impl (incl. untracked files).
 - `internal/discovery` — scan roots for repos (skips linked worktrees + heavy dirs).
-- `internal/store` — review/comment persistence (JSON).
+- `internal/store` — review/comment persistence (SQLite, `modernc.org/sqlite`; JSON escape hatch).
 - `internal/registry` — in-memory state + pub/sub event bus, emits deltas not full state.
 - `internal/watcher` — refresh driver (`Poller`).
 - `internal/engine` — orchestration + query/command surface.
@@ -220,6 +220,22 @@ See [docs/config.example.toml](docs/config.example.toml) for the full reference.
 Use `-config /path/to/config.toml` to specify a custom location, or `-watch fsnotify|poll`
 to override the watcher backend at runtime.
 
+## Persistence
+
+Review marks and comments live in `~/.wtcockpit/state.db` (SQLite, `modernc.org/sqlite`
+— CGO-free, so the single-static-binary story is unchanged). Upgrading from an earlier
+version with an existing `state.json`: it's imported automatically and exactly once, the
+first time `state.db` is created (review marks and comments both, byte-for-byte), and the
+source file is renamed to `state.json.imported` as a backup — never deleted, never
+touched again on later runs. `-state /path/to/foo.json` keeps the old JSON store working
+exactly as before, as a permanent escape hatch (no import, no `.db`).
+
+Files on disk alongside `state.db`: `state.db-wal`/`state.db-shm` (SQLite's WAL files,
+present while `wtd` is running). A corrupt or unreadable `state.db` is moved aside to
+`state.db.corrupt-<unixts>` and replaced with a fresh one rather than silently starting
+from zero. To back up a running daemon's state: `sqlite3 state.db "VACUUM INTO
+'backup.db'"`.
+
 ## What the engine does each refresh
 
 Discover repos under the roots → expand worktrees via git → for each, diff against its
@@ -253,6 +269,30 @@ Two behaviours were caught by tests and fixed during development: untracked file
 missing from diffs (agents create new files — now synthesized read-only via
 `git diff --no-index`), and content edits to already-dirty files weren't detected (the
 "changed?" decision is now keyed on the diff hash, correct under polling).
+
+## Benchmarks & performance budgets
+
+`internal/store` and `internal/engine` carry a `testing.B` benchmark suite (100
+worktrees × 200 reviewed files, 10k comments, an engine-level refresh benchmark with git
+subprocess time excluded via a stub backend) covering every store operation and the
+daemon's refresh/radar-serve paths, with documented p95 budgets on CI-class hardware —
+see `.claude/company/handoffs/P6-WP3.md` for the full budget-vs-measured table. Run them
+locally:
+
+```sh
+go test -bench=. -benchmem -count=6 ./internal/store/... ./internal/engine/... ./cmd/wtd/...
+```
+
+A separate, non-blocking CI job (`bench` in `.github/workflows/ci.yml`) runs this suite
+on every push, uploading bench output and pprof CPU/memory profiles as artifacts. That
+same job — and only that job, via `WT_BENCH_GATE=1` — also runs smoke-gate tests
+asserting each operation stays under **10× its budget**; a plain `go test ./...` always
+skips them, so a bench hiccup or shared-runner variance can never flake the core suite.
+
+`wt status` (and `GET /api/status`) report the daemon's last full-refresh and last
+targeted-refresh wall-clock durations (`refresh (full)` / `refresh (one)`, or
+`lastRefreshMs`/`lastRefreshOneMs` with `--json`) — the in-the-field version of the same
+budget check: if the cockpit feels slow, `wt status` has the numbers.
 
 ## Guardrails
 
@@ -413,6 +453,6 @@ way; pick whatever cadence suits you.)
 
 ## Not yet built (deliberately, next phases)
 
-A SQLite store (behind the existing `Store` interface — no engine rework needed, same
-pattern the Bubble Tea TUI and the fsnotify watcher already followed) and remote/auth'd
-access — see [ROADMAP.md](ROADMAP.md) for the full path.
+A gitoxide/libgit2 evaluation for the git-access hot paths (informed by this phase's
+bench profiles), diff pagination for huge files, and remote/auth'd access — see
+[ROADMAP.md](ROADMAP.md) for the full path.

@@ -80,6 +80,16 @@ type Engine struct {
 	// standing hits never replays them as "new". Set once, at the end of the
 	// first Refresh call, for the engine's whole lifetime.
 	firstScanDone atomic.Bool
+
+	// lastRefreshDur/lastRefreshOneDur record the wall-clock duration (as
+	// nanoseconds, time.Duration's own unit) of the most recently COMPLETED
+	// full Refresh / targeted RefreshOne (P6-design.md §6.3 layer 3 — the
+	// v0.2 roadmap's "scan timings" IOU): additive observability only, no
+	// behavior change. Atomics so a concurrent /api/status read never races
+	// a refresh in flight — it just sees the previous completed value until
+	// the new one finishes and stores. Zero means "hasn't completed one yet".
+	lastRefreshDur    atomic.Int64
+	lastRefreshOneDur atomic.Int64
 }
 
 // New constructs an Engine.
@@ -179,6 +189,15 @@ func (e *Engine) SetReviewed(id, file string, reviewed bool, expectedHash string
 		e.reg.Publish(model.Event{Type: model.EventReviewChanged, ID: id, At: time.Now()})
 	}
 	return nil
+}
+
+// LastRefreshDurations reports the wall-clock duration of the most recently
+// completed full Refresh and targeted RefreshOne (P6-design.md §6.3 layer 3):
+// `wt status`/`/api/status`'s perf counters, the v0.2 roadmap's "scan
+// timings" IOU. Zero for either means it hasn't completed one yet (e.g. a
+// daemon that has never seen a targeted refresh reports one=0 forever).
+func (e *Engine) LastRefreshDurations() (full, one time.Duration) {
+	return time.Duration(e.lastRefreshDur.Load()), time.Duration(e.lastRefreshOneDur.Load())
 }
 
 // ReviewedMap returns, for worktree id's current diff, whether each file is
@@ -350,7 +369,9 @@ func (e *Engine) RefreshOne(ctx context.Context, worktreePath string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	start := time.Now()
 	e.refreshOneLocked(id)
+	e.lastRefreshOneDur.Store(int64(time.Since(start))) // only this, the actually-targeted path — the delegate-to-Refresh branch above already updates lastRefreshDur via Refresh itself
 	return nil
 }
 
@@ -399,6 +420,7 @@ func (e *Engine) refreshOneLocked(id string) bool {
 func (e *Engine) Refresh(ctx context.Context) error {
 	e.refreshMu.Lock()
 	defer e.refreshMu.Unlock()
+	start := time.Now()
 
 	repos, err := discovery.DiscoverRepos(e.cfg.Roots, e.cfg.MaxDepth)
 	if err != nil {
@@ -448,7 +470,8 @@ func (e *Engine) Refresh(ctx context.Context) error {
 			e.reg.Remove(id)
 		}
 	}
-	e.firstScanDone.Store(true) // only on this, the success path — see doc comment above
+	e.firstScanDone.Store(true)                      // only on this, the success path — see doc comment above
+	e.lastRefreshDur.Store(int64(time.Since(start))) // same success-only rule as firstScanDone above: a fast-failing scan must not overwrite a real duration with a misleadingly small one
 	return nil
 }
 
