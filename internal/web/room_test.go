@@ -231,6 +231,101 @@ func TestRoomHandlerRendersGuardrailBannerWhenTripped(t *testing.T) {
 	}
 }
 
+var approveBtnDisabledRE = regexp.MustCompile(`id="approve-btn"[^>]*\sdisabled`)
+
+// TestRoomHandlerApproveGateReflectsDirtyWorktreeState pins the P4-fixes.md
+// #3 fix: the engine's Approve gates on a clean worktree in addition to full
+// review (engine.go's Gate 2, IsDirty) but the room previously only ever
+// reflected the review gate, so a fully-reviewed-but-dirty worktree looked
+// approvable right up until the 409. The room must now surface the knowable
+// State-derived dirty signal (registry snapshot, no new engine call) before
+// the click, and the 409 stays as the real backstop.
+func TestRoomHandlerApproveGateReflectsDirtyWorktreeState(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, repo, "add", ".")
+	testGit(t, repo, "commit", "-q", "-m", "init")
+
+	wt := filepath.Join(root, "repo-feature")
+	testGit(t, repo, "worktree", "add", "-q", "-b", "feature", wt)
+	if err := os.WriteFile(filepath.Join(wt, "app.go"), []byte("package app\n\nfunc B() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := registry.New()
+	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := gitbackend.NewCLIWithEnv(testGitEnv())
+	gr := guardrail.New(guardrail.DefaultRules())
+	// A vanishingly small (but > 0 — engine.New clamps <= 0 to a 30s default)
+	// ActivityWindow: "recently changed" can never mask the dirty signal
+	// here — buildWorktree's own IsDirty git subprocess call alone takes far
+	// longer than this, so by the time State is computed the window has
+	// already elapsed. This test is about the dirty-vs-clean gate
+	// specifically, not activity recency (which engine.state also folds
+	// into State).
+	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 1 * time.Microsecond}, be, reg, st, gr)
+	if err := eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var feat *model.Worktree
+	for _, w := range eng.List() {
+		if w.Branch == "feature" {
+			wc := w
+			feat = &wc
+		}
+	}
+	if feat == nil {
+		t.Fatalf("feature worktree not found in %+v", eng.List())
+	}
+	if feat.State != model.StateDirty {
+		t.Fatalf("precondition: worktree state = %q, want dirty (uncommitted change, ActivityWindow already elapsed)", feat.State)
+	}
+	if err := eng.SetReviewed(feat.ID, "app.go", true, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+	body := getPage(t, h, "/wt/"+feat.ID).Body.String()
+	if !strings.Contains(body, `data-dirty="true"`) {
+		t.Errorf("expected the approve button to carry data-dirty=true, got:\n%s", body)
+	}
+	if !strings.Contains(body, "uncommitted changes") {
+		t.Errorf("expected a pre-check line naming uncommitted changes, got:\n%s", body)
+	}
+	if !approveBtnDisabledRE.MatchString(body) {
+		t.Errorf("expected the approve button disabled even though every file is reviewed (dirty gate), got:\n%s", body)
+	}
+
+	// Commit the change: identical diff content vs base (same blob), but no
+	// longer dirty.
+	testGit(t, wt, "add", ".")
+	testGit(t, wt, "commit", "-q", "-m", "wip")
+	if err := eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body = getPage(t, h, "/wt/"+feat.ID).Body.String()
+	if !strings.Contains(body, `data-dirty="false"`) {
+		t.Errorf("expected data-dirty=false once the worktree is committed, got:\n%s", body)
+	}
+	if strings.Contains(body, "uncommitted changes") {
+		t.Errorf("expected the dirty pre-check line gone once clean, got:\n%s", body)
+	}
+	if approveBtnDisabledRE.MatchString(body) {
+		t.Errorf("expected the approve button enabled once clean and fully reviewed, got:\n%s", body)
+	}
+}
+
 // ---- side-by-side rendering + chroma classes on a real repo diff ----
 
 func TestRoomHandlerRendersSideBySideWithChromaClasses(t *testing.T) {

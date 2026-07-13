@@ -9,7 +9,12 @@
   --line2: #2a343f;
   --txt: #c9d4e0;
   --dim: #7d8996;
-  --faint: #4d5763;
+  /* #71808f, not the original #4d5763 (~2.7:1) — that failed WCAG AA on
+     functional text (line numbers, side labels, comment age) against every
+     dark background shade this app uses (--bg/--bg2/--panel and the
+     near-equivalent hardcoded ones); this clears 4.5:1 on all of them with a
+     small margin (P4-fixes.md #4) while staying visibly dimmer than --dim. */
+  --faint: #71808f;
   --accent: #6cb6ff;
   --accent2: #316dca;
   --add: #3fb950;
@@ -54,6 +59,10 @@ code { font-family: var(--mono); }
 .stat b { color: var(--txt); }
 .stat.warn b { color: var(--warn); }
 .stat.rev b { color: var(--accent); }
+
+/* SSE-drop indicator (P4-design.md §2's "Daemon-degraded" state): shown by
+   app.js's EventSource onerror handler, cleared on the next hello/message. */
+.sse-chip { font-size: 11px; padding: 2px 9px; border-radius: 10px; border: 1px solid rgba(227, 179, 65, .4); background: var(--warnbg); color: var(--warn); }
 
 .proj {
   padding: 9px 13px 3px;
@@ -131,6 +140,10 @@ code { font-family: var(--mono); }
   font-size: 12px;
 }
 .note { color: var(--dim); padding: 6px 12px; font-size: 12px; }
+/* the global `a` reset (top of file) makes a plain link invisible as a link;
+   the "expand" link is the only way to see a collapsed file's content, so it
+   needs its own visible affordance rather than reading as plain text. */
+.note a { color: var(--accent); text-decoration: underline; }
 
 .review-wrap { display: flex; flex: 1; min-height: 0; }
 .review-main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: auto; }
@@ -149,13 +162,40 @@ code { font-family: var(--mono); }
 
 .hunk-h { color: var(--accent); background: #0c1620; padding: 3px 12px; font-size: 11px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 
-/* side-by-side grid */
+/* side-by-side grid. Horizontal scroll (P4-fixes.md #1, the flagship "read
+   wide code" fix): one scroll region per SIDE (.side, below), not one per row
+   — a long line used to make its own .srow the scroll container, so
+   scrolling it right dragged that row's own .ln gutter out of view too, and
+   every row scrolled independently of its neighbours. Moving overflow-x up
+   to .side means all of a pane's rows share one scrollport (a long row's
+   grid track overflows .srow's own box exactly as before — grid items'
+   automatic minimum size is content-based unless overridden — but that
+   overflow now bubbles up to .side, the nearest non-visible-overflow
+   ancestor, instead of scrolling in place); .srow itself is no longer a
+   scroll container at all. The gutter stays visible across that scroll via
+   position: sticky (below), which needs a non-transparent background so the
+   code column scrolling underneath doesn't show through it. */
 .sxs { display: grid; grid-template-columns: 1fr 1fr; }
-.sxs .side { border-right: 1px solid var(--line); min-width: 0; }
+.sxs .side { border-right: 1px solid var(--line); min-width: 0; overflow-x: auto; }
 .sxs .side:last-child { border-right: 0; }
 .sxs .side-lab { padding: 4px 12px; font-size: 10px; color: var(--faint); letter-spacing: .5px; background: #0c1219; border-bottom: 1px solid var(--line); text-transform: uppercase; }
-.srow { display: grid; grid-template-columns: 40px 1fr; font-size: 12px; white-space: pre; overflow-x: auto; min-height: 19px; }
-.srow .ln { color: var(--faint); text-align: right; padding: 0 7px; background: rgba(255, 255, 255, .015); }
+.srow { display: grid; grid-template-columns: 40px 1fr; font-size: 12px; white-space: pre; min-height: 19px; }
+.srow .ln {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  appearance: none;
+  font: inherit;
+  line-height: inherit;
+  color: var(--faint);
+  text-align: right;
+  padding: 0 7px;
+  background: var(--bg2);
+}
 .srow .code { padding: 0 9px; }
 .srow.add { background: var(--addbg); }
 .srow.add .code { color: #aff0b5; }
@@ -195,10 +235,14 @@ code { font-family: var(--mono); }
 .btn.ghost.danger:hover { border-color: var(--del); }
 .file-h .c-add { margin-left: 8px; }
 
-/* a line-number gutter cell that can anchor a comment (data-line is only
-   present on cells with a real line number — filler/empty cells stay inert) */
+/* a line-number gutter cell that can anchor a comment: a real <button> (see
+   room.tmpl), keyboard-focusable and click-operable, unlike the old
+   hover-only <span> (data-line is only present on cells with a real line
+   number — filler/empty cells stay a plain, inert <span>). :focus-visible
+   gets the same cue as :hover so tabbing to it is as discoverable as
+   hovering it (WCAG 2.1.1/2.4.7). */
 .ln[data-line] { cursor: pointer; }
-.ln[data-line]:hover { background: rgba(108, 182, 255, .18); color: var(--accent); }
+.ln[data-line]:hover, .ln[data-line]:focus-visible { background: rgba(108, 182, 255, .18); color: var(--accent); }
 
 /* the per-file comment strip, right under the file header; renders with no
    visible chrome of its own when it has no children so an uncommented file
@@ -221,6 +265,10 @@ code { font-family: var(--mono); }
 
 .orphaned-comments h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
 .orphaned-comments .cgroup-lab { color: var(--dim); }
+/* mirrors .comments:not(:empty) above: a genuinely childless card (no
+   orphaned comments at all) shows nothing, instead of an h3 + "none" on
+   every single room page. */
+.orphaned-comments:empty { display: none; }
 
 /* comment composer, cloned from the page's static <template> */
 .composer { border: 1px solid var(--accent2); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; background: var(--panel); }

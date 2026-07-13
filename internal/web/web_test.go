@@ -139,6 +139,11 @@ func TestIndexPageContainsFixtureWorktreeName(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `href="/wt/`+feat.ID+`"`) {
 		t.Errorf("index page should link to /wt/%s:\n%s", feat.ID, rec.Body.String())
 	}
+	// P4-fixes.md #6: the SSE-drop indicator lives in the topbar on both the
+	// index and room pages (app.js's EventSource onerror unhides it).
+	if !strings.Contains(rec.Body.String(), `id="sse-chip" class="sse-chip hidden"`) {
+		t.Errorf("expected the (initially hidden) SSE-drop chip in the topbar, got:\n%s", rec.Body.String())
+	}
 }
 
 // TestIndexPageEmptyWorkspaceMessage pins the "no worktrees" state (§2):
@@ -202,6 +207,9 @@ func TestRoomHandlerRendersFixtureWorktree(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "app.go") {
 		t.Errorf("expected the fixture's changed file in the room page, got:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `id="sse-chip" class="sse-chip hidden"`) {
+		t.Errorf("expected the (initially hidden) SSE-drop chip in the topbar, got:\n%s", rec.Body.String())
 	}
 
 	rec = getPage(t, h, "/wt/definitely-unknown")

@@ -24,10 +24,19 @@ function swapInnerHTML(el, html) {
 // "protocol-version"> means this tab was rendered by a since-upgraded/
 // downgraded daemon — surfaced as a persistent banner rather than silently
 // misinterpreting a shape this build doesn't understand (P4-design.md §1.6/§2).
+//
+// It also drives the topbar's "live updates paused — retrying" chip
+// (#sse-chip, present on both the index and room pages): EventSource has no
+// built-in "connection dropped" signal of its own, but it does auto-reconnect
+// after firing onerror (P4-design.md §2's "Daemon-degraded" state), so
+// showing/hiding the chip on error/hello-or-message is the whole fix — no
+// manual retry loop needed.
 function connectEvents(onMessage) {
   if (!window.EventSource) return null;
   var events = new EventSource("/api/events");
+  var chip = document.getElementById("sse-chip");
   events.addEventListener("hello", function (e) {
+    if (chip) chip.classList.add("hidden");
     var hello;
     try { hello = JSON.parse(e.data); } catch (err) { return; }
     var meta = document.querySelector('meta[name="protocol-version"]');
@@ -37,7 +46,13 @@ function connectEvents(onMessage) {
       if (banner) banner.classList.remove("hidden");
     }
   });
-  events.onmessage = onMessage;
+  events.onmessage = function (e) {
+    if (chip) chip.classList.add("hidden");
+    onMessage(e);
+  };
+  events.onerror = function () {
+    if (chip) chip.classList.remove("hidden");
+  };
   return events;
 }
 
@@ -129,6 +144,14 @@ function showBanner(el, text) {
     updateProgress();
   }
 
+  // updateProgress derives everything (bar width, "N / M" text, the approve
+  // button's disabled state and label) from the rail's own live checkboxes,
+  // so it's correct whether it's called after a review toggle, once at page
+  // load, or after refreshRail() swaps #rail's contents wholesale (P4-fixes.md
+  // #9: the bar's width can no longer be a server-rendered inline style —
+  // style-src 'self' has no unsafe-inline — so app.js setting it here, via
+  // the .style property rather than an HTML attribute, is the fix; that
+  // assignment is not CSP-restricted).
   function updateProgress() {
     var boxes = document.querySelectorAll(".rail-toggle");
     var total = boxes.length, done = 0;
@@ -142,11 +165,17 @@ function showBanner(el, text) {
     var btn = document.getElementById("approve-btn");
     if (!btn) return;
     var allDone = total > 0 && done === total;
-    btn.disabled = !allDone;
+    // data-dirty (P4-fixes.md #3) is server-rendered from the worktree's own
+    // registry state, refreshed wholesale by refreshRail() — read fresh here
+    // too, so marking every file reviewed can never re-enable approve while
+    // the worktree still has uncommitted changes.
+    var dirty = btn.dataset.dirty === "true";
+    btn.disabled = !allDone || dirty;
     btn.textContent = allDone
       ? "✓ Approve & merge to " + btn.dataset.base
       : "✓ Approve & merge (" + (total - done) + " left)";
   }
+  updateProgress(); // initialize bar/text/button from the as-rendered page
 
   document.addEventListener("change", function (e) {
     if (!e.target.classList || !e.target.classList.contains("rev-toggle")) return;
@@ -183,7 +212,9 @@ function showBanner(el, text) {
   document.addEventListener("click", function (e) {
     var btn = e.target.closest("#approve-btn");
     if (!btn || btn.disabled) return;
+    var label = btn.textContent;
     btn.disabled = true;
+    btn.textContent = "merging…";
     var errEl = document.getElementById("approve-error");
     if (errEl) errEl.classList.add("hidden");
 
@@ -192,11 +223,13 @@ function showBanner(el, text) {
         if (r.ok) return r.json().then(showTerminal);
         return r.text().then(function (msg) {
           btn.disabled = false;
+          btn.textContent = label;
           showBanner(errEl, msg);
         });
       })
       .catch(function () {
         btn.disabled = false;
+        btn.textContent = label;
         showBanner(errEl, "network error — try again");
       });
   });
@@ -267,21 +300,63 @@ function showBanner(el, text) {
     });
   });
 
+  // Cmd/Ctrl+Enter submits the composer without reaching for the mouse.
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey)) return;
+    var form = e.target.closest(".composer");
+    if (!form) return;
+    e.preventDefault();
+    form.requestSubmit();
+  });
+
+  // resetDeleteConfirm reverts a comment's delete button back to its
+  // resting state — used both by an explicit cancel click and by a failed
+  // delete (network error or a rejected POST), so a stale "delete?" never
+  // lingers after either.
+  function resetDeleteConfirm(card) {
+    if (!card) return;
+    var btn = card.querySelector(".c-delete");
+    var cancelBtn = card.querySelector(".c-delete-cancel");
+    if (btn) { btn.classList.remove("confirming"); btn.textContent = "delete"; btn.disabled = false; }
+    if (cancelBtn) cancelBtn.classList.add("hidden");
+  }
+
+  // Delete is destructive and one pixel from resolve, so it's a two-step
+  // click, not a native confirm() dialog: the first click turns "delete"
+  // into "delete?" and reveals a "cancel" button (both server-rendered,
+  // always present, just hidden — P4-design.md §1.2's "no markup built from
+  // data" rule stays intact since nothing here is new markup); only a
+  // *second* click on the already-confirming button actually POSTs. Resolve
+  // stays a single click — it's non-destructive.
   document.addEventListener("click", function (e) {
+    var cancel = e.target.closest(".c-delete-cancel");
+    if (cancel) {
+      resetDeleteConfirm(cancel.closest(".ccard"));
+      return;
+    }
     var btn = e.target.closest(".c-resolve, .c-delete");
     if (!btn) return;
+    if (btn.classList.contains("c-delete") && !btn.classList.contains("confirming")) {
+      btn.classList.add("confirming");
+      btn.textContent = "delete?";
+      var cancelBtn = btn.parentElement.querySelector(".c-delete-cancel");
+      if (cancelBtn) cancelBtn.classList.remove("hidden");
+      return;
+    }
     var action = btn.classList.contains("c-resolve") ? "resolve" : "delete";
     btn.disabled = true;
     postJSON("/api/comments/" + action, { id: wtID, commentId: btn.dataset.commentId })
       .then(function (r) {
         if (r.ok) return;
         return r.text().then(function (msg) {
-          btn.disabled = false;
+          if (action === "delete") resetDeleteConfirm(btn.closest(".ccard"));
+          else btn.disabled = false;
           showBanner(banner, msg);
         });
       })
       .catch(function () {
-        btn.disabled = false;
+        if (action === "delete") resetDeleteConfirm(btn.closest(".ccard"));
+        else btn.disabled = false;
         showBanner(banner, "network error — try again");
       });
   });
@@ -293,24 +368,44 @@ function showBanner(el, text) {
     fetch("/fragment/rail?id=" + encodeURIComponent(wtID), { credentials: "same-origin" })
       .then(function (r) { return r.ok ? r.text() : null; })
       .then(function (html) {
-        if (html !== null) swapInnerHTML(document.getElementById("rail"), html);
+        if (html === null) return;
+        swapInnerHTML(document.getElementById("rail"), html);
+        updateProgress(); // the swapped-in bar has no width until this runs (see its own doc comment)
       });
   }
 
   // applyCommentsFragment distributes the fetched, already-escaped fragment's
   // per-file (and orphaned) blocks into their matching live containers —
-  // every file card always carries an (at minimum empty) #comments-<idx>
-  // host, so the only real "anchor missing" case is a file whose position in
-  // the diff shifted since the page loaded (P4-design.md §1.6's chip state).
+  // keyed on data-file (the diff path), not data-file-idx/id: if the file
+  // order shifts between this page's load and this fetch while a draft
+  // suppresses the auto-reload, an idx-keyed lookup would land a file's fresh
+  // strip on whatever OTHER file now happens to hold that idx. A path is
+  // stable for as long as the file stays in the diff at all, which is the one
+  // real "anchor missing" case left (P4-design.md §1.6's chip state).
   function applyCommentsFragment(html) {
     var tpl = document.createElement("template");
     swapInnerHTML(tpl, html); // parses into tpl.content as inert DOM, nothing live yet
     var missing = false;
-    tpl.content.querySelectorAll("[data-file-idx], #orphaned-comments").forEach(function (fresh) {
-      var live = fresh.id ? document.getElementById(fresh.id) : null;
+
+    // Map, not a plain object: a file path is attacker-influenced (the
+    // hostile-fixture torture suite covers filenames far stranger than
+    // "__proto__"), and a Map can't collide with Object.prototype the way a
+    // plain object's computed keys can.
+    var liveByFile = new Map();
+    document.querySelectorAll(".comments[data-file]").forEach(function (el) {
+      liveByFile.set(el.dataset.file, el);
+    });
+    tpl.content.querySelectorAll(".comments[data-file]").forEach(function (fresh) {
+      var live = liveByFile.get(fresh.dataset.file);
       if (live) swapInnerHTML(live, fresh.innerHTML);
       else missing = true;
     });
+
+    var freshOrphaned = tpl.content.getElementById("orphaned-comments");
+    var liveOrphaned = document.getElementById("orphaned-comments");
+    if (freshOrphaned && liveOrphaned) swapInnerHTML(liveOrphaned, freshOrphaned.innerHTML);
+    else if (freshOrphaned) missing = true;
+
     if (missing) showBanner(banner, "comments updated — reload to see them all");
   }
 

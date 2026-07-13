@@ -31,11 +31,16 @@ type commentGroupView struct {
 
 // fileCommentsView is the lightweight (no highlighting, no hunks) per-file
 // shape the comments fragment renders — fileCardView also satisfies the
-// "fileCommentsStrip" template's field requirements (Idx, CommentGroups), so
-// the exact same template block renders both the full room page and the
-// fragment without ever risking the two drifting apart.
+// "fileCommentsStrip" template's field requirements (Idx, Path,
+// CommentGroups), so the exact same template block renders both the full room
+// page and the fragment without ever risking the two drifting apart. Path is
+// what app.js's live-refresh reconciles the per-file strip on (P4-fixes.md
+// #10): Idx alone drifts if a file's position in the diff shifts between the
+// page's initial render and a later fragment fetch, but a file's path is
+// stable for as long as it stays in the diff at all.
 type fileCommentsView struct {
 	Idx           int
+	Path          string
 	CommentGroups []commentGroupView
 }
 
@@ -53,7 +58,7 @@ type commentsFragmentView struct {
 func buildCommentsFragmentView(d model.Diff, views []model.CommentView) commentsFragmentView {
 	files := make([]fileCommentsView, len(d.Files))
 	for i, f := range d.Files {
-		files[i] = fileCommentsView{Idx: i, CommentGroups: fileCommentGroups(views, f.Path, i)}
+		files[i] = fileCommentsView{Idx: i, Path: f.Path, CommentGroups: fileCommentGroups(views, f.Path, i)}
 	}
 	return commentsFragmentView{Files: files, Orphaned: orphanedComments(views)}
 }
