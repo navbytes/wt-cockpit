@@ -6,11 +6,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"sort"
 	"strconv"
@@ -148,8 +151,13 @@ func main() {
 			fatal("usage: wt resolve <id> <comment-id>")
 		}
 		must(c.resolve(args[1], args[2]))
+	case "open":
+		if len(args) < 2 {
+			fatal("usage: wt open <id>")
+		}
+		must(c.open(args[1]))
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, status, tui)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, status, tui)", args[0])
 	}
 }
 
@@ -332,6 +340,7 @@ type statusPayload struct {
 	WatcherMode   string   `json:"watcherMode"`
 	Roots         []string `json:"roots"`
 	StatePath     string   `json:"statePath"`
+	WebAddr       string   `json:"webAddr"` // "" when -web is off; see wt open below
 	RepoCount     int      `json:"repoCount"`
 	WorktreeCount int      `json:"worktreeCount"`
 	ReviewedFiles int      `json:"reviewedFiles"`
@@ -417,6 +426,58 @@ func (c *client) resolve(id, commentID string) error {
 	}
 	fmt.Printf("resolved %s in %s\n", commentID, id)
 	return nil
+}
+
+// open resolves wtd's web listener address via /api/status (empty when -web
+// is off) and launches the browser at that worktree's reading-room URL
+// (P4-design.md §1.6). Reuses c.get/statusPayload (like status/renderStatus
+// above) rather than the shared internal/client.Client — /api/status has no
+// method there yet, and one more raw GET here doesn't earn adding one.
+func (c *client) open(id string) error {
+	var st statusPayload
+	if err := c.get("/api/status", &st); err != nil {
+		return err
+	}
+	if st.WebAddr == "" {
+		return errors.New("wtd is not serving the web UI — start it with -web 127.0.0.1:7788")
+	}
+	return openBrowser(fmt.Sprintf("http://%s/wt/%s", st.WebAddr, url.PathEscape(id)))
+}
+
+// browserCommand picks which program to launch for openBrowser, in priority
+// order: $BROWSER, then the platform opener. goos is runtime.GOOS, passed in
+// so this selection logic is unit-testable without actually executing
+// anything platform-specific. "" (no BROWSER, an unrecognised goos) tells
+// the caller to just print the URL instead of exec'ing.
+func browserCommand(browserEnv, goos string) string {
+	if browserEnv != "" {
+		return browserEnv
+	}
+	switch goos {
+	case "darwin":
+		return "open"
+	case "linux":
+		return "xdg-open"
+	default:
+		return ""
+	}
+}
+
+// openBrowser launches url via browserCommand's pick, non-blocking (Start,
+// not Run) — $BROWSER may name a raw, non-forking browser binary that would
+// otherwise hang wt for as long as the browser stays open. $BROWSER-first is
+// also what makes this scriptably testable end to end: `BROWSER=echo wt open
+// <id>` prints the exact URL (its stdout/stderr are wired to wt's own).
+func openBrowser(url string) error {
+	prog := browserCommand(os.Getenv("BROWSER"), runtime.GOOS)
+	if prog == "" {
+		fmt.Println(url)
+		return nil
+	}
+	cmd := exec.Command(prog, url)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Start()
 }
 
 // ---- rendering ----
@@ -575,6 +636,11 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %sversion%s    %s (protocol %d)\n", dim, reset, st.Version, st.Protocol)
 	fmt.Printf("  %suptime%s     %s\n", dim, reset, uptime)
 	fmt.Printf("  %ssocket%s     %s\n", dim, reset, st.SocketPath)
+	web := st.WebAddr
+	if web == "" {
+		web = "(off)"
+	}
+	fmt.Printf("  %sweb%s        %s\n", dim, reset, web)
 	fmt.Printf("  %swatcher%s    %s\n", dim, reset, st.WatcherMode)
 	fmt.Printf("  %sstate%s      %s\n", dim, reset, st.StatePath)
 	fmt.Printf("  %sroots%s      %s\n", dim, reset, strings.Join(st.Roots, ", "))
@@ -612,6 +678,8 @@ func usage() {
                              add a comment (line 0 = file-level; --old for the base-side line)
   wt resolve <id> <comment-id>
                              mark a comment resolved
+  wt open <id>               open the worktree's reading room in a browser
+                             (needs wtd started with -web; $BROWSER wins if set)
   wt -version               print the client's build version
 
 Set WTD_SOCKET to override the daemon socket path.

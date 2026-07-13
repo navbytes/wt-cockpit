@@ -25,6 +25,7 @@ roots = ["/home/nav/code", "/home/nav/work"]
 base = "main"
 socket = "/home/nav/.wtcockpit/wtd.sock"
 tcp = "127.0.0.1:7799"
+web = "127.0.0.1:7788"
 state = "/home/nav/.wtcockpit/state.json"
 interval = "5s"
 watch = "fsnotify"
@@ -65,6 +66,9 @@ func TestLoadFullExamplePopulatesEveryField(t *testing.T) {
 	}
 	if cfg.TCP != "127.0.0.1:7799" {
 		t.Errorf("TCP = %q", cfg.TCP)
+	}
+	if cfg.Web != "127.0.0.1:7788" {
+		t.Errorf("Web = %q, want 127.0.0.1:7788", cfg.Web)
 	}
 	if cfg.State != "/home/nav/.wtcockpit/state.json" {
 		t.Errorf("State = %q", cfg.State)

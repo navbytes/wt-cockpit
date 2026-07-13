@@ -1,0 +1,93 @@
+/* Palette/tokens ported from docs/ux/mock.html's :root (P4-design.md §2).
+   WP2 only styles the index/worktree-list surface; the review pane, rail,
+   and hunk styling arrive with WP3's room.tmpl. */
+:root {
+  --bg: #0d1117;
+  --bg2: #010409;
+  --panel: #0f141b;
+  --line: #1f2731;
+  --line2: #2a343f;
+  --txt: #c9d4e0;
+  --dim: #7d8996;
+  --faint: #4d5763;
+  --accent: #6cb6ff;
+  --add: #3fb950;
+  --del: #f85149;
+  --warn: #e3b341;
+  --chip-claude: #d2a8ff;
+  --chip-codex: #7ee787;
+  --chip-aider: #79c0ff;
+  --chip-git: #8b949e;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg2);
+  color: var(--txt);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+}
+a { color: inherit; text-decoration: none; }
+code { font-family: var(--mono); }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 14px;
+  background: linear-gradient(180deg, #12181f, #0e131a);
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; color: #fff; }
+.brand span { color: var(--accent); }
+.spacer { flex: 1; }
+.stat { color: var(--dim); }
+.stat b { color: var(--txt); }
+.stat.warn b { color: var(--warn); }
+.stat.rev b { color: var(--accent); }
+
+.proj {
+  padding: 9px 13px 3px;
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+}
+.wt {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  gap: 9px;
+  align-items: center;
+  padding: 7px 13px 7px 20px;
+  border-left: 2px solid transparent;
+  position: relative;
+}
+.wt:hover { background: #0e141b; }
+.wt .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); justify-self: center; }
+.wt.active .dot { background: var(--add); }
+.wt.dirty .dot { background: var(--warn); }
+.wt .name { color: var(--txt); }
+.wt .sub { display: flex; gap: 7px; align-items: center; margin-top: 2px; }
+.chip { font-size: 10px; padding: 0 6px; border-radius: 4px; line-height: 16px; font-weight: 600; }
+.chip.claude { color: var(--chip-claude); background: rgba(210, 168, 255, .12); }
+.chip.codex { color: var(--chip-codex); background: rgba(126, 231, 135, .12); }
+.chip.aider { color: var(--chip-aider); background: rgba(121, 192, 255, .12); }
+.chip.git, .chip.unknown { color: var(--chip-git); background: rgba(139, 148, 158, .12); }
+.wt .time { color: var(--faint); font-size: 10px; }
+.wt .nums { text-align: right; font-size: 11px; white-space: nowrap; }
+.add { color: var(--add); }
+.del { color: var(--del); }
+.wt .files { color: var(--dim); font-size: 10px; display: block; }
+.badge-alert { position: absolute; right: 9px; top: 6px; color: var(--warn); font-size: 11px; }
+
+.empty { color: var(--dim); padding: 16px; }
+.card {
+  margin: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}

@@ -118,6 +118,56 @@ func TestWtdExitsOneOnInvalidLogLevelFlag(t *testing.T) {
 	}
 }
 
+// TestWtdExitsOneOnNonLoopbackWebAddr is the end-to-end (real subprocess)
+// counterpart to TestValidateWebAddrRefusesNonLoopback: -web 0.0.0.0:x must
+// refuse to start, exit 1, and name both "loopback" and "v0.7" in stderr —
+// the DONE WHEN's "designed message" check, run against the actual binary
+// rather than just the pure validateWebAddr function.
+func TestWtdExitsOneOnNonLoopbackWebAddr(t *testing.T) {
+	dir := t.TempDir()
+	err, stderr := runWtd(t,
+		"-root", dir,
+		"-socket", filepath.Join(dir, "wtd.sock"),
+		"-state", filepath.Join(dir, "state.json"),
+		"-web", "0.0.0.0:7788",
+	)
+	wantExitCode1(t, err, stderr)
+	if !strings.Contains(stderr, "loopback") {
+		t.Errorf("stderr = %q, want it to mention loopback", stderr)
+	}
+	if !strings.Contains(stderr, "v0.7") {
+		t.Errorf("stderr = %q, want it to name v0.7", stderr)
+	}
+	if !strings.Contains(stderr, "0.0.0.0:7788") {
+		t.Errorf("stderr = %q, want it to name the offending value", stderr)
+	}
+}
+
+// TestWtdExitsOneOnNonLoopbackWebAddrFromConfigFile is the config-file
+// counterpart, mirroring TestWtdExitsOneOnInvalidLogLevelFromConfigFile: a
+// `web = "..."` config value goes through the identical validateWebAddr
+// check as the flag, not a separate (or absent) one.
+func TestWtdExitsOneOnNonLoopbackWebAddrFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(`web = "192.168.1.5:7788"`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err, stderr := runWtd(t,
+		"-config", cfgPath,
+		"-root", dir,
+		"-socket", filepath.Join(dir, "wtd.sock"),
+		"-state", filepath.Join(dir, "state.json"),
+	)
+	wantExitCode1(t, err, stderr)
+	if !strings.Contains(stderr, "loopback") {
+		t.Errorf("stderr = %q, want it to mention loopback", stderr)
+	}
+	if !strings.Contains(stderr, "192.168.1.5:7788") {
+		t.Errorf("stderr = %q, want it to name the offending config value", stderr)
+	}
+}
+
 // TestWtdExitsOneOnInvalidLogLevelFromConfigFile pins that a config-file typo
 // is refused by the *same* validation as the flag, not silently accepted:
 // config.Load never validates log_level's value (it just parses the TOML

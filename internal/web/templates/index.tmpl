@@ -1,0 +1,40 @@
+{{define "content"}}
+<div class="topbar">
+  <div class="brand"><span>wt</span> cockpit</div>
+  <div class="spacer"></div>
+  <div class="stat"><b>{{.Counts.Worktrees}}</b> worktrees</div>
+  <div class="stat"><b>{{.Counts.Active}}</b> active</div>
+  <div class="stat rev"><b>{{.Counts.Unreviewed}}</b> unreviewed</div>
+  <div class="stat warn"><b>{{.Counts.Alerts}}</b> alerts</div>
+</div>
+<div id="worktrees">{{template "worktrees" .}}</div>
+{{end}}
+
+{{define "worktrees"}}
+{{if not .Groups}}
+<p class="empty">no worktrees under
+  {{range $i, $r := .Roots}}{{if $i}}, {{end}}<code>{{$r}}</code>{{end}}
+  — <code>wtd -root &lt;dir&gt;</code> or edit config.toml</p>
+{{else}}
+{{range .Groups}}
+<div class="proj">{{.Repo}}</div>
+{{range .Worktrees}}
+<a class="wt {{.State}}" href="/wt/{{.ID}}">
+  <span class="dot"></span>
+  <span class="main">
+    <span class="name">{{.Name}}</span>
+    <span class="sub">
+      <span class="chip {{.Agent}}">{{.Agent}}</span>
+      <span class="time">{{reltime .LastChange}}</span>
+    </span>
+  </span>
+  <span class="nums">
+    <span class="add">+{{.Stats.Add}}</span> <span class="del">-{{.Stats.Del}}</span>
+    <span class="files">{{.Stats.Files}} files</span>
+  </span>
+  {{if .Guardrails}}<span class="badge-alert" title="{{guardrails .Guardrails}}">&#9888;</span>{{end}}
+</a>
+{{end}}
+{{end}}
+{{end}}
+{{end}}
