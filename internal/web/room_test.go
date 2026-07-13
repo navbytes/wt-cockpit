@@ -240,6 +240,53 @@ func TestRoomHandlerRendersGuardrailBannerWhenTripped(t *testing.T) {
 	}
 }
 
+// TestRoomHandlerFileTagGradesWarnNotDangerAndKeepsStatus pins ux-expert
+// P1-1a: a per-file hit's tag must reflect ITS OWN severity, not a bare "any
+// hit = danger" bool — and must not clobber the file's own status tag. The
+// default "binary-added" rule is warn-severity and always fires alongside an
+// "added" status (a binary file is only ever added/modified-as-a-whole-blob/
+// deleted, never "modified" with hunks), so one fixture exercises both
+// halves of the fix: the audit's own example of a warn hit losing its
+// "added" status.
+func TestRoomHandlerFileTagGradesWarnNotDangerAndKeepsStatus(t *testing.T) {
+	eng, feat := buildRepoEngine(t, func(_, wt string) {
+		mustWriteFile(t, filepath.Join(wt, "logo.png"), []byte("PNG\x00\x01\x02binarydata"))
+	})
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	rec := getPage(t, h, "/wt/"+feat.ID)
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="tag warn"`) {
+		t.Errorf("expected the binary-added file's tag graded warn (not danger), got:\n%s", body)
+	}
+	if strings.Contains(body, `class="tag danger"`) {
+		t.Errorf("a warn-only hit must not tint the file tag danger, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="tag">added</span>`) {
+		t.Errorf("expected the file's own \"added\" status tag preserved alongside the severity tag, got:\n%s", body)
+	}
+}
+
+// TestRoomHandlerMixedWorktreeGradesEachFileByItsOwnHitSeverity pins the
+// consistency-check's "mixed worktree" case: two files with different hit
+// severities each show their OWN grade, independent of the other.
+func TestRoomHandlerMixedWorktreeGradesEachFileByItsOwnHitSeverity(t *testing.T) {
+	eng, feat := buildRepoEngine(t, func(_, wt string) {
+		mustWriteFile(t, filepath.Join(wt, "migrations", "014_drop.sql"), []byte("DROP TABLE x;\n"))
+		mustWriteFile(t, filepath.Join(wt, "go.mod"), []byte("module x\n\ngo 1.22\n"))
+	})
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	rec := getPage(t, h, "/wt/"+feat.ID)
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="tag danger"`) {
+		t.Errorf("expected the migrations file's tag graded danger, got:\n%s", body)
+	}
+	if !strings.Contains(body, `class="tag warn"`) {
+		t.Errorf("expected the go.mod file's tag graded warn, got:\n%s", body)
+	}
+}
+
 var approveBtnDisabledRE = regexp.MustCompile(`id="approve-btn"[^>]*\sdisabled`)
 
 // TestRoomHandlerApproveGateReflectsDirtyWorktreeState pins the P4-fixes.md

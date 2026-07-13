@@ -212,9 +212,11 @@ func (v *diffview) setReviewed(path string, reviewed bool) {
 // render paints exactly the visible slice [offset, offset+height) into a
 // width x height block — the one place per-row styling/highlighting happens,
 // so cost per frame is O(visible rows) regardless of diff size (§6's <16ms
-// scroll budget). danger is the set of file paths a guardrail hit names
-// (red "danger" tag on that file's header).
-func (v *diffview) render(width, height int, hl *highlightCache, danger map[string]bool) string {
+// scroll budget). sev maps each file path a guardrail hit names to that
+// file's own worst severity ("danger"|"warn") — the file header's tag grades
+// red/amber to match (ux-expert P1-1a), rather than a fixed "any hit =
+// danger" bool.
+func (v *diffview) render(width, height int, hl *highlightCache, sev map[string]string) string {
 	v.setHeight(height)
 	if len(v.lines) == 0 {
 		return lipgloss.NewStyle().Width(width).Height(v.height).Render(styles.Dim.Render("no changes"))
@@ -232,7 +234,7 @@ func (v *diffview) render(width, height int, hl *highlightCache, danger map[stri
 		if i > v.offset {
 			b.WriteByte('\n')
 		}
-		b.WriteString(v.renderRow(v.lines[i], width, hl, danger, addPrefix, delPrefix))
+		b.WriteString(v.renderRow(v.lines[i], width, hl, sev, addPrefix, delPrefix))
 	}
 	// MaxWidth here (not Width) is a truncating safety net, not the primary
 	// sizing mechanism: every row is already exactly `width` cells via
@@ -243,10 +245,10 @@ func (v *diffview) render(width, height int, hl *highlightCache, danger map[stri
 	return lipgloss.NewStyle().MaxWidth(width).Height(v.height).Render(b.String())
 }
 
-func (v *diffview) renderRow(ln renderLine, width int, hl *highlightCache, danger map[string]bool, addPrefix, delPrefix string) string {
+func (v *diffview) renderRow(ln renderLine, width int, hl *highlightCache, sev map[string]string, addPrefix, delPrefix string) string {
 	switch ln.kind {
 	case rowFileHeader:
-		return v.renderFileHeader(ln.fileIdx, width, danger)
+		return v.renderFileHeader(ln.fileIdx, width, sev)
 	case rowHunkHeader:
 		return clipWidth(styles.Accent.Render(ln.content), width)
 	case rowNote:
@@ -258,23 +260,33 @@ func (v *diffview) renderRow(ln renderLine, width int, hl *highlightCache, dange
 	}
 }
 
-func (v *diffview) renderFileHeader(fi int, width int, danger map[string]bool) string {
+func (v *diffview) renderFileHeader(fi int, width int, sev map[string]string) string {
 	f := v.diff.Files[fi]
 	dir, base := splitDirBase(displayPath(f))
-	isDanger := danger[f.Path] || (f.OldPath != "" && danger[f.OldPath])
+	hitSev := sev[f.Path]
+	if hitSev == "" && f.OldPath != "" {
+		hitSev = sev[f.OldPath]
+	}
 
 	nameStyle := styles.Txt
-	if isDanger {
+	if hitSev != "" {
 		nameStyle = styles.Warn
 	}
 	name := styles.Faint.Render(dir) + nameStyle.Bold(true).Render(base)
 
+	// Both the hit's own severity tag AND the file's status tag render when
+	// applicable (ux-expert P1-1a) — the old single-switch version showed at
+	// most one, so e.g. a warn-severity binary-added file lost its "added"
+	// status entirely under the (then-always-red) "danger" tag.
 	var tag string
-	switch {
-	case isDanger:
+	switch hitSev {
+	case "danger":
 		tag = "  " + styles.Del.Render("danger")
-	case f.Status != model.FileModified:
-		tag = "  " + styles.Dim.Render(string(f.Status))
+	case "warn":
+		tag = "  " + styles.Warn.Render("warn")
+	}
+	if f.Status != model.FileModified {
+		tag += "  " + styles.Dim.Render(string(f.Status))
 	}
 	if v.diff.Reviewed[f.Path] {
 		tag += "  " + styles.Add.Render("✓")

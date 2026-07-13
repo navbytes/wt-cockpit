@@ -33,7 +33,7 @@
     <span class="add">+{{.Stats.Add}}</span> <span class="del">-{{.Stats.Del}}</span>
     <span class="files">{{.Stats.Files}} files</span>
   </span>
-  {{if .Guardrails}}<span class="badge-alert" title="{{guardrails .Guardrails}}">&#9888;</span>{{end}}
+  {{if .Guardrails}}<span class="badge-alert {{.Severity}}" title="{{guardrails .Guardrails}}">&#9888;</span>{{end}}
 </a>
 {{end}}
 {{end}}

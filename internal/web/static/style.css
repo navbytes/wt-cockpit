@@ -96,7 +96,12 @@ code { font-family: var(--mono); }
 .add { color: var(--add); }
 .del { color: var(--del); }
 .wt .files { color: var(--dim); font-size: 10px; display: block; }
-.badge-alert { position: absolute; right: 9px; top: 6px; color: var(--warn); font-size: 11px; }
+/* ux-expert P1-1c: graded by the worktree's own worst hit severity (index.tmpl
+   sets .Severity from pages.go's worstSeverity) — this used to be a fixed
+   amber for every severity, contradicting the TUI sidebar badge/CLI radar,
+   both of which already grade red for a danger hit. */
+.badge-alert { position: absolute; right: 9px; top: 6px; font-size: 11px; color: var(--warn); }
+.badge-alert.danger { color: var(--del); }
 
 .empty { color: var(--dim); padding: 16px; }
 .card {
@@ -164,6 +169,10 @@ code { font-family: var(--mono); }
 .file-h.flag .fname, .file-h.flag .fname .path { color: #f0d68a; }
 .file-h .tag { font-size: 10px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 6px; color: var(--dim); }
 .file-h .tag.danger { color: var(--del); border-color: var(--delln); }
+/* ux-expert P1-1a: a warn-severity hit's own tag, alongside (not instead of)
+   the file's status tag — no --warnln border token exists, so this mirrors
+   .cbadge.stale's identical "warn text, warnbg border" fallback below. */
+.file-h .tag.warn { color: var(--warn); border-color: var(--warnbg); }
 .rev-check { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 11px; cursor: pointer; user-select: none; }
 .rev-check input { accent-color: var(--add); }
 
