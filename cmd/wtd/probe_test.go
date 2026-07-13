@@ -63,7 +63,7 @@ func TestHandleStatusOnEmptyRootReportsZeroCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{
 		Roots:          []string{root},
 		ActivityWindow: 30 * time.Second,

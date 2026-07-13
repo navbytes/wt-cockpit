@@ -68,6 +68,10 @@ func DefaultPath() string {
 // error: it returns the zero Config, so callers fall back to built-in
 // defaults. Malformed TOML, or a key this version doesn't recognise (a typo in
 // a hand-edited guardrails file is a real footgun otherwise), is an error.
+// [[rules]], when present, is also routed through guardrail.Compile so a
+// self-contradictory hand-edited rule (bad severity, a non-compiling
+// added_pattern, ...) fails fast at load time too — the same "typo fails
+// fast" philosophy, extended from the TOML shape to the rule semantics.
 func Load(path string) (Config, error) {
 	var cfg Config
 	meta, err := toml.DecodeFile(path, &cfg)
@@ -81,5 +85,10 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("%s: unknown config key %q", path, undecoded[0])
 	}
 	cfg.RulesSet = meta.IsDefined("rules")
+	if cfg.RulesSet {
+		if _, err := guardrail.Compile(cfg.Rules); err != nil {
+			return Config{}, fmt.Errorf("%s: %w", path, err)
+		}
+	}
 	return cfg, nil
 }

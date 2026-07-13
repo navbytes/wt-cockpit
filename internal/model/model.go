@@ -138,12 +138,16 @@ type Diff struct {
 	Reviewed map[string]bool `json:"reviewed,omitempty"`
 }
 
-// GuardrailHit records a tripped guardrail rule against a worktree/file.
+// GuardrailHit records a tripped guardrail rule against a worktree/file. Line
+// is set only by content rules (added_pattern, entropy): the first matching
+// added line's NewNum. Per the non-echo invariant (P5-design.md §1.1),
+// neither this nor Message ever carries the matched content itself.
 type GuardrailHit struct {
 	Rule     string `json:"rule"`
 	Severity string `json:"severity"` // "warn" | "danger"
 	Message  string `json:"message"`
 	File     string `json:"file,omitempty"`
+	Line     int    `json:"line,omitempty"`
 }
 
 // EventType enumerates the deltas pushed on the event bus. Payloads stay small:

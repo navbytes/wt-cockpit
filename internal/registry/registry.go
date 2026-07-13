@@ -5,6 +5,7 @@
 package registry
 
 import (
+	"slices"
 	"sort"
 	"sync"
 
@@ -78,7 +79,10 @@ func (r *Registry) Upsert(w model.Worktree) {
 }
 
 // meaningfullyDiffers reports whether two worktree snapshots differ in a way a UI
-// would need to repaint for.
+// would need to repaint for. Guardrails is compared element-wise (not just by
+// length): a same-count hit change — one rule swapping for another, or a
+// Line moving — must still repaint (model.GuardrailHit is comparable, so
+// slices.Equal is exact, no false negatives from a length-only check).
 func meaningfullyDiffers(a, b model.Worktree) bool {
 	return a.DiffHash != b.DiffHash ||
 		a.State != b.State ||
@@ -87,7 +91,7 @@ func meaningfullyDiffers(a, b model.Worktree) bool {
 		a.Base != b.Base ||
 		a.Agent != b.Agent ||
 		a.Reviewed != b.Reviewed ||
-		len(a.Guardrails) != len(b.Guardrails)
+		!slices.Equal(a.Guardrails, b.Guardrails)
 }
 
 // Remove deletes a worktree and emits a removal event if it existed.

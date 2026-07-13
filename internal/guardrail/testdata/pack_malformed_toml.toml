@@ -1,0 +1,3 @@
+# Deliberately broken TOML syntax (unterminated table header) — exercises
+# the fail-closed-to-global path for a pack that doesn't even parse.
+this is not [ valid toml

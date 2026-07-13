@@ -27,6 +27,19 @@ import (
 // suite, where that mux actually is — internal/web cannot import a "main"
 // package. See middleware_test.go for the middleware-unit-level matrix.
 
+// mustResolver builds a guardrail.Resolver over rules with no per-repo packs
+// in play — this package's test-only equivalent of the old guardrail.New
+// (test helpers aren't importable across packages, so this is re-declared
+// per-package like every other test helper in this repo).
+func mustResolver(t testing.TB, rules []guardrail.Rule) *guardrail.Resolver {
+	t.Helper()
+	r, err := guardrail.NewResolver(rules, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 // testGit/testGitEnv mirror the identical helpers in cmd/wtd/integration_test.go
 // (test helpers aren't importable across packages, so this is re-declared
 // locally per that existing repo convention).
@@ -72,7 +85,7 @@ func buildTestEngine(t *testing.T) (*engine.Engine, model.Worktree) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{
 		Roots:          []string{root},
 		MaxDepth:       4,
@@ -157,7 +170,7 @@ func TestIndexPageEmptyWorkspaceMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{Roots: []string{root}, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
 	if err := eng.Refresh(context.Background()); err != nil {
 		t.Fatal(err)

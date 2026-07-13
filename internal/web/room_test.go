@@ -60,7 +60,7 @@ func buildRepoEngine(t *testing.T, populate func(repo, wt string)) (*engine.Engi
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
 	if err := eng.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestRoomHandlerApproveGateReflectsDirtyWorktreeState(t *testing.T) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	// A vanishingly small (but > 0 — engine.New clamps <= 0 to a 30s default)
 	// ActivityWindow: "recently changed" can never mask the dirty signal
 	// here — buildWorktree's own IsDirty git subprocess call alone takes far
@@ -666,7 +666,7 @@ func BenchmarkRoomRender5kLines(b *testing.B) {
 		b.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(b, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
 	if err := eng.Refresh(context.Background()); err != nil {
 		b.Fatal(err)

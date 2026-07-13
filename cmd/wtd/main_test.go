@@ -187,6 +187,19 @@ func TestClampIntervalLeavesZeroAndNegativeUntouched(t *testing.T) {
 	}
 }
 
+// mustResolver builds a guardrail.Resolver over rules with no per-repo packs
+// in play — this package's test-only equivalent of the old guardrail.New
+// (test helpers aren't importable across packages, so this is re-declared
+// per-package like every other test helper in this repo).
+func mustResolver(t testing.TB, rules []guardrail.Rule) *guardrail.Resolver {
+	t.Helper()
+	r, err := guardrail.NewResolver(rules, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 // testGit runs git with a deterministic, isolated identity/config, mirroring
 // the git() helpers in internal/engine and internal/watcher's test files
 // (test helpers aren't importable across packages, so this is re-declared
@@ -235,7 +248,7 @@ func buildTestServer(t *testing.T) (*server, model.Worktree) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{
 		Roots:          []string{root},
 		MaxDepth:       4,
@@ -355,6 +368,81 @@ func getDiff(t *testing.T, handler http.Handler, id string) model.Diff {
 	return d
 }
 
+// TestHandleRulesReturnsEffectivePayload pins GET /api/rules's wire shape
+// (P5-design.md §1.3): the effective, provenance-tagged rule set for the
+// worktree's owning repo, with no pack in play for buildTestServer's plain
+// fixture repo.
+func TestHandleRulesReturnsEffectivePayload(t *testing.T) {
+	srv, feat := buildTestServer(t)
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/rules?id="+feat.ID, nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var eff guardrail.Effective
+	if err := json.Unmarshal(rec.Body.Bytes(), &eff); err != nil {
+		t.Fatalf("decoding /api/rules response: %v", err)
+	}
+	if eff.WorktreeID != feat.ID {
+		t.Errorf("WorktreeID = %q, want %q", eff.WorktreeID, feat.ID)
+	}
+	if eff.RepoPath == "" {
+		t.Error("RepoPath should be set")
+	}
+	if eff.PackPath != "" || eff.PackStatus != "none" {
+		t.Errorf("PackPath/PackStatus = %q/%q, want empty/none (no pack in this fixture)", eff.PackPath, eff.PackStatus)
+	}
+	if len(eff.Rules) == 0 {
+		t.Fatal("expected at least the default rules")
+	}
+	for _, r := range eff.Rules {
+		if r.Source != "default" {
+			t.Errorf("expected every rule tagged default, got %+v", r)
+		}
+	}
+}
+
+// TestHandleRulesReturns404ForUnknownID mirrors /api/diff's own unknown-id
+// contract.
+func TestHandleRulesReturns404ForUnknownID(t *testing.T) {
+	srv, _ := buildTestServer(t)
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/rules?id=no-such-id", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleStatusIncludesRulePacksField pins statusPayload's additive
+// `rulePacks` field: buildTestServer's fixture has no .wtcockpit.toml
+// anywhere, so both counts must read zero, not merely be absent from the
+// JSON.
+func TestHandleStatusIncludesRulePacksField(t *testing.T) {
+	srv, _ := buildTestServer(t)
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got statusPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if got.RulePacks.Loaded != 0 || got.RulePacks.Errors != 0 {
+		t.Errorf("RulePacks = %+v, want {0 0} for a fixture with no packs", got.RulePacks)
+	}
+}
+
 // TestHandleDiffReviewedMapSurvivesCommitAndFlipsFalseOnEdit is the
 // handler-level TDD case for the WP3 sanctioned API addition: GET /api/diff
 // gains a per-file `reviewed` map, additive to the existing wire shape,
@@ -463,7 +551,7 @@ func TestHandleDiffReviewedMapForAWorktreeWithZeroDiffFilesDecodesSafely(t *test
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
 	if err := eng.Refresh(context.Background()); err != nil {
 		t.Fatal(err)

@@ -1,0 +1,5 @@
+# Valid top-level shape, but a typo'd field inside a [[rules]] entry
+# ("path_glbo") — the [[rules]] array-of-tables sibling of pack_unknown_key.toml.
+[[rules]]
+name = "touches-payments"
+path_glbo = "internal/payments/**"

@@ -1,0 +1,7 @@
+# Valid TOML and all-known keys, but the rule itself fails Compile's
+# validation matrix (an invalid severity) — the "parses fine but breaks the
+# combined set" fail-closed path, distinct from a TOML/key-shape error.
+[[rules]]
+name = "bad-severity-rule"
+severity = "critical"
+path_globs = ["**/*.go"]

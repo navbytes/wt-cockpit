@@ -1,0 +1,15 @@
+# A valid .wtcockpit.toml pack fixture: disables one global rule and both
+# adds a new rule and overrides an existing one by name (P5-design.md §1.3).
+disable_rules = ["net-negative"]
+
+[[rules]]
+name = "touches-payments"
+severity = "danger"
+path_globs = ["internal/payments/**"]
+message = "touches payment code"
+
+[[rules]]
+name = "large-deletion"
+severity = "warn"
+min_net_deleted = 200
+message = "large net deletion in one file (repo-tuned threshold)"

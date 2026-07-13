@@ -84,6 +84,51 @@ func TestUnchangedUpsertDoesNotEmit(t *testing.T) {
 	}
 }
 
+// TestSameCountGuardrailSwapStillEmits is the registry-level pin for the
+// meaningfullyDiffers fix: a same-COUNT change to Guardrails (one rule swaps
+// for another, or a hit's Line moves) must still be treated as meaningful —
+// a length-only comparison would silently swallow it.
+func TestSameCountGuardrailSwapStillEmits(t *testing.T) {
+	r := New()
+	sub, cancel := r.Subscribe(8)
+	defer cancel()
+
+	w := wt("a", "p1", 1)
+	w.Guardrails = []model.GuardrailHit{{Rule: "rule-a", Severity: "warn", File: "x.go"}}
+	r.Upsert(w)
+	recv(t, sub) // consume the first upsert
+
+	w2 := w
+	w2.Guardrails = []model.GuardrailHit{{Rule: "rule-b", Severity: "danger", File: "x.go"}} // same count (1), different rule
+	r.Upsert(w2)
+
+	e := recv(t, sub)
+	if e.Worktree == nil || len(e.Worktree.Guardrails) != 1 || e.Worktree.Guardrails[0].Rule != "rule-b" {
+		t.Fatalf("expected the swapped guardrail hit to emit, got %+v", e)
+	}
+}
+
+// TestSameGuardrailHitDoesNotEmit is the control case: an identical
+// Guardrails slice (same rule, same fields) alongside no other change must
+// still coalesce to nothing on the bus.
+func TestSameGuardrailHitDoesNotEmit(t *testing.T) {
+	r := New()
+	sub, cancel := r.Subscribe(8)
+	defer cancel()
+
+	w := wt("a", "p1", 1)
+	w.Guardrails = []model.GuardrailHit{{Rule: "rule-a", Severity: "warn", File: "x.go", Line: 3}}
+	r.Upsert(w)
+	recv(t, sub)
+
+	r.Upsert(w) // byte-identical Guardrails
+	select {
+	case e := <-sub:
+		t.Fatalf("unchanged Guardrails should not emit, got %+v", e)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestMultipleSubscribersBothReceive(t *testing.T) {
 	r := New()
 	s1, c1 := r.Subscribe(8)

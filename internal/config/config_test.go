@@ -100,12 +100,14 @@ func TestLoadFullExamplePopulatesEveryField(t *testing.T) {
 	if len(cfg.Rules) != 2 {
 		t.Fatalf("Rules = %+v, want 2 entries", cfg.Rules)
 	}
+	// guardrail.Rule now carries slice fields (PathGlobs/ExcludeGlobs), so it's
+	// no longer comparable via == — reflect.DeepEqual is the v0.5 equivalent.
 	want0 := guardrail.Rule{Name: "touches-migrations", Severity: "danger", PathGlob: "**/migrations/**", Message: "touches database migrations"}
-	if cfg.Rules[0] != want0 {
+	if !reflect.DeepEqual(cfg.Rules[0], want0) {
 		t.Errorf("Rules[0] = %+v, want %+v", cfg.Rules[0], want0)
 	}
 	want1 := guardrail.Rule{Name: "large-deletion", Severity: "warn", MinNetDeleted: 80}
-	if cfg.Rules[1] != want1 {
+	if !reflect.DeepEqual(cfg.Rules[1], want1) {
 		t.Errorf("Rules[1] = %+v, want %+v", cfg.Rules[1], want1)
 	}
 }
@@ -195,7 +197,7 @@ func TestLoadRuleWithOnlyOneFieldSetKeepsOthersZero(t *testing.T) {
 		t.Fatalf("Rules = %+v, want 1 entry", cfg.Rules)
 	}
 	want := guardrail.Rule{Name: "only-a-name"}
-	if cfg.Rules[0] != want {
+	if !reflect.DeepEqual(cfg.Rules[0], want) {
 		t.Errorf("Rules[0] = %+v, want %+v (every other field zero)", cfg.Rules[0], want)
 	}
 }
@@ -213,6 +215,46 @@ func TestLoadMistypedNestedRuleFieldErrorsAndNamesIt(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "pathglob") {
 		t.Errorf("error should name the offending key %q, got: %v", "pathglob", got)
+	}
+}
+
+// TestLoadRejectsRuleFailingCompileValidation is the v0.5 sibling of
+// TestLoadUnknownKeyErrorsAndNamesIt: a [[rules]] entry that parses fine as
+// TOML but is self-contradictory (here, an invalid severity) must still fail
+// Load with a message naming the offending rule, per guardrail.Compile's
+// validation matrix routed through config.Load.
+func TestLoadRejectsRuleFailingCompileValidation(t *testing.T) {
+	path := writeTOML(t, "[[rules]]\nname = \"bad-sev\"\nseverity = \"critical\"\npath_glob = \"**\"\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for a rule that fails guardrail.Compile validation")
+	}
+	if got := err.Error(); !strings.Contains(got, "bad-sev") {
+		t.Errorf("error should name the offending rule %q, got: %v", "bad-sev", got)
+	}
+}
+
+// TestLoadAcceptsRuleUsingV05OnlyFields guards the compatible-superset claim
+// end to end through config.Load: a config using ONLY new v0.5 fields (no
+// v0.2 fields at all) must load cleanly and route through Compile without
+// error.
+func TestLoadAcceptsRuleUsingV05OnlyFields(t *testing.T) {
+	path := writeTOML(t, `
+[[rules]]
+name = "secrets"
+severity = "danger"
+added_pattern = "AKIA[0-9A-Z]{16}"
+
+[[rules]]
+name = "blast-radius"
+min_files_changed = 25
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("a config using only v0.5 fields should load cleanly, got: %v", err)
+	}
+	if len(cfg.Rules) != 2 || cfg.Rules[0].AddedPattern == "" || cfg.Rules[1].MinFilesChanged != 25 {
+		t.Errorf("Rules = %+v, want the two v0.5-only rules decoded", cfg.Rules)
 	}
 }
 

@@ -1,10 +1,24 @@
 package guardrail
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
+
+// mustCompile is the test-only equivalent of the old can't-fail New: most
+// tests don't care about Compile's error path (that's exercised explicitly
+// by the validation-matrix tests below), so this keeps every other test's
+// setup a one-liner.
+func mustCompile(t testing.TB, rules []Rule) *Engine {
+	t.Helper()
+	e, err := Compile(rules)
+	if err != nil {
+		t.Fatalf("Compile(%+v): %v", rules, err)
+	}
+	return e
+}
 
 func sampleDiff() model.Diff {
 	return model.Diff{
@@ -17,11 +31,46 @@ func sampleDiff() model.Diff {
 	}
 }
 
-func TestPathGlobRuleTrips(t *testing.T) {
-	rules := []Rule{
-		{Name: "touches-migrations", Severity: "danger", PathGlob: "migrations/**", Message: "touches migrations"},
+// addedFile builds a DiffFile whose one hunk carries lines of added content —
+// the shape content conditions (added_pattern, entropy) scan.
+func addedFile(path string, addedLines ...string) model.DiffFile {
+	var lines []model.Line
+	for i, s := range addedLines {
+		lines = append(lines, model.Line{Kind: model.LineAdd, NewNum: i + 1, Content: s})
 	}
-	e := New(rules)
+	return model.DiffFile{
+		Path:   path,
+		Status: model.FileAdded,
+		Stats:  model.Stats{Add: len(addedLines)},
+		Hunks:  []model.Hunk{{Header: "@@ -0,0 +1," + itoa(len(addedLines)) + " @@", Lines: lines}},
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
+}
+
+// ---- existing v0.2 behaviour, ported to Compile ----
+
+func TestPathGlobRuleTrips(t *testing.T) {
+	e := mustCompile(t, []Rule{
+		{Name: "touches-migrations", Severity: "danger", PathGlob: "migrations/**", Message: "touches migrations"},
+	})
 	hits := e.Eval(sampleDiff())
 	if len(hits) != 1 {
 		t.Fatalf("want 1 hit, got %d: %+v", len(hits), hits)
@@ -35,8 +84,7 @@ func TestPathGlobRuleTrips(t *testing.T) {
 }
 
 func TestGlobMatchesNestedAndFlat(t *testing.T) {
-	// ".github/workflows/*" should match the ci.yml file.
-	e := New([]Rule{{Name: "ci", Severity: "warn", PathGlob: ".github/workflows/*", Message: "edits CI"}})
+	e := mustCompile(t, []Rule{{Name: "ci", Severity: "warn", PathGlob: ".github/workflows/*", Message: "edits CI"}})
 	hits := e.Eval(sampleDiff())
 	if len(hits) != 1 || hits[0].File != ".github/workflows/ci.yml" {
 		t.Fatalf("glob match failed: %+v", hits)
@@ -44,8 +92,7 @@ func TestGlobMatchesNestedAndFlat(t *testing.T) {
 }
 
 func TestNetDeletionThresholdPerFile(t *testing.T) {
-	// Rule: warn when a single file deletes >= 50 lines net.
-	e := New([]Rule{{Name: "big-delete", Severity: "warn", MinNetDeleted: 50, Message: "large deletion"}})
+	e := mustCompile(t, []Rule{{Name: "big-delete", Severity: "warn", MinNetDeleted: 50, Message: "large deletion"}})
 	hits := e.Eval(sampleDiff())
 	if len(hits) != 1 || hits[0].File != "migrations/014_drop.sql" {
 		t.Fatalf("want big-delete on migrations file, got %+v", hits)
@@ -53,9 +100,8 @@ func TestNetDeletionThresholdPerFile(t *testing.T) {
 }
 
 func TestDeletionRatioWorktreeWide(t *testing.T) {
-	// Rule: warn when the whole worktree deletes >= 2x what it adds.
 	// sample totals: add=43, del=101 -> ratio ~2.35 -> trips.
-	e := New([]Rule{{Name: "net-negative", Severity: "warn", MinDeleteAddRatio: 2.0, Message: "deletes >2x additions"}})
+	e := mustCompile(t, []Rule{{Name: "net-negative", Severity: "warn", MinDeleteAddRatio: 2.0, Message: "deletes >2x additions"}})
 	hits := e.Eval(sampleDiff())
 	found := false
 	for _, h := range hits {
@@ -72,7 +118,7 @@ func TestNoFalsePositives(t *testing.T) {
 	clean := model.Diff{Files: []model.DiffFile{
 		{Path: "src/util.go", Stats: model.Stats{Add: 5, Del: 1}},
 	}}
-	e := New([]Rule{
+	e := mustCompile(t, []Rule{
 		{Name: "touches-migrations", Severity: "danger", PathGlob: "migrations/**"},
 		{Name: "big-delete", Severity: "warn", MinNetDeleted: 50},
 		{Name: "net-negative", Severity: "warn", MinDeleteAddRatio: 2.0},
@@ -83,21 +129,525 @@ func TestNoFalsePositives(t *testing.T) {
 }
 
 // TestRuleWithNoConditionsNeverMatches covers a rule loaded from a config
-// [[rules]] table with only "name" set (every condition field left at its
-// TOML zero value): fileMatches' hasCond guard means such a rule matches no
-// file, and it's not a ratio rule either (MinDeleteAddRatio == 0), so it must
-// produce zero hits — never a crash, and never a false positive on every file.
+// [[rules]] table with only "name" set: hasFileCond's guard means such a rule
+// matches no file, and it's not a worktree-wide rule either, so it must
+// produce zero hits — never a crash, never a false positive on every file.
 func TestRuleWithNoConditionsNeverMatches(t *testing.T) {
-	e := New([]Rule{{Name: "only-a-name"}})
+	e := mustCompile(t, []Rule{{Name: "only-a-name"}})
 	if hits := e.Eval(sampleDiff()); len(hits) != 0 {
 		t.Fatalf("a rule with no conditions should never match, got %+v", hits)
 	}
 }
 
 func TestDefaultRulesLoad(t *testing.T) {
-	e := New(DefaultRules())
+	e := mustCompile(t, DefaultRules())
 	hits := e.Eval(sampleDiff())
 	if len(hits) == 0 {
 		t.Fatal("default rules should catch the migrations + big-delete case")
+	}
+}
+
+// ---- new v0.5 per-file conditions ----
+
+// TestPathGlobsSingularEquivalence is the glob-list/singular equivalence
+// property: for any (glob, path), path_glob=X and path_globs=[X] must agree.
+func TestPathGlobsSingularEquivalence(t *testing.T) {
+	cases := []struct {
+		glob, path string
+	}{
+		{"migrations/**", "migrations/014_drop.sql"},
+		{"migrations/**", "src/app.ts"},
+		{".github/workflows/*", ".github/workflows/ci.yml"},
+		{"**/*.lock", "sub/dir/yarn.lock"},
+		{"go.mod", "go.mod"},
+		{"go.mod", "sub/go.mod"},
+	}
+	diff := sampleDiff()
+	for _, c := range cases {
+		singular := mustCompile(t, []Rule{{Name: "r", PathGlob: c.glob, Severity: "warn"}})
+		list := mustCompile(t, []Rule{{Name: "r", PathGlobs: []string{c.glob}, Severity: "warn"}})
+
+		got1 := ruleMatchesAnyOf(singular.Eval(diff), c.path)
+		got2 := ruleMatchesAnyOf(list.Eval(diff), c.path)
+		if got1 != got2 {
+			t.Errorf("glob %q path %q: path_glob matched=%v, path_globs matched=%v (want equal)", c.glob, c.path, got1, got2)
+		}
+	}
+}
+
+func ruleMatchesAnyOf(hits []model.GuardrailHit, file string) bool {
+	for _, h := range hits {
+		if h.File == file {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPathGlobsAnyOf(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "manifests", PathGlobs: []string{"go.mod", "package.json"}}})
+	diff := model.Diff{Files: []model.DiffFile{
+		{Path: "go.mod", Stats: model.Stats{Add: 1}},
+		{Path: "package.json", Stats: model.Stats{Add: 1}},
+		{Path: "other.go", Stats: model.Stats{Add: 1}},
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 2 {
+		t.Fatalf("want 2 hits (go.mod, package.json), got %+v", hits)
+	}
+}
+
+func TestExcludeGlobsExemptsMatchingFile(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "big-files", MinChangedLines: 10, ExcludeGlobs: []string{"*.lock"}}})
+	diff := model.Diff{Files: []model.DiffFile{
+		{Path: "yarn.lock", Stats: model.Stats{Add: 20}},
+		{Path: "app.go", Stats: model.Stats{Add: 20}},
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 || hits[0].File != "app.go" {
+		t.Fatalf("want only app.go to trip (yarn.lock exempted), got %+v", hits)
+	}
+}
+
+// TestExcludeGlobsAloneMatchesNothing: a rule whose ONLY field is
+// exclude_globs has no real condition (per hasFileCond) and so must never
+// match, exactly like a rule with no fields at all.
+func TestExcludeGlobsAloneMatchesNothing(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "r", ExcludeGlobs: []string{"*.lock"}}})
+	if hits := e.Eval(sampleDiff()); len(hits) != 0 {
+		t.Fatalf("exclude_globs alone should match nothing, got %+v", hits)
+	}
+}
+
+func TestStatusCondition(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "deletes", Status: "deleted"}})
+	diff := model.Diff{Files: []model.DiffFile{
+		{Path: "gone.go", Status: model.FileDeleted},
+		{Path: "kept.go", Status: model.FileModified},
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 || hits[0].File != "gone.go" {
+		t.Fatalf("want only gone.go (status=deleted), got %+v", hits)
+	}
+}
+
+func TestBinaryCondition(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "bin-added", Binary: true, Status: "added"}})
+	diff := model.Diff{Files: []model.DiffFile{
+		{Path: "img.png", Status: model.FileAdded, Binary: true},
+		{Path: "text.txt", Status: model.FileAdded, Binary: false},
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 || hits[0].File != "img.png" {
+		t.Fatalf("want only img.png (binary+added), got %+v", hits)
+	}
+}
+
+func TestMinChangedLinesCondition(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "churn", MinChangedLines: 100}})
+	diff := model.Diff{Files: []model.DiffFile{
+		{Path: "small.go", Stats: model.Stats{Add: 10, Del: 10}}, // 20 total
+		{Path: "large.go", Stats: model.Stats{Add: 60, Del: 60}}, // 120 total
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 || hits[0].File != "large.go" {
+		t.Fatalf("want only large.go (>=100 changed lines), got %+v", hits)
+	}
+}
+
+// ---- new v0.5 worktree-wide conditions ----
+
+func TestMinFilesChangedCondition(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "blast-radius", MinFilesChanged: 3}})
+	few := model.Diff{Files: []model.DiffFile{{Path: "a"}, {Path: "b"}}}
+	many := model.Diff{Files: []model.DiffFile{{Path: "a"}, {Path: "b"}, {Path: "c"}}}
+	if hits := e.Eval(few); len(hits) != 0 {
+		t.Errorf("2 files should not trip a >=3 threshold, got %+v", hits)
+	}
+	if hits := e.Eval(many); len(hits) != 1 || hits[0].File != "" {
+		t.Errorf("3 files should trip as a worktree-wide hit (empty File), got %+v", hits)
+	}
+}
+
+func TestMinTotalChangedCondition(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "huge-churn", MinTotalChanged: 100}})
+	small := model.Diff{Files: []model.DiffFile{{Stats: model.Stats{Add: 10, Del: 10}}}}
+	big := model.Diff{Files: []model.DiffFile{{Stats: model.Stats{Add: 60, Del: 60}}}}
+	if hits := e.Eval(small); len(hits) != 0 {
+		t.Errorf("20 total changed lines should not trip a >=100 threshold, got %+v", hits)
+	}
+	if hits := e.Eval(big); len(hits) != 1 {
+		t.Errorf("120 total changed lines should trip, got %+v", hits)
+	}
+}
+
+// ---- content conditions: added_pattern, entropy ----
+
+func TestAddedPatternTripsOnAddedLineOnly(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "aws-key", Severity: "danger", AddedPattern: `AKIA[0-9A-Z]{16}`}})
+	diff := model.Diff{Files: []model.DiffFile{
+		addedFile("config.go", `key := "AKIAABCDEFGHIJKLMNOP"`, "other line"),
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 {
+		t.Fatalf("want 1 hit, got %+v", hits)
+	}
+	if hits[0].Line != 1 {
+		t.Errorf("Line = %d, want 1 (the matching added line)", hits[0].Line)
+	}
+}
+
+func TestAddedPatternIgnoresContextAndDeletedLines(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "aws-key", AddedPattern: `AKIA[0-9A-Z]{16}`}})
+	f := model.DiffFile{
+		Path: "config.go", Status: model.FileModified,
+		Hunks: []model.Hunk{{Lines: []model.Line{
+			{Kind: model.LineContext, Content: `key := "AKIAABCDEFGHIJKLMNOP"`},
+			{Kind: model.LineDel, Content: `key := "AKIAABCDEFGHIJKLMNOP"`},
+			{Kind: model.LineAdd, NewNum: 1, Content: "unrelated"},
+		}}},
+	}
+	if hits := e.Eval(model.Diff{Files: []model.DiffFile{f}}); len(hits) != 0 {
+		t.Fatalf("a pattern match on a context/deleted line must not trip, got %+v", hits)
+	}
+}
+
+func TestAddedPatternSkipsBinaryFiles(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "aws-key", AddedPattern: `AKIA[0-9A-Z]{16}`}})
+	f := addedFile("blob.bin", `AKIAABCDEFGHIJKLMNOP`)
+	f.Binary = true
+	if hits := e.Eval(model.Diff{Files: []model.DiffFile{f}}); len(hits) != 0 {
+		t.Fatalf("a binary file must never be content-scanned, got %+v", hits)
+	}
+}
+
+// TestAddedPatternOneHitPerFileWithMatchCount: multiple matching lines in one
+// file still produce exactly one hit, and its default message carries a
+// match count.
+func TestAddedPatternOneHitPerFileWithMatchCount(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "aws-key", AddedPattern: `AKIA[0-9A-Z]{16}`}})
+	diff := model.Diff{Files: []model.DiffFile{
+		addedFile("config.go",
+			`a := "AKIAABCDEFGHIJKLMNOP"`,
+			"unrelated",
+			`b := "AKIAZZZZZZZZZZZZZZZZ"`,
+			`c := "AKIAYYYYYYYYYYYYYYYY"`,
+		),
+	}}
+	hits := e.Eval(diff)
+	if len(hits) != 1 {
+		t.Fatalf("want exactly 1 hit even with 3 matching lines, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].Line != 1 {
+		t.Errorf("Line = %d, want 1 (first match)", hits[0].Line)
+	}
+	if !strings.Contains(hits[0].Message, "3") {
+		t.Errorf("default message = %q, want it to carry the match count (3)", hits[0].Message)
+	}
+}
+
+func TestEntropyTripsOnHighEntropyToken(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "secret", MinTokenEntropy: 4.8, MinTokenLen: 32}})
+	highEntropy := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef" // 32 distinct chars, H=5.0
+	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `token := "`+highEntropy+`"`)}}
+	if hits := e.Eval(diff); len(hits) != 1 {
+		t.Fatalf("want the high-entropy token to trip, got %+v", hits)
+	}
+}
+
+// TestEntropyImmuneToHexBelowThreshold is the shipped rationale: a git SHA /
+// checksum is hex-only (entropy <= 4.0) and must never trip a 4.8 threshold,
+// however long.
+func TestEntropyImmuneToHexBelowThreshold(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "secret", MinTokenEntropy: 4.8, MinTokenLen: 32}})
+	sha := "5f4dcc3b5aa765d61d8327deb882cf995f4dcc3b" // 40-char hex-shaped token
+	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `commit := "`+sha+`"`)}}
+	if hits := e.Eval(diff); len(hits) != 0 {
+		t.Fatalf("a hex-only token must never trip the entropy rule, got %+v", hits)
+	}
+}
+
+func TestEntropyIgnoresTokensShorterThanMinLen(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "secret", MinTokenEntropy: 1.0, MinTokenLen: 32}})
+	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `x := "Ab3F"`)}} // high per-char entropy, but only 4 chars long
+	if hits := e.Eval(diff); len(hits) != 0 {
+		t.Fatalf("a token shorter than min_token_len must never trip, got %+v", hits)
+	}
+}
+
+// TestEntropyExcludeGlobsExemptsLockfiles pins the shipped secrets-entropy
+// default's own exclude_globs: the exact same high-entropy token that trips
+// in a regular file must be inert inside an excluded path.
+func TestEntropyExcludeGlobsExemptsLockfiles(t *testing.T) {
+	e := mustCompile(t, DefaultRules())
+	highEntropy := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+	diff := model.Diff{Files: []model.DiffFile{
+		addedFile("go.sum", `h1:`+highEntropy),
+		addedFile("app.go", `token := "`+highEntropy+`"`),
+	}}
+	hits := e.Eval(diff)
+	var sawGoSum, sawAppGo bool
+	for _, h := range hits {
+		if h.Rule != "secrets-entropy" {
+			continue
+		}
+		if h.File == "go.sum" {
+			sawGoSum = true
+		}
+		if h.File == "app.go" {
+			sawAppGo = true
+		}
+	}
+	if sawGoSum {
+		t.Error("go.sum should be exempted by exclude_globs, but secrets-entropy fired on it")
+	}
+	if !sawAppGo {
+		t.Error("app.go should trip secrets-entropy on the same high-entropy token")
+	}
+}
+
+// TestContentScanCapsAt5000AddedLines: a pattern that would only match past
+// the 5,000-added-line cap must not trip.
+func TestContentScanCapsAt5000AddedLines(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "needle", AddedPattern: `NEEDLE`}})
+
+	lines := make([]string, 5010)
+	for i := range lines {
+		lines[i] = "filler"
+	}
+	lines[5005] = "NEEDLE" // past the 5,000-line cap (0-indexed: line 5006)
+	diff := model.Diff{Files: []model.DiffFile{addedFile("big.go", lines...)}}
+	if hits := e.Eval(diff); len(hits) != 0 {
+		t.Fatalf("a match past the 5,000-added-line cap must not trip, got %+v", hits)
+	}
+
+	lines[100] = "NEEDLE" // well within the cap
+	diff2 := model.Diff{Files: []model.DiffFile{addedFile("big.go", lines...)}}
+	if hits := e.Eval(diff2); len(hits) != 1 {
+		t.Fatalf("a match within the 5,000-added-line cap should trip, got %+v", hits)
+	}
+}
+
+// ---- THE NON-ECHO INVARIANT ----
+
+// TestNonEchoInvariantContentRulesNeverLeakMatchedText is the security-
+// critical pin (P5-design.md §1.1): a hit's Message must never contain the
+// matched token or line content, whether the rule uses its own custom
+// Message or the engine's generated default.
+func TestNonEchoInvariantContentRulesNeverLeakMatchedText(t *testing.T) {
+	const fakeAWSKey = "AKIAABCDEFGHIJKLMNOPQRST"
+	const highEntropySecret = "Zx9qP2mK7wR4tB8vN1cL6hJ3"
+
+	rules := []Rule{
+		{Name: "aws-key-custom-msg", Severity: "danger", AddedPattern: `AKIA[0-9A-Z]{16,}`, Message: "secrets-shaped string (known token pattern)"},
+		{Name: "aws-key-default-msg", Severity: "danger", AddedPattern: `AKIA[0-9A-Z]{16,}`}, // no Message: exercises the fallback
+		{Name: "entropy-custom-msg", MinTokenEntropy: 4.5, MinTokenLen: 20, Message: "high-entropy string — possible secret"},
+		{Name: "entropy-default-msg", MinTokenEntropy: 4.5, MinTokenLen: 20}, // no Message: exercises the fallback
+	}
+	e := mustCompile(t, rules)
+	diff := model.Diff{Files: []model.DiffFile{
+		addedFile("secrets.go",
+			`awsKey := "`+fakeAWSKey+`"`,
+			`token := "`+highEntropySecret+`"`,
+		),
+	}}
+	hits := e.Eval(diff)
+	if len(hits) == 0 {
+		t.Fatal("precondition: the planted secrets should trip at least one rule")
+	}
+	for _, h := range hits {
+		if strings.Contains(h.Message, fakeAWSKey) {
+			t.Errorf("rule %q: Message leaks the matched AWS-key-shaped string: %q", h.Rule, h.Message)
+		}
+		if strings.Contains(h.Message, highEntropySecret) {
+			t.Errorf("rule %q: Message leaks the matched high-entropy token: %q", h.Rule, h.Message)
+		}
+		// Belt and braces: nothing in the hit's own fields carries the raw
+		// diff line at all (File/Rule/Severity are metadata; Message is the
+		// only free-text field).
+		full := h.Rule + h.Severity + h.Message + h.File
+		if strings.Contains(full, fakeAWSKey) || strings.Contains(full, highEntropySecret) {
+			t.Errorf("some field of hit %+v leaks matched content", h)
+		}
+	}
+}
+
+// TestNonEchoInvariantAcrossFullDefaultPack runs the shipped DefaultRules()
+// (not a hand-picked subset) over a torture fixture planting both a known
+// AWS-key-shaped token and a random high-entropy string, and asserts no hit's
+// Message contains either secret. This is the "secrets torture fixture"
+// scenario named in the phase brief.
+func TestNonEchoInvariantAcrossFullDefaultPack(t *testing.T) {
+	const fakeAWSKey = "AKIAIOSFODNN7EXAMPLE"
+	const randomSecret = "qT7xM2vK9pL4nR8wZ3cH6jF1sD5b"
+
+	e := mustCompile(t, DefaultRules())
+	diff := model.Diff{Files: []model.DiffFile{
+		addedFile("internal/config/secrets.go",
+			`const awsAccessKey = "`+fakeAWSKey+`"`,
+			`const apiToken = "`+randomSecret+`"`,
+		),
+	}}
+	hits := e.Eval(diff)
+	if len(hits) == 0 {
+		t.Fatal("precondition: the torture fixture should trip at least one default rule")
+	}
+	for _, h := range hits {
+		if strings.Contains(h.Message, fakeAWSKey) || strings.Contains(h.Message, randomSecret) {
+			t.Errorf("default rule %q leaked matched secret content in its message: %q", h.Rule, h.Message)
+		}
+	}
+}
+
+// ---- Compile validation matrix ----
+
+func TestCompileRejectsInvalidSeverity(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "bad-sev", Severity: "critical", PathGlob: "*"}})
+	if err == nil {
+		t.Fatal("expected an error for an invalid severity")
+	}
+	if !strings.Contains(err.Error(), "bad-sev") || !strings.Contains(err.Error(), "critical") {
+		t.Errorf("error should name the rule and the bad value, got: %v", err)
+	}
+}
+
+func TestCompileRejectsDuplicateNames(t *testing.T) {
+	_, err := Compile([]Rule{
+		{Name: "dup", PathGlob: "a/**"},
+		{Name: "dup", PathGlob: "b/**"},
+	})
+	if err == nil {
+		t.Fatal("expected an error for duplicate rule names")
+	}
+	if !strings.Contains(err.Error(), "dup") {
+		t.Errorf("error should name the duplicated rule, got: %v", err)
+	}
+}
+
+func TestCompileAutoFillsBlankNamesWithoutFalseDuplicate(t *testing.T) {
+	e, err := Compile([]Rule{{PathGlob: "a/**"}, {PathGlob: "b/**"}})
+	if err != nil {
+		t.Fatalf("two blank-named rules should auto-fill to distinct names, got: %v", err)
+	}
+	names := e.Rules()
+	if names[0].Name == "" || names[1].Name == "" || names[0].Name == names[1].Name {
+		t.Errorf("expected distinct auto-filled names, got %q and %q", names[0].Name, names[1].Name)
+	}
+}
+
+func TestCompileRejectsPathGlobAndPathGlobsTogether(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "both-globs", PathGlob: "a/**", PathGlobs: []string{"b/**"}}})
+	if err == nil {
+		t.Fatal("expected an error when both path_glob and path_globs are set")
+	}
+	if !strings.Contains(err.Error(), "both-globs") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileRejectsMixedPerFileAndWorktreeWideConditions(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "mixed", PathGlob: "a/**", MinFilesChanged: 10}})
+	if err == nil {
+		t.Fatal("expected an error mixing a per-file condition with a worktree-wide condition")
+	}
+	if !strings.Contains(err.Error(), "mixed") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileRejectsExcludeGlobsOnWorktreeWideRule(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "wt-exclude", MinFilesChanged: 10, ExcludeGlobs: []string{"*.lock"}}})
+	if err == nil {
+		t.Fatal("expected an error for exclude_globs on a worktree-wide rule")
+	}
+	if !strings.Contains(err.Error(), "wt-exclude") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileRejectsEntropyWithoutTokenFloor(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "no-floor", MinTokenEntropy: 4.8}})
+	if err == nil {
+		t.Fatal("expected an error for min_token_entropy without a min_token_len >= 8")
+	}
+	if !strings.Contains(err.Error(), "no-floor") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileRejectsEntropyWithTooLowTokenFloor(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "low-floor", MinTokenEntropy: 4.8, MinTokenLen: 4}})
+	if err == nil {
+		t.Fatal("expected an error for min_token_len below 8")
+	}
+	if !strings.Contains(err.Error(), "low-floor") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileAcceptsEntropyWithTokenFloorOfExactly8(t *testing.T) {
+	if _, err := Compile([]Rule{{Name: "ok-floor", MinTokenEntropy: 4.8, MinTokenLen: 8}}); err != nil {
+		t.Errorf("min_token_len == 8 should be accepted, got: %v", err)
+	}
+}
+
+func TestCompileRejectsNonCompilingAddedPattern(t *testing.T) {
+	_, err := Compile([]Rule{{Name: "bad-regex", AddedPattern: "(unterminated["}})
+	if err == nil {
+		t.Fatal("expected an error for a non-compiling added_pattern")
+	}
+	if !strings.Contains(err.Error(), "bad-regex") {
+		t.Errorf("error should name the rule, got: %v", err)
+	}
+}
+
+func TestCompileRejectsMultipleWorktreeConditionsMixedWithFileCondition(t *testing.T) {
+	// Sanity: MinDeleteAddRatio (the pre-existing worktree-wide field) mixed
+	// with a per-file field is rejected the same way the new fields are.
+	_, err := Compile([]Rule{{Name: "old-and-new-mixed", MinDeleteAddRatio: 2.0, Status: "deleted"}})
+	if err == nil {
+		t.Fatal("expected an error mixing min_delete_add_ratio with a per-file condition")
+	}
+}
+
+// TestCompileAcceptsCombinedWorktreeConditionsOnOneRule: multiple
+// worktree-wide fields on the SAME rule are valid (ANDed), not an error.
+func TestCompileAcceptsCombinedWorktreeConditionsOnOneRule(t *testing.T) {
+	e, err := Compile([]Rule{{Name: "combo", MinFilesChanged: 3, MinTotalChanged: 50}})
+	if err != nil {
+		t.Fatalf("combining worktree-wide fields on one rule should be valid, got: %v", err)
+	}
+	trips := model.Diff{Files: []model.DiffFile{
+		{Stats: model.Stats{Add: 20}}, {Stats: model.Stats{Add: 20}}, {Stats: model.Stats{Add: 20}},
+	}}
+	if hits := e.Eval(trips); len(hits) != 1 {
+		t.Errorf("3 files totalling 60 changed lines should trip both combined thresholds, got %+v", hits)
+	}
+	onlyFiles := model.Diff{Files: []model.DiffFile{
+		{Stats: model.Stats{Add: 1}}, {Stats: model.Stats{Add: 1}}, {Stats: model.Stats{Add: 1}},
+	}}
+	if hits := e.Eval(onlyFiles); len(hits) != 0 {
+		t.Errorf("3 files but only 3 changed lines should NOT trip the combined total-changed condition, got %+v", hits)
+	}
+}
+
+// TestDefaultRulesAlwaysCompile guards against ever shipping a DefaultRules()
+// entry that would fail its own validation matrix.
+func TestDefaultRulesAlwaysCompile(t *testing.T) {
+	if _, err := Compile(DefaultRules()); err != nil {
+		t.Fatalf("DefaultRules() must always compile cleanly, got: %v", err)
+	}
+}
+
+// TestCompileIsSelfContainedNoSharedState: compiling the same rules twice
+// must not error the second time (i.e. Compile doesn't mutate its input in a
+// way that breaks re-use, e.g. from Resolver re-merging per repo).
+func TestCompileIsSelfContainedNoSharedState(t *testing.T) {
+	rules := DefaultRules()
+	if _, err := Compile(rules); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(rules); err != nil {
+		t.Fatalf("compiling the identical rule slice twice should succeed both times, got: %v", err)
 	}
 }
