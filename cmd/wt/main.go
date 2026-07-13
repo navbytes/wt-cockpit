@@ -631,6 +631,10 @@ func stateDot(s model.WorktreeState) string {
 func renderRadar(wts []model.Worktree) {
 	// Group by repo for a tree-like layout, but keep global most-recent-first order
 	// by iterating the already-sorted slice and printing repo headers on change.
+	// alerts is a TOTAL-hits count (every worktree's every guardrail hit), the
+	// same definition the web index/CLI already used — ux-expert P2-3 unified
+	// the TUI topbar (which used to count worktrees-with-a-hit instead) onto
+	// this one, so "alerts" means the same number everywhere.
 	var active, alerts int
 	for _, w := range wts {
 		if w.State == model.StateActive {
@@ -638,8 +642,12 @@ func renderRadar(wts []model.Worktree) {
 		}
 		alerts += len(w.Guardrails)
 	}
-	fmt.Printf("%s%swt cockpit%s  %s%d worktrees · %d active · %d guardrail hits%s\n\n",
+	fmt.Printf("%s%swt cockpit%s  %s%d worktrees · %d active · %d alerts%s\n\n",
 		bold, blue, reset, dim, len(wts), active, alerts, reset)
+
+	if len(wts) == 0 {
+		fmt.Printf("%sno worktrees — wtd -root <dir> or edit ~/.config/wtcockpit/config.toml%s\n\n", dim, reset)
+	}
 
 	// Stable repo grouping: collect repos in first-seen order.
 	byRepo := map[string][]model.Worktree{}
@@ -653,7 +661,11 @@ func renderRadar(wts []model.Worktree) {
 	sort.Strings(order)
 
 	for _, repo := range order {
-		fmt.Printf("%s%s%s\n", faint, repo, reset)
+		// repo/w.Name are filesystem-derived (repo dir / worktree dir basename)
+		// and can carry raw control bytes on Unix (P7 security LOW-1) — sanitized
+		// here, at the render sink, the same treatment shortGuard's rule names
+		// and the web/menubar renderers of this exact untrusted text already get.
+		fmt.Printf("%s%s%s\n", faint, diffparse.SanitizeControl(repo), reset)
 		for _, w := range byRepo[repo] {
 			alert := ""
 			if len(w.Guardrails) > 0 {
@@ -667,7 +679,7 @@ func renderRadar(wts []model.Worktree) {
 			}
 			fmt.Printf("  %s %s%-24s%s %s%-12s%s  %s+%-4d%s %s-%-4d%s %s%d files%s  %s%s%s%s\n",
 				stateDot(w.State),
-				white, truncate(w.Name, 24), reset,
+				white, truncate(diffparse.SanitizeControl(w.Name), 24), reset,
 				agentColor(w.Agent), w.Agent, reset,
 				green, w.Stats.Add, reset,
 				red, w.Stats.Del, reset,

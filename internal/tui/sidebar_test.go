@@ -451,6 +451,36 @@ func TestRenderSidebarRowAlwaysExactlyTwoLinesWithinRailWidth(t *testing.T) {
 	}
 }
 
+// TestRenderSidebarRowSanitizesControlBytesInName is P7 security LOW-1's
+// pin: w.Name is filepath.Base(dir) — filesystem-derived text that can carry
+// raw control bytes on Unix — and renderSidebarRow used to print it raw.
+func TestRenderSidebarRowSanitizesControlBytesInName(t *testing.T) {
+	w := model.Worktree{Name: "evil\x1b]0;pwned\x07-name"}
+	out := renderSidebarRow(w, false, sidebarWidth)
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into the sidebar row: %q", out)
+	}
+	if !strings.Contains(stripANSI(out), "evil^[]0;pwned^G-name") {
+		t.Errorf("row = %q, want the caret-sanitized worktree name", stripANSI(out))
+	}
+}
+
+// TestSidebarViewSanitizesControlBytesInRepoHeader is the repo-header half of
+// the same fix: r.repo (grouped from w.Repo, also filepath.Base(dir)) renders
+// through a separate call site (view's own repo-header branch) from
+// renderSidebarRow's per-worktree name.
+func TestSidebarViewSanitizesControlBytesInRepoHeader(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{wt("wt1", "evil\x1b]0;pwned\x07-repo", "feature", 0)})
+	out := s.view(sidebarWidth, 20, connLive)
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into the sidebar's repo header: %q", out)
+	}
+	if !strings.Contains(stripANSI(out), "evil^[]0;pwned^G-repo") {
+		t.Errorf("view = %q, want the caret-sanitized repo header", stripANSI(out))
+	}
+}
+
 // TestSeverityBadgeWorstSeverityWins pins the ux-expert P2-6 contract: red
 // (danger style) when any hit is severity "danger", else amber warn; empty
 // when there are no hits at all. Compares under TrueColor (the package's

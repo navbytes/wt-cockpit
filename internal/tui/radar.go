@@ -236,7 +236,10 @@ func renderDiffHeader(width int, w model.Worktree, focused, reviewing bool) stri
 	if focused {
 		titleStyle = styles.Accent.Bold(true)
 	}
-	title := titleStyle.Render(fmt.Sprintf("%s / %s", w.Repo, w.Name))
+	// w.Repo/w.Name are filepath.Base(dir) — filesystem-derived, can carry raw
+	// control bytes on Unix (P7 security LOW-1) — sanitized at this render
+	// sink, same treatment the guardrail banner's Message already gets below.
+	title := titleStyle.Render(fmt.Sprintf("%s / %s", diffparse.SanitizeControl(w.Repo), diffparse.SanitizeControl(w.Name)))
 
 	var base string
 	if reviewing {

@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -358,7 +359,10 @@ func (s *sidebar) view(width, height int, conn connState) string {
 				fmt.Fprintln(&b)
 			}
 			if r.header {
-				fmt.Fprint(&b, styles.RepoHeader.Render(r.repo))
+				// r.repo is filepath.Base(dir) — filesystem-derived, can carry raw
+				// control bytes on Unix (P7 security LOW-1); sanitized here, the
+				// same treatment renderSidebarRow's own name gets below.
+				fmt.Fprint(&b, styles.RepoHeader.Render(diffparse.SanitizeControl(r.repo)))
 				continue
 			}
 			fmt.Fprint(&b, renderSidebarRow(r.wt, r.wt.ID == s.selectedID, width))
@@ -398,7 +402,10 @@ func renderSidebarRow(w model.Worktree, selected bool, width int) string {
 	if selected {
 		nameStyle = nameStyle.Bold(true) // mock's ".wt.sel .name{color:#fff}" — brighter, via weight
 	}
-	name := nameStyle.Render(w.Name)
+	// w.Name is filepath.Base(dir) — filesystem-derived, can carry raw control
+	// bytes on Unix (P7 security LOW-1); sanitized before render, same as the
+	// repo header above.
+	name := nameStyle.Render(diffparse.SanitizeControl(w.Name))
 	stats := styles.Add.Render(fmt.Sprintf("+%d", w.Stats.Add)) + " " + styles.Del.Render(fmt.Sprintf("-%d", w.Stats.Del))
 	line1 := packRow(fmt.Sprintf(" %s %s", dot, name), stats, contentWidth)
 

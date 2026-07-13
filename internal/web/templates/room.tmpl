@@ -1,6 +1,6 @@
 {{define "content"}}
 <div class="topbar">
-  <div class="brand"><span>wt</span> cockpit</div>
+  <h1 class="brand"><span>wt</span> cockpit</h1>
   <span id="sse-chip" class="sse-chip hidden" role="status">live updates paused — retrying</span>
   <div class="spacer"></div>
   <a class="back" href="/">&larr; worktrees</a>
@@ -13,7 +13,7 @@
 </div>
 {{else}}
 <div class="pane-h" data-id="{{.ID}}" data-diff-hash="{{.DiffHash}}">
-  <span class="title">{{.Repo}} / {{.Name}}</span>
+  <h2 class="title">{{.Repo}} / {{.Name}}</h2>
   <span class="base">reviewing working tree vs <code>{{.Base}}</code></span>
   <span class="sum">{{.TotalFiles}} files · <span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span> · <span class="chip {{.Agent}}">{{.Agent}}</span></span>
 </div>

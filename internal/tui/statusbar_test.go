@@ -39,9 +39,45 @@ func TestAlertsCountStyleWarnsOnlyWhenPositive(t *testing.T) {
 func TestRenderTopbarShowsAllFourCounts(t *testing.T) {
 	wts := []model.Worktree{{State: model.StateActive, Reviewed: 0, Stats: model.Stats{Files: 1}}}
 	out := stripANSI(renderTopbar(80, wts, connLive, 0, screenRadar))
-	for _, want := range []string{"1 worktrees", "1 active", "1 unreviewed", "0 alerts", "● live", "◐ Radar"} {
+	for _, want := range []string{"1 worktree", "1 active", "1 unreviewed", "0 alerts", "● live", "◐ Radar"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("topbar = %q, want it to contain %q", out, want)
+		}
+	}
+	if strings.Contains(out, "1 worktrees") {
+		t.Errorf("topbar = %q, want the singular \"1 worktree\", not \"1 worktrees\" (ux-expert P3-9)", out)
+	}
+}
+
+// TestRenderTopbarAlertsCountsTotalHitsNotWorktreesWithAHit pins ux-expert
+// P2-3: a single worktree with three guardrail hits must count as 3 alerts,
+// matching the web index/CLI `wt ls` (both already total-hits) — the TUI
+// topbar used to count worktrees-with-a-hit instead, so the same workspace
+// showed "1 alert" here and "3 alerts" everywhere else.
+func TestRenderTopbarAlertsCountsTotalHitsNotWorktreesWithAHit(t *testing.T) {
+	wts := []model.Worktree{
+		{Guardrails: []model.GuardrailHit{{Rule: "r1"}, {Rule: "r2"}, {Rule: "r3"}}},
+	}
+	out := stripANSI(renderTopbar(80, wts, connLive, 0, screenRadar))
+	if !strings.Contains(out, "3 alerts") {
+		t.Errorf("topbar = %q, want the total hit count (3), not the worktree count (1)", out)
+	}
+}
+
+// TestPluralizeSingularizesOnlyAtExactlyOne pins the pluralize helper's own
+// contract directly (ux-expert P3-9).
+func TestPluralizeSingularizesOnlyAtExactlyOne(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{0, "alerts"},
+		{1, "alert"},
+		{2, "alerts"},
+	}
+	for _, c := range cases {
+		if got := pluralize(c.n, "alert"); got != c.want {
+			t.Errorf("pluralize(%d, %q) = %q, want %q", c.n, "alert", got, c.want)
 		}
 	}
 }

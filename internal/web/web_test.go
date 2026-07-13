@@ -159,6 +159,25 @@ func TestIndexPageContainsFixtureWorktreeName(t *testing.T) {
 	}
 }
 
+// TestIndexPageHasSensibleHeadingOutline pins ux-expert P2-5b: the index
+// used to have zero headings at all — a screen reader's "jump to heading"
+// navigation had nothing to land on. One <h1> (the brand, page-wide) and one
+// <h2> per repo group is the minimum sensible outline.
+func TestIndexPageHasSensibleHeadingOutline(t *testing.T) {
+	h, feat, _ := buildTestApp(t)
+	body := getPage(t, h, "/").Body.String()
+
+	if n := strings.Count(body, "<h1"); n != 1 {
+		t.Errorf("index page has %d <h1> elements, want exactly 1, got:\n%s", n, body)
+	}
+	if !strings.Contains(body, `<h1 class="brand">`) {
+		t.Errorf("expected the brand as the page's <h1>, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<h2 class="proj">`+feat.Repo+`</h2>`) {
+		t.Errorf("expected the repo group as an <h2>, got:\n%s", body)
+	}
+}
+
 // TestIndexPageEmptyWorkspaceMessage pins the "no worktrees" state (§2):
 // an engine with nothing tracked renders the friendly empty message naming
 // the configured roots, not a blank list.
@@ -186,6 +205,19 @@ func TestIndexPageEmptyWorkspaceMessage(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), root) {
 		t.Errorf("expected the empty-workspace message to name the configured root %q, got:\n%s", root, rec.Body.String())
+	}
+}
+
+// TestIndexPageHasProtoBanner pins the P3-cheap fix: app.js's protocol-
+// mismatch handshake (connectEvents' "hello" listener) looks for
+// #proto-banner and unhides it on a mismatch — the index used to have no
+// such element at all, so a stale-index-after-a-wtd-upgrade reload prompt
+// silently no-op'd there (room.tmpl already had it).
+func TestIndexPageHasProtoBanner(t *testing.T) {
+	h, _, _ := buildTestApp(t)
+	body := getPage(t, h, "/").Body.String()
+	if !strings.Contains(body, `id="proto-banner" class="banner hidden"`) {
+		t.Errorf("expected the (initially hidden) proto-banner element on the index page, got:\n%s", body)
 	}
 }
 
@@ -285,6 +317,25 @@ func TestRoomHandlerRendersFixtureWorktree(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "definitely-unknown") {
 		t.Errorf("expected the unknown id echoed in the 404 page, got:\n%s", rec.Body.String())
+	}
+}
+
+// TestRoomPageHasSensibleHeadingOutline pins ux-expert P2-5b: the room page
+// used to expose h4 ("Files in this worktree")/h3 (orphaned comments) with
+// nothing above them — now there's exactly one <h1> (the brand) and the
+// pane's own repo/name title is an <h2>, so the outline is h1 > h2 > h3 > h4.
+func TestRoomPageHasSensibleHeadingOutline(t *testing.T) {
+	h, feat, _ := buildTestApp(t)
+	body := getPage(t, h, "/wt/"+feat.ID).Body.String()
+
+	if n := strings.Count(body, "<h1"); n != 1 {
+		t.Errorf("room page has %d <h1> elements, want exactly 1, got:\n%s", n, body)
+	}
+	if !strings.Contains(body, `<h1 class="brand">`) {
+		t.Errorf("expected the brand as the page's <h1>, got:\n%s", body)
+	}
+	if !strings.Contains(body, `<h2 class="title">`+feat.Repo+" / "+feat.Name+`</h2>`) {
+		t.Errorf("expected the pane's repo/name title as an <h2>, got:\n%s", body)
 	}
 }
 

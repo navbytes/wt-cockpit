@@ -52,7 +52,10 @@ code { font-family: var(--mono); }
   background: linear-gradient(180deg, #12181f, #0e131a);
   border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; color: #fff; }
+/* .brand is an <h1> (ux-expert P2-5b: every page needs exactly one) — margin/
+   font-size reset back to the plain-div look the UA heading defaults would
+   otherwise override (2em, bold, block margins). */
+.brand { margin: 0; font-size: inherit; font-weight: 700; color: #fff; }
 .brand span { color: var(--accent); }
 .spacer { flex: 1; }
 .stat { color: var(--dim); }
@@ -64,7 +67,12 @@ code { font-family: var(--mono); }
    app.js's EventSource onerror handler, cleared on the next hello/message. */
 .sse-chip { font-size: 11px; padding: 2px 9px; border-radius: 10px; border: 1px solid rgba(227, 179, 65, .4); background: var(--warnbg); color: var(--warn); }
 
+/* .proj is an <h2> (ux-expert P2-5b: index's repo groups, subordinate to the
+   page's one <h1> brand) — margin/font-weight reset back to the plain-div
+   look the UA heading defaults would otherwise override. */
 .proj {
+  margin: 0;
+  font-weight: 400;
   padding: 9px 13px 3px;
   color: var(--dim);
   font-size: 11px;
@@ -118,7 +126,10 @@ code { font-family: var(--mono); }
 .topbar .back:hover { color: var(--txt); }
 
 .pane-h { padding: 11px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.pane-h .title { color: #fff; font-weight: 700; }
+/* .title is an <h2> (ux-expert P2-5b: the room's own subject, subordinate to
+   the page's one <h1> brand) — margin/font-size reset back to the plain-span
+   look the UA heading defaults would otherwise override. */
+.pane-h .title { margin: 0; font-size: inherit; color: #fff; font-weight: 700; }
 .pane-h .base { color: var(--dim); }
 .pane-h .base code { color: var(--accent); background: #111a24; padding: 1px 6px; border-radius: 4px; }
 .pane-h .sum { margin-left: auto; color: var(--dim); }
@@ -261,7 +272,7 @@ code { font-family: var(--mono); }
 .rail .fitem .n { font-size: 10px; }
 .rail .foot { padding: 12px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
 .progress { height: 6px; border-radius: 4px; background: #182029; overflow: hidden; }
-.progress i { display: block; height: 100%; background: var(--add); transition: .3s; }
+.progress i { display: block; height: 100%; background: var(--add); }
 .rail .prog-lab { color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; }
 .btn { border: 0; border-radius: 7px; padding: 9px; font: inherit; font-weight: 600; cursor: pointer; text-align: center; }
 .btn.merge { background: var(--add); color: #04170a; }
@@ -317,6 +328,15 @@ code { font-family: var(--mono); }
    rather than a third color family. app.js appends/removes these — the
    region itself (in layout.tmpl) is always present, on every page. */
 .toast-region { position: fixed; top: 12px; right: 12px; z-index: 100; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
-.toast { display: flex; gap: 8px; align-items: flex-start; padding: 9px 12px; border-radius: 7px; border: 1px solid var(--delln); background: var(--delbg); color: #ffb3af; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, .4); animation: toast-in .15s ease-out; }
+.toast { display: flex; gap: 8px; align-items: flex-start; padding: 9px 12px; border-radius: 7px; border: 1px solid var(--delln); background: var(--delbg); color: #ffb3af; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, .4); }
 .toast-icon { color: var(--del); }
-@keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ux-expert P3-9: the toast's slide-in and the progress bar's fill animation
+   are motion a prefers-reduced-motion user asked to opt out of entirely — both
+   are purely decorative (the toast is still fully readable the instant it
+   appears; the bar still ends at the correct width with no transition). */
+@media (prefers-reduced-motion: no-preference) {
+  .progress i { transition: .3s; }
+  .toast { animation: toast-in .15s ease-out; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+}

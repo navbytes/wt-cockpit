@@ -2,3 +2,5 @@
 *.sock
 /wt
 /wtd
+
+.claude/company/

@@ -391,6 +391,24 @@ func TestRenderGuardrailBannerGradesByWorstSeverity(t *testing.T) {
 
 // ---- diff pane header ----
 
+// TestRenderDiffHeaderSanitizesControlBytesInRepoAndName is P7 security
+// LOW-1's pin: w.Repo/w.Name are filepath.Base(dir) — filesystem-derived text
+// that can carry raw control bytes on Unix — and renderDiffHeader used to
+// print both raw.
+func TestRenderDiffHeaderSanitizesControlBytesInRepoAndName(t *testing.T) {
+	w := model.Worktree{Repo: "evil\x1b]0;pwned\x07-repo", Name: "evil\x1bname", Base: "main"}
+	got := renderDiffHeader(80, w, false, false)
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into the diff header: %q", got)
+	}
+	if !strings.Contains(stripANSI(got), "evil^[]0;pwned^G-repo") {
+		t.Errorf("header = %q, want the caret-sanitized repo name", stripANSI(got))
+	}
+	if !strings.Contains(stripANSI(got), "evil^[name") {
+		t.Errorf("header = %q, want the caret-sanitized worktree name", stripANSI(got))
+	}
+}
+
 func TestRenderDiffHeaderContainsRepoNameAndBase(t *testing.T) {
 	w := model.Worktree{Repo: "api-server", Name: "auth-refactor", Base: "main", Stats: model.Stats{Files: 3, Add: 10, Del: 2}}
 	got := stripANSI(renderDiffHeader(80, w, false, false))

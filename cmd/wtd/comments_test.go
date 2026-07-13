@@ -158,6 +158,60 @@ func TestHandleCommentsCreateReturns413ForOversizedBody(t *testing.T) {
 	}
 }
 
+// TestHandleCommentsCreateReturns413WhenPerWorktreeCommentLimitReached pins
+// the P7-ux.md backlog fix: store.ErrTooManyComments used to fall through the
+// handler's switch to a bare 500 — it now maps to 413, same status family as
+// the per-comment body-size cap just above.
+func TestHandleCommentsCreateReturns413WhenPerWorktreeCommentLimitReached(t *testing.T) {
+	srv, feat := buildTestServer(t)
+	handler := srv.routes()
+
+	for i := 0; i < 500; i++ { // maxCommentsPerWorktree, internal/store
+		if _, err := srv.eng.AddComment(feat.ID, "app.go", 1, "", "filler", ""); err != nil {
+			t.Fatalf("seeding comment %d: %v", i, err)
+		}
+	}
+
+	rec := postJSON(t, handler, "/api/comments", map[string]any{
+		"id": feat.ID, "file": "app.go", "line": 1, "body": "one too many",
+	})
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleCommentsCreateReturns404WithClearBodyForUnknownWorktree pins the
+// distinct ErrWorktreeNotFound body (P7-ux.md backlog): an unknown worktree
+// id must no longer say "file not found in current diff" — a request that
+// never named a real worktree gets its own, unambiguous message.
+func TestHandleCommentsCreateReturns404WithClearBodyForUnknownWorktree(t *testing.T) {
+	srv, _ := buildTestServer(t)
+	handler := srv.routes()
+
+	rec := postJSON(t, handler, "/api/comments", map[string]any{
+		"id": "no-such-id", "file": "app.go", "line": 1, "body": "hi",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "file not found") {
+		t.Errorf("body = %q, want the distinct unknown-worktree message, not the file-not-found one", rec.Body.String())
+	}
+}
+
+func TestHandleCommentsListReturns404WithClearBodyForUnknownWorktree(t *testing.T) {
+	srv, _ := buildTestServer(t)
+	handler := srv.routes()
+
+	_, rec := getComments(t, handler, "id=no-such-id")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "file not found") {
+		t.Errorf("body = %q, want the distinct unknown-worktree message, not the file-not-found one", rec.Body.String())
+	}
+}
+
 func TestHandleCommentsCreateReturns400ForMalformedJSON(t *testing.T) {
 	srv, _ := buildTestServer(t)
 	handler := srv.routes()
