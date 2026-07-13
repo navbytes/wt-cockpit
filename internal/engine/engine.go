@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/navbytes/wt-cockpit/internal/diffparse"
@@ -45,10 +46,12 @@ type Config struct {
 
 // meta is the engine's per-worktree cache: enough to skip re-diffing unchanged
 // worktrees and to answer Diff()/review queries without touching git again.
+// hits is the worktree's guardrail hit set as of its last refresh — kept so
+// refreshWorktree can compute which hits are NEW (see publishNewGuardrailHits).
 type meta struct {
 	id         string
 	repo       string
-	repoPath   string // owning repo root (main worktree), needed for the merge path
+	repoPath   string // owning repo root (main worktree), needed for the merge path AND for pack resolution
 	name       string
 	path       string
 	branch     string
@@ -56,6 +59,7 @@ type meta struct {
 	token      string
 	diff       model.Diff
 	lastChange time.Time
+	hits       []model.GuardrailHit
 }
 
 // Engine is the orchestrator.
@@ -64,15 +68,22 @@ type Engine struct {
 	be  gitbackend.Backend
 	reg *registry.Registry
 	st  store.Store
-	gr  *guardrail.Engine
+	gr  *guardrail.Resolver
 
 	refreshMu sync.Mutex // serialises full scans
 	mu        sync.RWMutex
 	cache     map[string]*meta
+
+	// firstScanDone gates guardrail.tripped emission (P5-design.md §1.4): no
+	// hit-appearance event is published until the engine's first full Refresh
+	// completes, so restarting the daemon over a pile of worktrees with
+	// standing hits never replays them as "new". Set once, at the end of the
+	// first Refresh call, for the engine's whole lifetime.
+	firstScanDone atomic.Bool
 }
 
 // New constructs an Engine.
-func New(cfg Config, be gitbackend.Backend, reg *registry.Registry, st store.Store, gr *guardrail.Engine) *Engine {
+func New(cfg Config, be gitbackend.Backend, reg *registry.Registry, st store.Store, gr *guardrail.Resolver) *Engine {
 	if cfg.ActivityWindow <= 0 {
 		cfg.ActivityWindow = 30 * time.Second
 	}
@@ -80,6 +91,26 @@ func New(cfg Config, be gitbackend.Backend, reg *registry.Registry, st store.Sto
 		cfg.MaxDepth = 4
 	}
 	return &Engine{cfg: cfg, be: be, reg: reg, st: st, gr: gr, cache: map[string]*meta{}}
+}
+
+// Rules returns the effective, provenance-tagged rule set for worktree id's
+// owning repo (P5-design.md §1.3) — GET /api/rules and `wt rules`'s payload.
+// ok=false for an unknown worktree, mirroring Diff/WorktreePath's contract.
+func (e *Engine) Rules(id string) (guardrail.Effective, bool) {
+	e.mu.RLock()
+	m, ok := e.cache[id]
+	e.mu.RUnlock()
+	if !ok {
+		return guardrail.Effective{}, false
+	}
+	return e.gr.Effective(id, m.repoPath), true
+}
+
+// RulePackStats reports how many currently-known repos are running a
+// validly-loaded pack ("loaded") vs a malformed one that fell back to global
+// rules ("errors") — statusPayload's additive `rulePacks` field.
+func (e *Engine) RulePackStats() (loaded, errs int) {
+	return e.gr.Stats()
 }
 
 // Registry exposes the underlying registry (for Subscribe/List in the daemon).
@@ -353,9 +384,17 @@ func (e *Engine) refreshOneLocked(id string) bool {
 // Refresh performs a full scan: discover repos, expand worktrees, and for any whose
 // git state changed, recompute the diff, guardrails and stats. It is safe to call
 // concurrently — scans are serialised.
+//
+// The first call to Refresh in the engine's lifetime marks firstScanDone at
+// the end, regardless of outcome — this is the cold-start gate that stops a
+// daemon restart from replaying every standing guardrail hit as "new" (see
+// publishNewGuardrailHits). A worktree discovered by a LATER Refresh (or by
+// RefreshOne, e.g. one an agent just created) still publishes normally on
+// its own first eval, since the gate is already open by then.
 func (e *Engine) Refresh(ctx context.Context) error {
 	e.refreshMu.Lock()
 	defer e.refreshMu.Unlock()
+	defer e.firstScanDone.Store(true)
 
 	repos, err := discovery.DiscoverRepos(e.cfg.Roots, e.cfg.MaxDepth)
 	if err != nil {
@@ -417,6 +456,15 @@ func (e *Engine) Refresh(ctx context.Context) error {
 // any file's content and so leaves every per-file hash exactly where it was. A
 // future fsnotify watcher can reinstate a skip-if-unchanged fast path keyed on
 // .git/index + worktree mtimes.
+//
+// Guardrails are evaluated once here (rather than inside buildWorktree, as
+// before v0.5) because this is the one place that can compare the new hit set
+// against the worktree's PREVIOUS one (meta.hits) and publish a
+// guardrail.tripped event per hit whose (rule, file) key is genuinely new —
+// see publishNewGuardrailHits. repo.Path (the repo's main worktree root, per
+// discovery) is what Resolver.For reads a .wtcockpit.toml pack from — never
+// ref.Path, the worktree actually being diffed, which is what keeps an agent
+// from weakening the guardrails judging its own diff (P5-design.md §1.3).
 func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, base, id string) {
 	diffText, derr := e.be.DiffAgainstBase(ref.Path, base)
 	if derr != nil {
@@ -427,6 +475,8 @@ func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, ba
 		files[i].Hash = fileHash(files[i])
 	}
 	hash := hashString(diffText)
+	diff := model.Diff{WorktreeID: id, Base: base, Hash: hash, Files: files}
+	hits := e.gr.For(repo.Path).Eval(diff)
 
 	e.mu.RLock()
 	prev, cached := e.cache[id]
@@ -449,8 +499,9 @@ func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, ba
 		branch:     ref.Branch,
 		base:       base,
 		token:      hash,
-		diff:       model.Diff{WorktreeID: id, Base: base, Hash: hash, Files: files},
+		diff:       diff,
 		lastChange: lastChange,
+		hits:       hits,
 	}
 	e.mu.Lock()
 	e.cache[id] = m
@@ -464,8 +515,40 @@ func (e *Engine) refreshWorktree(repo model.Repo, ref gitbackend.WorktreeRef, ba
 	if changed {
 		e.reg.Publish(model.Event{Type: model.EventDiffReady, ID: id, Hash: hash, At: now})
 	}
+	e.publishNewGuardrailHits(id, prev, hits, now)
 
-	e.reg.Upsert(e.buildWorktree(m, ref))
+	e.reg.Upsert(e.buildWorktree(m, ref, hits))
+}
+
+// hitKey identifies a guardrail hit for new-vs-standing comparison. Line is
+// deliberately excluded (P5-design.md §1.4): an agent editing above an
+// existing match must not re-trip the same (rule, file) hit.
+type hitKey struct{ rule, file string }
+
+// publishNewGuardrailHits publishes one guardrail.tripped event per hit in
+// hits whose (rule, file) key was absent from prev's hit set — the delta the
+// bus ships, never full state. Suppressed entirely until the engine's first
+// full Refresh completes (firstScanDone): a daemon restart re-evaluating a
+// pile of worktrees with standing hits must not replay them all as "new".
+func (e *Engine) publishNewGuardrailHits(id string, prev *meta, hits []model.GuardrailHit, now time.Time) {
+	if !e.firstScanDone.Load() {
+		return
+	}
+	var prevHits []model.GuardrailHit
+	if prev != nil {
+		prevHits = prev.hits
+	}
+	seen := make(map[hitKey]bool, len(prevHits))
+	for _, h := range prevHits {
+		seen[hitKey{h.Rule, h.File}] = true
+	}
+	for _, h := range hits {
+		if seen[hitKey{h.Rule, h.File}] {
+			continue
+		}
+		hc := h
+		e.reg.Publish(model.Event{Type: model.EventGuardrail, ID: id, Hit: &hc, At: now})
+	}
 }
 
 // pruneReviews removes stored review records whose path is no longer present in
@@ -486,8 +569,10 @@ func (e *Engine) pruneReviews(id string, files []model.DiffFile) {
 	}
 }
 
-// buildWorktree assembles the public model from cached meta + live review state.
-func (e *Engine) buildWorktree(m *meta, ref gitbackend.WorktreeRef) model.Worktree {
+// buildWorktree assembles the public model from cached meta + live review
+// state. hits is passed in (computed once by refreshWorktree, alongside the
+// new-hit delta publish) rather than re-evaluated here.
+func (e *Engine) buildWorktree(m *meta, ref gitbackend.WorktreeRef, hits []model.GuardrailHit) model.Worktree {
 	var stats model.Stats
 	for _, f := range m.diff.Files {
 		stats.Add += f.Stats.Add
@@ -495,7 +580,6 @@ func (e *Engine) buildWorktree(m *meta, ref gitbackend.WorktreeRef) model.Worktr
 	}
 	stats.Files = len(m.diff.Files)
 
-	hits := e.gr.Eval(m.diff)
 	reviewed, _ := e.st.ReviewedFiles(m.id)
 	dirty, _ := e.be.IsDirty(m.path)
 

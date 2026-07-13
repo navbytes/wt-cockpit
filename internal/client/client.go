@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -169,6 +170,17 @@ func (c *Client) Diff(ctx context.Context, id string) (model.Diff, error) {
 	var d model.Diff
 	err := c.getJSON(ctx, "/api/diff?id="+url.QueryEscape(id), &d)
 	return d, err
+}
+
+// Rules fetches the effective, provenance-tagged rule set for worktree id's
+// owning repo (P5-design.md §1.3) — `wt rules`'s data source. The payload
+// type lives in internal/guardrail, which — like this package — imports only
+// model and stdlib, so pulling it in here doesn't drag the engine (or any
+// other daemon-only package) into the thin client.
+func (c *Client) Rules(ctx context.Context, id string) (guardrail.Effective, error) {
+	var eff guardrail.Effective
+	err := c.getJSON(ctx, "/api/rules?id="+url.QueryEscape(id), &eff)
+	return eff, err
 }
 
 // SetReviewed toggles a file's reviewed state. hash, when non-empty, must

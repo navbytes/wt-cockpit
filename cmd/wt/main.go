@@ -24,6 +24,7 @@ import (
 
 	"github.com/navbytes/wt-cockpit/internal/buildinfo"
 	wtclient "github.com/navbytes/wt-cockpit/internal/client"
+	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
 	"github.com/navbytes/wt-cockpit/internal/tui"
 )
@@ -157,8 +158,13 @@ func main() {
 			fatal("usage: wt open <id>")
 		}
 		must(c.open(args[1]))
+	case "rules":
+		if len(args) < 2 {
+			fatal("usage: wt rules <id> [--json]")
+		}
+		must(c.rules(args[1], len(args) > 2 && args[2] == "--json"))
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, status, tui)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, rules, status, tui)", args[0])
 	}
 }
 
@@ -334,18 +340,28 @@ func (c *client) diff(id string) error {
 // anonymous result struct below) rather than importing the daemon's internal
 // packages — wt only ever depends on the wire format, never on wtd's Go types.
 type statusPayload struct {
-	Version       string   `json:"version"`
-	Protocol      int      `json:"protocol"`
-	UptimeSeconds float64  `json:"uptimeSeconds"`
-	SocketPath    string   `json:"socketPath"`
-	WatcherMode   string   `json:"watcherMode"`
-	Roots         []string `json:"roots"`
-	StatePath     string   `json:"statePath"`
-	WebAddr       string   `json:"webAddr"` // "" when -web is off; see wt open below
-	RepoCount     int      `json:"repoCount"`
-	WorktreeCount int      `json:"worktreeCount"`
-	ReviewedFiles int      `json:"reviewedFiles"`
-	TotalFiles    int      `json:"totalFiles"`
+	Version       string           `json:"version"`
+	Protocol      int              `json:"protocol"`
+	UptimeSeconds float64          `json:"uptimeSeconds"`
+	SocketPath    string           `json:"socketPath"`
+	WatcherMode   string           `json:"watcherMode"`
+	Roots         []string         `json:"roots"`
+	StatePath     string           `json:"statePath"`
+	WebAddr       string           `json:"webAddr"` // "" when -web is off; see wt open below
+	RepoCount     int              `json:"repoCount"`
+	WorktreeCount int              `json:"worktreeCount"`
+	ReviewedFiles int              `json:"reviewedFiles"`
+	TotalFiles    int              `json:"totalFiles"`
+	RulePacks     rulePacksPayload `json:"rulePacks"`
+}
+
+// rulePacksPayload mirrors statusPayload's additive `rulePacks` field
+// (P5-design.md §1.3, §2): how many currently-known repos are running a
+// validly-loaded .wtcockpit.toml pack vs a malformed one that fell back to
+// global rules.
+type rulePacksPayload struct {
+	Loaded int `json:"loaded"`
+	Errors int `json:"errors"`
 }
 
 func (c *client) status(jsonOut bool) error {
@@ -426,6 +442,27 @@ func (c *client) resolve(id, commentID string) error {
 		return err
 	}
 	fmt.Printf("resolved %s in %s\n", commentID, id)
+	return nil
+}
+
+// rules shows the effective, provenance-tagged rule set for a worktree's
+// owning repo (P5-design.md §1.3) — the precedence-confusion antidote: one
+// command answers "why did/didn't this rule fire", including whether a
+// per-repo .wtcockpit.toml pack is in play (and if it's malformed).
+func (c *client) rules(id string, jsonOut bool) error {
+	eff, err := c.cl.Rules(context.Background(), id)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		b, err := json.MarshalIndent(eff, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+	renderRules(eff)
 	return nil
 }
 
@@ -631,6 +668,82 @@ func renderComments(p model.CommentsPayload) {
 	}
 }
 
+// renderRules is `wt rules <id>`'s human table: NAME SEV SOURCE CONDITIONS
+// MESSAGE, plus the pack file's own path+status when one is in effect — the
+// precedence-confusion antidote named in P5-design.md §1.3.
+func renderRules(eff guardrail.Effective) {
+	fmt.Printf("%s%srules%s  %s%s%s\n", bold, blue, reset, dim, eff.RepoPath, reset)
+	if eff.PackPath == "" {
+		fmt.Printf("  %spack%s  (none)\n", dim, reset)
+	} else {
+		fmt.Printf("  %spack%s  %s (%s)\n", dim, reset, eff.PackPath, eff.PackStatus)
+	}
+	fmt.Println()
+	fmt.Printf("  %-24s %-7s %-7s %-40s %s\n", "NAME", "SEV", "SOURCE", "CONDITIONS", "MESSAGE")
+	for _, r := range eff.Rules {
+		fmt.Printf("  %-24s %-7s %-7s %-40s %s\n",
+			truncate(r.Name, 24), effectiveSeverity(r.Severity), r.Source, truncate(conditionsSummary(r.Rule), 40), r.Message)
+	}
+}
+
+// effectiveSeverity mirrors guardrail's own severityOrDefault (unexported
+// there): a rule's blank Severity means "warn" everywhere it's evaluated.
+func effectiveSeverity(s string) string {
+	if s == "" {
+		return "warn"
+	}
+	return s
+}
+
+// conditionsSummary renders a Rule's set condition fields as a compact,
+// greppable one-liner — cosmetic only (cmd/wt holds no guardrail logic of
+// its own; this just formats the wire type for display).
+func conditionsSummary(r guardrail.Rule) string {
+	var parts []string
+	add := func(format string, args ...any) { parts = append(parts, fmt.Sprintf(format, args...)) }
+
+	if r.PathGlob != "" {
+		add("path_glob=%s", r.PathGlob)
+	}
+	if len(r.PathGlobs) > 0 {
+		add("path_globs=%s", strings.Join(r.PathGlobs, ","))
+	}
+	if len(r.ExcludeGlobs) > 0 {
+		add("exclude_globs=%s", strings.Join(r.ExcludeGlobs, ","))
+	}
+	if r.Status != "" {
+		add("status=%s", r.Status)
+	}
+	if r.Binary {
+		add("binary")
+	}
+	if r.MinNetDeleted > 0 {
+		add("min_net_deleted=%d", r.MinNetDeleted)
+	}
+	if r.MinChangedLines > 0 {
+		add("min_changed_lines=%d", r.MinChangedLines)
+	}
+	if r.AddedPattern != "" {
+		add("added_pattern=%s", r.AddedPattern)
+	}
+	if r.MinTokenEntropy > 0 {
+		add("min_token_entropy=%.1f,min_token_len=%d", r.MinTokenEntropy, r.MinTokenLen)
+	}
+	if r.MinDeleteAddRatio > 0 {
+		add("min_delete_add_ratio=%.1f", r.MinDeleteAddRatio)
+	}
+	if r.MinFilesChanged > 0 {
+		add("min_files_changed=%d", r.MinFilesChanged)
+	}
+	if r.MinTotalChanged > 0 {
+		add("min_total_changed=%d", r.MinTotalChanged)
+	}
+	if len(parts) == 0 {
+		return "(none)"
+	}
+	return strings.Join(parts, " ")
+}
+
 func renderStatus(st statusPayload) {
 	uptime := time.Duration(st.UptimeSeconds * float64(time.Second)).Round(time.Second)
 	fmt.Printf("%s%swtd status%s\n", bold, blue, reset)
@@ -648,6 +761,7 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %srepos%s      %d\n", dim, reset, st.RepoCount)
 	fmt.Printf("  %sworktrees%s  %d\n", dim, reset, st.WorktreeCount)
 	fmt.Printf("  %sreviewed%s   %d/%d files\n", dim, reset, st.ReviewedFiles, st.TotalFiles)
+	fmt.Printf("  %srule packs%s %d loaded, %d errors\n", dim, reset, st.RulePacks.Loaded, st.RulePacks.Errors)
 }
 
 func truncate(s string, n int) string {
@@ -681,6 +795,9 @@ func usage() {
                              mark a comment resolved
   wt open <id>               open the worktree's reading room in a browser
                              (needs wtd started with -web; $BROWSER wins if set)
+  wt rules <id> [--json]    show the effective guardrail rules for a worktree's
+                             repo, with provenance (default/global/pack) and
+                             any .wtcockpit.toml pack's status
   wt -version               print the client's build version
 
 Set WTD_SOCKET to override the daemon socket path.

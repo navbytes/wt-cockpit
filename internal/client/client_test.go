@@ -193,6 +193,49 @@ func TestDiffReturnsBodyVerbatimOnError(t *testing.T) {
 	}
 }
 
+// ---- Rules ----
+
+// TestRulesDecodesEffectivePayloadAndPassesIDThrough mirrors
+// TestDiffDecodesStructuredDiffAndPassesIDThrough for GET /api/rules
+// (P5-design.md §1.3): `wt rules`'s data source.
+func TestRulesDecodesEffectivePayloadAndPassesIDThrough(t *testing.T) {
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/rules" {
+			t.Errorf("path = %q, want /api/rules", r.URL.Path)
+		}
+		gotQuery = r.URL.Query().Get("id")
+		fmt.Fprintf(w, `{"worktreeId":%q,"repoPath":"/repo","packPath":"","packStatus":"none","rules":[{"name":"a","source":"default"}]}`, gotQuery)
+	}))
+	defer ts.Close()
+
+	eff, err := testClient(ts).Rules(context.Background(), "wt-42")
+	if err != nil {
+		t.Fatalf("Rules() error = %v", err)
+	}
+	if gotQuery != "wt-42" {
+		t.Errorf("server saw id=%q, want wt-42", gotQuery)
+	}
+	if eff.WorktreeID != "wt-42" || eff.RepoPath != "/repo" || eff.PackStatus != "none" {
+		t.Errorf("Rules() = %+v", eff)
+	}
+	if len(eff.Rules) != 1 || eff.Rules[0].Name != "a" || eff.Rules[0].Source != "default" {
+		t.Errorf("Rules().Rules = %+v, want one rule tagged default", eff.Rules)
+	}
+}
+
+func TestRulesReturnsBodyVerbatimOnError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unknown worktree id", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	_, err := testClient(ts).Rules(context.Background(), "missing")
+	if err == nil || !strings.Contains(err.Error(), "unknown worktree id") {
+		t.Errorf("Rules() error = %v, want the daemon's body verbatim", err)
+	}
+}
+
 // ---- SetReviewed ----
 
 func TestSetReviewedSucceeds(t *testing.T) {

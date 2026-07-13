@@ -149,7 +149,20 @@ func main() {
 		os.Exit(1)
 	}
 	reg := registry.New()
-	gr := guardrail.New(cfg.RulesOr(guardrail.DefaultRules()))
+	// globalSource distinguishes DefaultRules() from a user's own config
+	// [[rules]] for /api/rules and `wt rules`'s provenance column
+	// (P5-design.md §1.3) — config.Load already routed cfg.Rules through
+	// guardrail.Compile once for the "typo fails fast" check, so this second
+	// Compile (inside NewResolver) is defensive, not load-bearing.
+	globalSource := "default"
+	if cfg.RulesSet {
+		globalSource = "global"
+	}
+	gr, err := guardrail.NewResolver(cfg.RulesOr(guardrail.DefaultRules()), globalSource)
+	if err != nil {
+		slog.Error("invalid guardrail rules", "error", err)
+		os.Exit(1)
+	}
 	be := gitbackend.NewCLI()
 	eng := engine.New(engine.Config{
 		Roots:          roots,
@@ -460,6 +473,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/worktrees", s.handleWorktrees)
+	mux.HandleFunc("/api/rules", s.handleRules)
 	mux.HandleFunc("/api/diff", s.handleDiff)
 	mux.HandleFunc("/api/review", s.handleReview)
 	mux.HandleFunc("/api/approve", s.handleApprove)
@@ -494,23 +508,32 @@ func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, currentVersion())
 }
 
+// rulePacksPayload is statusPayload's additive `rulePacks` field: how many
+// currently-known repos are running a validly-loaded .wtcockpit.toml pack vs
+// a malformed one that fell back to global rules (P5-design.md §1.3, §2).
+type rulePacksPayload struct {
+	Loaded int `json:"loaded"`
+	Errors int `json:"errors"`
+}
+
 // statusPayload is wt status's raw payload: a human-rendered block by
 // default, or exactly this shape with --json. Repo/worktree/file counts come
 // straight off the existing registry snapshot (s.eng.List()) — cheap, and no
 // new engine/registry accessor needed for it.
 type statusPayload struct {
-	Version       string   `json:"version"`
-	Protocol      int      `json:"protocol"`
-	UptimeSeconds float64  `json:"uptimeSeconds"`
-	SocketPath    string   `json:"socketPath"`
-	WatcherMode   string   `json:"watcherMode"`
-	Roots         []string `json:"roots"`
-	StatePath     string   `json:"statePath"`
-	WebAddr       string   `json:"webAddr"` // "" when -web is off; see wt open (P4-design.md §1.6)
-	RepoCount     int      `json:"repoCount"`
-	WorktreeCount int      `json:"worktreeCount"`
-	ReviewedFiles int      `json:"reviewedFiles"`
-	TotalFiles    int      `json:"totalFiles"`
+	Version       string           `json:"version"`
+	Protocol      int              `json:"protocol"`
+	UptimeSeconds float64          `json:"uptimeSeconds"`
+	SocketPath    string           `json:"socketPath"`
+	WatcherMode   string           `json:"watcherMode"`
+	Roots         []string         `json:"roots"`
+	StatePath     string           `json:"statePath"`
+	WebAddr       string           `json:"webAddr"` // "" when -web is off; see wt open (P4-design.md §1.6)
+	RepoCount     int              `json:"repoCount"`
+	WorktreeCount int              `json:"worktreeCount"`
+	ReviewedFiles int              `json:"reviewedFiles"`
+	TotalFiles    int              `json:"totalFiles"`
+	RulePacks     rulePacksPayload `json:"rulePacks"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -522,6 +545,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		reviewed += wt.Reviewed
 		total += wt.Stats.Files
 	}
+	loaded, errs := s.eng.RulePackStats()
 	writeJSON(w, statusPayload{
 		Version:       version,
 		Protocol:      model.ProtocolVersion,
@@ -535,11 +559,25 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		WorktreeCount: len(wts),
 		ReviewedFiles: reviewed,
 		TotalFiles:    total,
+		RulePacks:     rulePacksPayload{Loaded: loaded, Errors: errs},
 	})
 }
 
 func (s *server) handleWorktrees(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.eng.List())
+}
+
+// handleRules answers GET /api/rules?id=<worktreeID>: the effective,
+// provenance-tagged rule set for that worktree's owning repo
+// (P5-design.md §1.3) — `wt rules`'s data source.
+func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	eff, ok := s.eng.Rules(id)
+	if !ok {
+		http.Error(w, "unknown worktree id", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, eff)
 }
 
 func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {

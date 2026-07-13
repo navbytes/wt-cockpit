@@ -1,0 +1,9 @@
+# Valid TOML, but a typo'd top-level key ("dissable_rules") — must be
+# rejected by ParsePack's strict-keys check, same philosophy as
+# config.Load's own typo rejection.
+dissable_rules = ["net-negative"]
+
+[[rules]]
+name = "touches-payments"
+severity = "danger"
+path_globs = ["internal/payments/**"]

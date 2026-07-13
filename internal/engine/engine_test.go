@@ -56,6 +56,19 @@ func buildWorkspace(t *testing.T) (root string) {
 	return root
 }
 
+// mustResolver builds a guardrail.Resolver over rules with no per-repo packs
+// in play — the engine-level test fixtures' equivalent of the old
+// guardrail.New (test helpers aren't importable across packages, so this is
+// re-declared per-package like every other test helper in this repo).
+func mustResolver(t *testing.T, rules []guardrail.Rule) *guardrail.Resolver {
+	t.Helper()
+	r, err := guardrail.NewResolver(rules, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 func newEngine(t *testing.T, root string) *Engine {
 	t.Helper()
 	reg := registry.New()
@@ -64,7 +77,7 @@ func newEngine(t *testing.T, root string) *Engine {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 	return New(Config{
 		Roots:          []string{root},
 		MaxDepth:       4,
@@ -467,7 +480,7 @@ func TestPerRepoBaseOverridePicksCorrectMergeBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := guardrail.New(guardrail.DefaultRules())
+	gr := mustResolver(t, guardrail.DefaultRules())
 
 	// Baseline: no per-repo override, global base "main".
 	eNoOverride := New(Config{
@@ -1191,5 +1204,295 @@ func TestApproveRefusesWhenWorktreeChangedSinceLastRefresh(t *testing.T) {
 		t.Fatal("approve should refuse: app.go changed since it was reviewed, and the engine cache was never refreshed")
 	} else if !strings.Contains(err.Error(), "review") {
 		t.Errorf("error should mention review, got: %v", err)
+	}
+}
+
+// ---- v0.5: per-repo rule packs, guardrail.tripped, Rules() provenance ----
+
+// writePack writes a .wtcockpit.toml at dir (a repo's or a worktree's root).
+func writePack(t *testing.T, dir, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".wtcockpit.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPackFromMainWorktreeDisablesAndAddsRule is the per-repo pack precedence
+// e2e: a .wtcockpit.toml checked in at the repo's MAIN worktree root disables
+// a tripping default rule and adds a new one, and both take effect.
+func TestPackFromMainWorktreeDisablesAndAddsRule(t *testing.T) {
+	root := buildWorkspace(t)
+	repo := filepath.Join(root, "api-server")
+	writePack(t, repo, "disable_rules = [\"touches-migrations\"]\n\n"+
+		"[[rules]]\n"+
+		"name = \"custom-added\"\n"+
+		"severity = \"danger\"\n"+
+		"path_glob = \"new.go\"\n"+
+		"message = \"custom rule from pack\"\n")
+
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+
+	for _, h := range feat.Guardrails {
+		if h.Rule == "touches-migrations" {
+			t.Errorf("touches-migrations should be disabled by the pack, got %+v", feat.Guardrails)
+		}
+	}
+	var sawCustom bool
+	for _, h := range feat.Guardrails {
+		if h.Rule == "custom-added" && h.File == "new.go" {
+			sawCustom = true
+		}
+	}
+	if !sawCustom {
+		t.Errorf("expected the pack-added custom-added rule to trip on new.go, got %+v", feat.Guardrails)
+	}
+
+	eff, ok := e.Rules(feat.ID)
+	if !ok {
+		t.Fatal("Rules() ok=false for a known worktree")
+	}
+	if eff.PackStatus != "ok" {
+		t.Errorf("PackStatus = %q, want ok", eff.PackStatus)
+	}
+	for _, r := range eff.Rules {
+		if r.Name == "custom-added" && r.Source != "pack" {
+			t.Errorf("custom-added should be tagged source=pack, got %+v", r)
+		}
+	}
+}
+
+// TestPackInFeatureWorktreeHasNoEffect is the trust-boundary test
+// (P5-design.md §1.3): the exact same weakening pack placed in the FEATURE
+// worktree (not the main one) must be completely inert — an agent working in
+// its own worktree cannot disable the guardrails judging its own diff.
+func TestPackInFeatureWorktreeHasNoEffect(t *testing.T) {
+	root := buildWorkspace(t)
+	wt := filepath.Join(root, "api-server-feature")
+	writePack(t, wt, `disable_rules = ["touches-migrations"]`+"\n")
+
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+
+	var sawMigration bool
+	for _, h := range feat.Guardrails {
+		if h.Rule == "touches-migrations" {
+			sawMigration = true
+		}
+	}
+	if !sawMigration {
+		t.Errorf("a .wtcockpit.toml placed in the FEATURE worktree must have no effect; touches-migrations should still fire, got %+v", feat.Guardrails)
+	}
+
+	eff, ok := e.Rules(feat.ID)
+	if !ok {
+		t.Fatal("Rules() ok=false")
+	}
+	if eff.PackPath != "" || eff.PackStatus != "none" {
+		t.Errorf("PackPath/PackStatus = %q/%q, want empty/none (pack must be read from the main worktree only)", eff.PackPath, eff.PackStatus)
+	}
+}
+
+// TestMalformedPackFallsBackToGlobalRules covers the fail-closed contract at
+// the engine level: a repo with a malformed .wtcockpit.toml keeps running on
+// global rules (never half-applied, never disabled outright), with the
+// failure observable via Rules()/RulePackStats.
+func TestMalformedPackFallsBackToGlobalRules(t *testing.T) {
+	root := buildWorkspace(t)
+	repo := filepath.Join(root, "api-server")
+	writePack(t, repo, "not valid [ toml")
+
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+
+	eff, ok := e.Rules(feat.ID)
+	if !ok {
+		t.Fatal("Rules() ok=false")
+	}
+	if !strings.HasPrefix(eff.PackStatus, "error:") {
+		t.Errorf("PackStatus = %q, want an error: prefix for a malformed pack", eff.PackStatus)
+	}
+
+	var sawMigration bool
+	for _, h := range feat.Guardrails {
+		if h.Rule == "touches-migrations" {
+			sawMigration = true
+		}
+	}
+	if !sawMigration {
+		t.Errorf("a malformed pack must fail closed to global rules (touches-migrations should still fire), got %+v", feat.Guardrails)
+	}
+
+	if _, errs := e.RulePackStats(); errs != 1 {
+		t.Errorf("RulePackStats errors = %d, want 1", errs)
+	}
+}
+
+// TestRulesReturnsSourceProvenanceForDefaultRules pins Rules()'s provenance
+// tagging when the engine runs on DefaultRules() with no pack in play: every
+// rule reads back tagged "default".
+func TestRulesReturnsSourceProvenanceForDefaultRules(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+
+	eff, ok := e.Rules(feat.ID)
+	if !ok {
+		t.Fatal("Rules() ok=false for a known worktree")
+	}
+	if eff.WorktreeID != feat.ID {
+		t.Errorf("WorktreeID = %q, want %q", eff.WorktreeID, feat.ID)
+	}
+	if eff.RepoPath == "" {
+		t.Error("RepoPath should be set")
+	}
+	if eff.PackStatus != "none" {
+		t.Errorf("PackStatus = %q, want none", eff.PackStatus)
+	}
+	if len(eff.Rules) == 0 {
+		t.Fatal("expected at least the default rules")
+	}
+	for _, r := range eff.Rules {
+		if r.Source != "default" {
+			t.Errorf("expected every rule tagged default (no config [[rules]], no pack), got %+v", r)
+		}
+	}
+}
+
+// TestRulesUnknownWorktreeReturnsFalseOK mirrors Diff()'s own unknown-id
+// contract.
+func TestRulesUnknownWorktreeReturnsFalseOK(t *testing.T) {
+	e := newEngine(t, t.TempDir())
+	if _, ok := e.Rules("no-such-id"); ok {
+		t.Error("Rules() ok = true, want false for an unknown worktree")
+	}
+}
+
+// drainEvents collects every event received on sub within wait — used to
+// assert on a NEGATIVE ("nothing of this type published") as well as a
+// positive outcome, the same wall-clock-bounded style
+// TestUnchangedUpsertDoesNotEmit already uses in the registry package.
+func drainEvents(sub <-chan model.Event, wait time.Duration) []model.Event {
+	var out []model.Event
+	timeout := time.After(wait)
+	for {
+		select {
+		case e := <-sub:
+			out = append(out, e)
+		case <-timeout:
+			return out
+		}
+	}
+}
+
+func guardrailEvents(events []model.Event) []model.Event {
+	var out []model.Event
+	for _, e := range events {
+		if e.Type == model.EventGuardrail {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestGuardrailTrippedSuppressedDuringFirstScanThenEmittedOnNewHit is the
+// headline event-plumbing test (P5-design.md §1.4): buildWorkspace's
+// worktree already has standing hits (touches-migrations, large-deletion) on
+// its very first Refresh — none of those may publish guardrail.tripped. A
+// hit that appears afterwards (a brand new binary file, tripping
+// binary-added) must publish exactly once, keyed on (rule, file); a further
+// no-op re-scan must not re-fire it.
+func TestGuardrailTrippedSuppressedDuringFirstScanThenEmittedOnNewHit(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+
+	sub, cancel := e.Registry().Subscribe(64)
+	defer cancel()
+
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+	if len(feat.Guardrails) == 0 {
+		t.Fatal("precondition: buildWorkspace's feature worktree should already have standing guardrail hits")
+	}
+	if ev := guardrailEvents(drainEvents(sub, 200*time.Millisecond)); len(ev) != 0 {
+		t.Fatalf("no guardrail.tripped events should publish during the first scan, got %+v", ev)
+	}
+
+	wt := filepath.Join(root, "api-server-feature")
+	if err := os.WriteFile(filepath.Join(wt, "asset.bin"), []byte{0x00, 0x01, 0x02, 0x03}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RefreshOne(context.Background(), wt); err != nil {
+		t.Fatal(err)
+	}
+
+	events := guardrailEvents(drainEvents(sub, time.Second))
+	var saw bool
+	for _, ev := range events {
+		if ev.ID == feat.ID && ev.Hit != nil && ev.Hit.Rule == "binary-added" && ev.Hit.File == "asset.bin" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("expected a guardrail.tripped event for the new binary-added hit, got %+v", events)
+	}
+
+	// Re-scanning with nothing changed must not re-fire the same (rule, file) hit.
+	if err := e.RefreshOne(context.Background(), wt); err != nil {
+		t.Fatal(err)
+	}
+	if ev := guardrailEvents(drainEvents(sub, 200*time.Millisecond)); len(ev) != 0 {
+		t.Errorf("re-scanning an unchanged hit must not re-fire it, got %+v", ev)
+	}
+}
+
+// TestGuardrailTrippedNotKeyedOnLine: a hit's Line moving (an edit above an
+// existing match) must NOT re-trip the same (rule, file) pair.
+func TestGuardrailTrippedNotKeyedOnLine(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	os.MkdirAll(repo, 0o755)
+	git(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+
+	wtPath := filepath.Join(root, "repo-feature")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", wtPath)
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar k = \""+secret+"\"\n"), 0o644)
+
+	e := newEngine(t, root)
+	sub, cancel := e.Registry().Subscribe(64)
+	defer cancel()
+
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// First scan: cold-start gate suppresses everything.
+	drainEvents(sub, 200*time.Millisecond)
+
+	// Prepend a blank line, moving the match down by one line — the (rule,
+	// file) key is unchanged, so this must NOT re-trip.
+	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar _ = 0\nvar k = \""+secret+"\"\n"), 0o644)
+	if err := e.RefreshOne(context.Background(), wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if ev := guardrailEvents(drainEvents(sub, 200*time.Millisecond)); len(ev) != 0 {
+		t.Errorf("a hit whose Line moved but (rule, file) stayed the same must not re-trip, got %+v", ev)
 	}
 }
