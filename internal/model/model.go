@@ -156,6 +156,7 @@ const (
 	EventDiffReady        EventType = "diff.ready"
 	EventGuardrail        EventType = "guardrail.tripped"
 	EventReviewChanged    EventType = "review.changed"
+	EventCommentChanged   EventType = "comment.changed"
 )
 
 // Event is one item on the bus.
@@ -178,4 +179,48 @@ type ApproveResult struct {
 	Merged     string `json:"merged"`  // feature branch
 	Into       string `json:"into"`    // base branch
 	Removed    string `json:"removed"` // removed worktree path
+}
+
+// Comment is an inline review note anchored to a file (and optionally a
+// specific line) within a worktree's diff, for humans and agents to leave
+// each other. It lives here, not internal/store (where the v0.1 shape
+// originated) — it is a wire type serialised over the API and consumed by
+// every frontend, exactly like Worktree/Diff/ApproveResult. See
+// .claude/company/handoffs/P4-design.md §1.5 for the frozen shape.
+type Comment struct {
+	ID         string    `json:"id"` // "c-" + 16 hex, crypto/rand, engine-assigned
+	WorktreeID string    `json:"worktreeId"`
+	File       string    `json:"file"` // worktree-relative, == DiffFile.Path
+	Line       int       `json:"line"` // 0 = file-level comment
+	Side       string    `json:"side"` // "new" (default) | "old"; which numbering Line uses
+	Body       string    `json:"body"`
+	Author     string    `json:"author"`
+	State      string    `json:"state"`    // "open" | "resolved"
+	FileHash   string    `json:"fileHash"` // DiffFile.Hash when the comment was created
+	At         time.Time `json:"at"`
+}
+
+// CommentView is a Comment enriched with drift computed at read time against
+// the worktree's *current* diff — never persisted. Stale means the file is
+// still in the diff but its content (and so its hash) moved since the
+// comment was made; Orphaned means the file left the diff entirely. Neither
+// ever auto-resolves or auto-deletes the comment — both just surface as a
+// badge so a human or agent can decide whether the anchor still applies.
+type CommentView struct {
+	Comment
+	Stale    bool `json:"stale"`
+	Orphaned bool `json:"orphaned"`
+}
+
+// CommentsPayload is GET /api/comments's response shape and `wt comments
+// --json`'s frozen output — the CLI decodes this exact type and re-emits it
+// with json.MarshalIndent, so the API and the CLI can never drift apart.
+// Path/Branch/Base come from the registry: what lets an agent locate the
+// worktree and open file:line directly from the JSON alone.
+type CommentsPayload struct {
+	WorktreeID string        `json:"worktreeId"`
+	Path       string        `json:"path"`
+	Branch     string        `json:"branch"`
+	Base       string        `json:"base"`
+	Comments   []CommentView `json:"comments"`
 }

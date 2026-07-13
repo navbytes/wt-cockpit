@@ -369,6 +369,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/review", s.handleReview)
 	mux.HandleFunc("/api/approve", s.handleApprove)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/comments", s.handleComments)
+	mux.HandleFunc("/api/comments/resolve", s.handleCommentsResolve)
+	mux.HandleFunc("/api/comments/delete", s.handleCommentsDelete)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	return mux
 }
@@ -523,6 +526,142 @@ func (s *server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// handleComments serves both verbs the REST table puts on this one path
+// (P4-design.md §1.5): GET lists, POST creates. Available on every listener,
+// same as every other /api/ route — the socket is tokenless for agents/CLI,
+// the future web listener sits behind its own middleware (§1.3, WP2).
+func (s *server) handleComments(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleCommentsList(w, r)
+	case http.MethodPost:
+		s.handleCommentsCreate(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCommentsList answers GET /api/comments?id=<wt>[&state=][&file=].
+// state defaults to "open"; "resolved"/"all" are the only other accepted
+// values. Filtering by state/file happens here, not in the engine
+// (engine.Comments always returns the full set) — it's presentation, not a
+// validated business rule.
+func (s *server) handleCommentsList(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	views, err := s.eng.Comments(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		state = "open"
+	}
+	if state != "open" && state != "resolved" && state != "all" {
+		http.Error(w, fmt.Sprintf("invalid state %q (want open, resolved, or all)", state), http.StatusBadRequest)
+		return
+	}
+	file := r.URL.Query().Get("file")
+
+	filtered := make([]model.CommentView, 0, len(views))
+	for _, v := range views {
+		if state != "all" && v.State != state {
+			continue
+		}
+		if file != "" && v.File != file {
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+
+	// path/branch/base come from the registry — what lets an agent locate the
+	// worktree and open file:line directly from the JSON alone (§1.5).
+	var path, branch, base string
+	if wt := s.eng.Registry().Get(id); wt != nil {
+		path, branch, base = wt.Path, wt.Branch, wt.Base
+	}
+	writeJSON(w, model.CommentsPayload{
+		WorktreeID: id,
+		Path:       path,
+		Branch:     branch,
+		Base:       base,
+		Comments:   filtered,
+	})
+}
+
+// handleCommentsCreate answers POST /api/comments. The request body is
+// capped at 1 MiB here — a decode-time safety net distinct from the comment
+// BODY text's own 64 KiB business-rule cap, which is engine.AddComment's job
+// (engine.ErrCommentTooLarge -> 413 below); see P4-design.md §1.3.
+func (s *server) handleCommentsCreate(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		ID     string `json:"id"`
+		File   string `json:"file"`
+		Line   int    `json:"line"`
+		Side   string `json:"side"`
+		Body   string `json:"body"`
+		Author string `json:"author"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c, err := s.eng.AddComment(req.ID, req.File, req.Line, req.Side, req.Body, req.Author)
+	switch {
+	case err == nil:
+		writeJSON(w, c)
+	case errors.Is(err, engine.ErrCommentTooLarge):
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+	case errors.Is(err, engine.ErrFileNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, engine.ErrInvalidComment):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// commentActionRequest is the shared body shape for resolve/delete: both take
+// only {id, commentId}.
+type commentActionRequest struct {
+	ID        string `json:"id"`
+	CommentID string `json:"commentId"`
+}
+
+func (s *server) handleCommentsResolve(w http.ResponseWriter, r *http.Request) {
+	var req commentActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeCommentActionResult(w, s.eng.ResolveComment(req.ID, req.CommentID))
+}
+
+func (s *server) handleCommentsDelete(w http.ResponseWriter, r *http.Request) {
+	var req commentActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeCommentActionResult(w, s.eng.DeleteComment(req.ID, req.CommentID))
+}
+
+// writeCommentActionResult shapes ResolveComment/DeleteComment's error into
+// the REST table's status codes: unknown worktree and unknown comment id
+// both 404 (the table doesn't distinguish them), anything else 500.
+func writeCommentActionResult(w http.ResponseWriter, err error) {
+	switch {
+	case err == nil:
+		writeJSON(w, map[string]bool{"ok": true})
+	case errors.Is(err, engine.ErrFileNotFound), errors.Is(err, engine.ErrCommentNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // handleEvents streams the live event bus as Server-Sent Events. The very

@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,9 +114,67 @@ func main() {
 	case "refresh":
 		must(c.cl.Refresh(context.Background()))
 		fmt.Println("refreshed")
+	case "comments":
+		if len(args) < 2 {
+			fatal("usage: wt comments <id> [--json] [--all]")
+		}
+		jsonOut, all := false, false
+		for _, a := range args[2:] {
+			switch a {
+			case "--json":
+				jsonOut = true
+			case "--all":
+				all = true
+			default:
+				fatal("usage: wt comments <id> [--json] [--all]")
+			}
+		}
+		must(c.comments(args[1], jsonOut, all))
+	case "comment":
+		if len(args) < 4 {
+			fatal("usage: wt comment <id> <file> <line> [--old] [--author <name>] <body...>")
+		}
+		line, err := strconv.Atoi(args[3])
+		if err != nil {
+			fatal("invalid line %q: must be an integer (0 = file-level)", args[3])
+		}
+		side, author, body := parseCommentArgs(args[4:])
+		if body == "" {
+			fatal("usage: wt comment <id> <file> <line> [--old] [--author <name>] <body...>")
+		}
+		must(c.comment(args[1], args[2], line, side, author, body))
+	case "resolve":
+		if len(args) < 3 {
+			fatal("usage: wt resolve <id> <comment-id>")
+		}
+		must(c.resolve(args[1], args[2]))
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, status, tui)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, status, tui)", args[0])
 	}
+}
+
+// parseCommentArgs scans the trailing tokens of `wt comment` for its
+// optional [--old] [--author <name>] flags, then joins whatever remains into
+// the comment body (spaces preserved between words). Flags may appear in any
+// order but must precede the body — the first token that isn't a recognised
+// flag, and everything after it, is the body verbatim.
+func parseCommentArgs(rest []string) (side, author, body string) {
+	i := 0
+	for i < len(rest) {
+		switch rest[i] {
+		case "--old":
+			side = "old"
+			i++
+		case "--author":
+			if i+1 < len(rest) {
+				author = rest[i+1]
+			}
+			i += 2
+		default:
+			return side, author, strings.Join(rest[i:], " ")
+		}
+	}
+	return side, author, ""
 }
 
 // printVersion writes the build-time version string to w. Pulled out of the
@@ -314,6 +373,52 @@ func (c *client) approve(id string) error {
 	return nil
 }
 
+// comments lists id's comments. --json is the frozen agent-integration
+// contract (P4-design.md §1.5): the daemon's model.CommentsPayload is decoded
+// then re-emitted with MarshalIndent verbatim, so the API and the CLI can
+// never drift apart. Default is open-only; --all requests every state.
+func (c *client) comments(id string, jsonOut, all bool) error {
+	state := "open"
+	if all {
+		state = "all"
+	}
+	payload, err := c.cl.Comments(context.Background(), id, state, "")
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		b, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+	renderComments(payload)
+	return nil
+}
+
+// comment adds one, printing the daemon-assigned id (the handle `wt resolve`
+// later needs).
+func (c *client) comment(id, file string, line int, side, author, body string) error {
+	cm, err := c.cl.AddComment(context.Background(), id, file, line, side, body, author)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("added comment %s on %s:%d in %s\n", cm.ID, cm.File, cm.Line, id)
+	return nil
+}
+
+// resolve is the agent's loop-closer — CLI deliberately has no --delete
+// (P4-design.md §1.5: mistakes via CLI get deleted in the web UI later).
+func (c *client) resolve(id, commentID string) error {
+	if err := c.cl.ResolveComment(context.Background(), id, commentID); err != nil {
+		return err
+	}
+	fmt.Printf("resolved %s in %s\n", commentID, id)
+	return nil
+}
+
 // ---- rendering ----
 
 const (
@@ -446,6 +551,24 @@ func renderDiff(d model.Diff) {
 	}
 }
 
+func renderComments(p model.CommentsPayload) {
+	fmt.Printf("%s%scomments%s  %s%s%s  %s%d%s\n", bold, blue, reset, dim, p.WorktreeID, reset, dim, len(p.Comments), reset)
+	for _, cm := range p.Comments {
+		flag := ""
+		switch {
+		case cm.Orphaned:
+			flag = amber + " [orphaned]" + reset
+		case cm.Stale:
+			flag = amber + " [stale]" + reset
+		}
+		fmt.Printf("  %s%s%s %s%s:%d (%s)%s%s\n", white, cm.ID, reset, dim, cm.File, cm.Line, cm.State, reset, flag)
+		fmt.Printf("    %s%s%s  %s— %s%s\n", reset, cm.Body, reset, faint, cm.Author, reset)
+	}
+	if len(p.Comments) == 0 {
+		fmt.Printf("  %s(none)%s\n", dim, reset)
+	}
+}
+
 func renderStatus(st statusPayload) {
 	uptime := time.Duration(st.UptimeSeconds * float64(time.Second)).Round(time.Second)
 	fmt.Printf("%s%swtd status%s\n", bold, blue, reset)
@@ -482,6 +605,13 @@ func usage() {
   wt review <id> <file>     mark a file reviewed (--off to unmark)
   wt approve <id>           merge worktree→base & remove it (needs full review + clean tree)
   wt refresh                force a rescan
+  wt comments <id> [--json] [--all]
+                             list comments (default: open only; --json is the
+                             frozen agent-integration contract)
+  wt comment <id> <file> <line> [--old] [--author <name>] <body...>
+                             add a comment (line 0 = file-level; --old for the base-side line)
+  wt resolve <id> <comment-id>
+                             mark a comment resolved
   wt -version               print the client's build version
 
 Set WTD_SOCKET to override the daemon socket path.
