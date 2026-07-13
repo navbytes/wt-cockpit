@@ -22,11 +22,21 @@ var templateFuncs = template.FuncMap{
 	"guardrails": guardrailSummary,
 }
 
-// pageHeader is embedded by every page's view struct: the two things
-// layout.tmpl itself needs.
+// pageHeader is embedded by every page's view struct: what layout.tmpl itself
+// needs. Protocol is model.ProtocolVersion, embedded as a <meta> tag so
+// app.js can compare it against the SSE hello frame and banner "wtd was
+// upgraded — reload" on a mismatch (P4-design.md §1.6/§2) without a second
+// round trip to GET /api/version.
 type pageHeader struct {
 	Title     string
 	CSRFToken string
+	Protocol  int
+}
+
+// newPageHeader builds the header every page constructs identically save for
+// its title.
+func newPageHeader(title, csrfToken string) pageHeader {
+	return pageHeader{Title: title, CSRFToken: csrfToken, Protocol: model.ProtocolVersion}
 }
 
 // indexView is GET /'s (and /fragment/worktrees') template data.
@@ -86,7 +96,7 @@ func (a *app) buildIndexView() indexView {
 	}
 
 	return indexView{
-		pageHeader: pageHeader{Title: "wt cockpit", CSRFToken: a.cfg.CSRFToken},
+		pageHeader: newPageHeader("wt cockpit", a.cfg.CSRFToken),
 		Roots:      a.cfg.Roots,
 		Groups:     groups,
 		Counts:     c,
@@ -123,6 +133,14 @@ type roomView struct {
 	ReviewedCount, TotalFiles, LeftCount int
 	ProgressPct                          int
 	AllReviewed                          bool
+
+	// OrphanedComments are comments whose file left the diff entirely — no
+	// file card exists to strip them under, so they render in their own
+	// page-bottom section instead (P4-design.md §1.5/§2). Always populated
+	// (possibly empty), never nil-vs-empty-sensitive: the section itself
+	// always renders (comments.go/fragments.tmpl), just visually empty, so
+	// app.js always has a container to refresh into.
+	OrphanedComments []model.CommentView
 }
 
 // fileCardView is one DiffFile's rendered content: the header line (name,
@@ -145,6 +163,13 @@ type fileCardView struct {
 	CollapseNote string
 	HighlightOff bool
 	Hunks        []hunkView
+
+	// CommentGroups is this file's comment threads, grouped by (line, side)
+	// and rendered in a strip right under the header (comments.go) —
+	// unconditional on Binary/Collapsed: a comment can be about a collapsed
+	// or binary file too, and always has somewhere to render regardless of
+	// whether its hunks do.
+	CommentGroups []commentGroupView
 }
 
 // hunkView is one hunk's header text plus its side-by-side rows (sxs.go).
@@ -158,7 +183,7 @@ func (a *app) handleRoom(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	d, ok := a.eng.Diff(id)
-	view := roomView{pageHeader: pageHeader{Title: "reading room", CSRFToken: a.cfg.CSRFToken}, ID: id}
+	view := roomView{pageHeader: newPageHeader("reading room", a.cfg.CSRFToken), ID: id}
 	if !ok {
 		view.NotFound = true
 		w.WriteHeader(http.StatusNotFound)
@@ -181,6 +206,12 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	for _, p := range expandParams {
 		expanded[p] = true
 	}
+	// Comments are read fresh every render (never cached): Stale/Orphaned are
+	// computed by the engine against the *current* diff on every call, which
+	// is exactly what makes them flip live once a refetch happens (P4-design.md
+	// §1.5's frozen semantics; the error case (an unknown id) can't actually
+	// happen here since handleRoom already proved the diff exists).
+	views, _ := a.eng.Comments(id)
 
 	hits := guardrailHitsFor(wt)
 	msg, more := guardrailBanner(hits)
@@ -189,7 +220,7 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	files := make([]fileCardView, len(d.Files))
 	reviewedCount := 0
 	for i, f := range d.Files {
-		files[i] = a.buildFileCard(i, f, reviewedMap[f.Path], danger, expanded)
+		files[i] = a.buildFileCard(i, f, reviewedMap[f.Path], danger, expanded, views)
 		if reviewedMap[f.Path] {
 			reviewedCount++
 		}
@@ -197,19 +228,20 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	total := len(d.Files)
 
 	view := roomView{
-		pageHeader:    pageHeader{Title: roomTitle(wt, id), CSRFToken: a.cfg.CSRFToken},
-		ID:            id,
-		Empty:         total == 0,
-		DiffHash:      d.Hash,
-		Files:         files,
-		ReviewedCount: reviewedCount,
-		TotalFiles:    total,
-		LeftCount:     total - reviewedCount,
-		ProgressPct:   progressPct(reviewedCount, total),
-		AllReviewed:   total > 0 && reviewedCount == total,
-		GuardrailMsg:  msg,
-		GuardrailMore: more,
-		Base:          d.Base,
+		pageHeader:       newPageHeader(roomTitle(wt, id), a.cfg.CSRFToken),
+		ID:               id,
+		Empty:            total == 0,
+		DiffHash:         d.Hash,
+		Files:            files,
+		ReviewedCount:    reviewedCount,
+		TotalFiles:       total,
+		LeftCount:        total - reviewedCount,
+		ProgressPct:      progressPct(reviewedCount, total),
+		AllReviewed:      total > 0 && reviewedCount == total,
+		GuardrailMsg:     msg,
+		GuardrailMore:    more,
+		Base:             d.Base,
+		OrphanedComments: orphanedComments(views),
 	}
 	if wt != nil {
 		view.Repo, view.Name, view.Branch = wt.Repo, wt.Name, wt.Branch
@@ -224,13 +256,14 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 // the file's single per-file highlight pass by a running codeIdx offset —
 // the same "concatenated hunk lines, indexed 1:1" convention
 // internal/tui/flatten.go's codeIdx uses.
-func (a *app) buildFileCard(idx int, f model.DiffFile, reviewed bool, danger map[string]bool, expanded map[string]bool) fileCardView {
+func (a *app) buildFileCard(idx int, f model.DiffFile, reviewed bool, danger map[string]bool, expanded map[string]bool, comments []model.CommentView) fileCardView {
 	disp := displayPath(f)
 	dir, base := dirsplit(disp)
 	card := fileCardView{
 		Idx: idx, Path: f.Path, DisplayPath: disp, Dir: dir, FileName: base,
 		Status: f.Status, Danger: danger[f.Path] || (f.OldPath != "" && danger[f.OldPath]),
 		Stats: f.Stats, Reviewed: reviewed, Hash: f.Hash, Binary: f.Binary,
+		CommentGroups: fileCommentGroups(comments, f.Path, idx),
 	}
 
 	switch {

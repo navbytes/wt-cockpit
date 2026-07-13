@@ -186,3 +186,48 @@ code { font-family: var(--mono); }
 .btn.merge { background: var(--add); color: #04170a; }
 .btn.merge:disabled { background: #1c2b20; color: var(--faint); cursor: not-allowed; }
 .approve-error { color: var(--del); font-size: 11px; }
+
+/* ---- comments (P4-design.md WP4 — ported button look from
+   docs/ux/mock.html's .btn.ghost) ---- */
+.btn.ghost { background: transparent; border: 1px solid var(--line2); padding: 3px 9px; font-weight: 500; font-size: 11px; }
+.btn.ghost:hover { color: var(--txt); border-color: var(--dim); }
+.btn.ghost.danger { color: var(--del); border-color: var(--delln); }
+.btn.ghost.danger:hover { border-color: var(--del); }
+.file-h .c-add { margin-left: 8px; }
+
+/* a line-number gutter cell that can anchor a comment (data-line is only
+   present on cells with a real line number — filler/empty cells stay inert) */
+.ln[data-line] { cursor: pointer; }
+.ln[data-line]:hover { background: rgba(108, 182, 255, .18); color: var(--accent); }
+
+/* the per-file comment strip, right under the file header; renders with no
+   visible chrome of its own when it has no children so an uncommented file
+   shows nothing extra. */
+.comments:not(:empty) { padding: 8px 12px; border-bottom: 1px solid var(--line); background: #0b1017; }
+.cgroup + .cgroup { margin-top: 8px; }
+.cgroup-lab { color: var(--accent2); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+.ccard { border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; margin-bottom: 6px; background: var(--panel); }
+.ccard:last-child { margin-bottom: 0; }
+.ccard.resolved { opacity: .6; }
+.ccard-h { display: flex; align-items: center; gap: 8px; font-size: 11px; margin-bottom: 4px; }
+.cauthor { color: var(--txt); font-weight: 600; }
+.cage { color: var(--faint); }
+.cbadge { font-size: 10px; border-radius: 4px; padding: 0 6px; border: 1px solid var(--line2); }
+.cbadge.stale { color: var(--warn); border-color: var(--warnbg); }
+.cbadge.orphaned { color: var(--dim); }
+.cbadge.resolved { color: var(--add); border-color: var(--addln); }
+.cbody { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.cactions { margin-top: 6px; display: flex; gap: 6px; }
+
+.orphaned-comments h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+.orphaned-comments .cgroup-lab { color: var(--dim); }
+
+/* comment composer, cloned from the page's static <template> */
+.composer { border: 1px solid var(--accent2); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; background: var(--panel); }
+.composer-h { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.composer-lab { font-size: 11px; color: var(--dim); }
+.composer-cancel { background: none; border: 0; color: var(--faint); font-size: 15px; line-height: 1; cursor: pointer; padding: 0; }
+.composer-cancel:hover { color: var(--txt); }
+.composer-body { width: 100%; resize: vertical; background: var(--bg2); color: var(--txt); border: 1px solid var(--line2); border-radius: 5px; font: inherit; font-size: 12px; padding: 6px 8px; }
+.composer-actions { margin-top: 6px; display: flex; justify-content: flex-end; }
+.composer-error { color: var(--del); font-size: 11px; margin-top: 6px; }
