@@ -385,16 +385,20 @@ func (e *Engine) refreshOneLocked(id string) bool {
 // git state changed, recompute the diff, guardrails and stats. It is safe to call
 // concurrently — scans are serialised.
 //
-// The first call to Refresh in the engine's lifetime marks firstScanDone at
-// the end, regardless of outcome — this is the cold-start gate that stops a
+// The first call to Refresh in the engine's lifetime to actually COMPLETE
+// marks firstScanDone at the end — this is the cold-start gate that stops a
 // daemon restart from replaying every standing guardrail hit as "new" (see
-// publishNewGuardrailHits). A worktree discovered by a LATER Refresh (or by
-// RefreshOne, e.g. one an agent just created) still publishes normally on
-// its own first eval, since the gate is already open by then.
+// publishNewGuardrailHits). A Refresh that fails outright (a discovery
+// failure, or ctx canceled mid-scan) leaves the gate closed rather than
+// opening it on a scan that never populated a baseline: opening it anyway
+// would make the NEXT (successful) scan republish every standing hit as new,
+// exactly the restart storm this gate exists to prevent. A worktree
+// discovered by a LATER Refresh (or by RefreshOne, e.g. one an agent just
+// created) still publishes normally on its own first eval, since the gate is
+// already open by then.
 func (e *Engine) Refresh(ctx context.Context) error {
 	e.refreshMu.Lock()
 	defer e.refreshMu.Unlock()
-	defer e.firstScanDone.Store(true)
 
 	repos, err := discovery.DiscoverRepos(e.cfg.Roots, e.cfg.MaxDepth)
 	if err != nil {
@@ -444,6 +448,7 @@ func (e *Engine) Refresh(ctx context.Context) error {
 			e.reg.Remove(id)
 		}
 	}
+	e.firstScanDone.Store(true) // only on this, the success path — see doc comment above
 	return nil
 }
 

@@ -152,6 +152,36 @@ func TestMergeDisableThenPackReintroducesSameName(t *testing.T) {
 	}
 }
 
+// TestMergePackWithDuplicateRuleNameSilentlyCollapsesToLastOne is the MINOR-2
+// fix pin. When a pack's OWN [[rules]] list contains two entries sharing a
+// name (a plausible copy-paste mistake, with no corresponding global rule to
+// "replace"), Merge used to conflate "this name came from a global rule"
+// with "this name was already added by an earlier PACK rule in this same
+// loop" — so the second pack rule silently overwrote the first in place
+// (out[i] = ...) instead of ever being seen as a duplicate, and by the time
+// the caller (Resolver.loadPack) ran Compile on the merged result, only one
+// rule survived, so Compile's own duplicate-name check never fired either.
+// Merge now leaves a genuine intra-pack duplicate as a SECOND distinct
+// entry (rather than overwriting the first), so Compile catches it exactly
+// like the identical mistake in config.toml's [[rules]] list already does.
+func TestMergePackWithDuplicateRuleNameSilentlyCollapsesToLastOne(t *testing.T) {
+	pack := Pack{Rules: []Rule{
+		{Name: "dup", Severity: "warn", PathGlob: "a/**"},
+		{Name: "dup", Severity: "danger", PathGlob: "b/**"},
+	}}
+	merged := Merge(nil, "default", pack)
+	// Expected (once fixed): Merge/Compile should surface this as an error
+	// (mirroring Compile's own duplicate-name rejection for the global list),
+	// not silently keep exactly one entry.
+	rules := make([]Rule, len(merged))
+	for i, m := range merged {
+		rules[i] = m.Rule
+	}
+	if _, err := Compile(rules); err == nil {
+		t.Fatalf("expected a duplicate-rule-name error for a pack with two [[rules]] entries named %q, got none (merged=%+v)", "dup", merged)
+	}
+}
+
 func TestMergeEmptyPackReturnsGlobalUnchangedButTagged(t *testing.T) {
 	global := []Rule{{Name: "a"}, {Name: "b"}}
 	got := Merge(global, "global", Pack{})

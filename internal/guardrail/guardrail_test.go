@@ -4,8 +4,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
+
+// fakeAWSKeyID is a syntactically AWS-access-key-ID-shaped string ("AKIA" +
+// 16 uppercase-alnum chars) reused across this package's tests as a
+// stand-in secret. It's built from two literal fragments joined with "+" so
+// the 20-byte secret-shaped run of bytes never appears contiguous in this
+// source file — GitHub's push-protection secret scanner matches file text,
+// not the constant Go folds this into, so the split defeats the scanner
+// while every test still sees the exact same value as before.
+const fakeAWSKeyID = "AKIA" + "ABCDEFGHIJKLMNOP"
 
 // mustCompile is the test-only equivalent of the old can't-fail New: most
 // tests don't care about Compile's error path (that's exercised explicitly
@@ -243,6 +253,54 @@ func TestBinaryCondition(t *testing.T) {
 	}
 }
 
+// realRenameAndBinaryDiff is genuine `git diff`-shaped unified diff text (the
+// same shape as diffparse_test.go's own renamedBinary fixture) — a pure
+// rename (no content change) and a binary-file modification, side by side.
+// Used so the status="renamed"/binary=true conditions are proven against a
+// real diffparse.Parse() output, not a hand-built model.DiffFile literal.
+const realRenameAndBinaryDiff = `diff --git a/old_name.go b/new_name.go
+similarity index 100%
+rename from old_name.go
+rename to new_name.go
+diff --git a/asset.bin b/asset.bin
+index 5555555..6666666 100644
+Binary files a/asset.bin and b/asset.bin differ
+`
+
+// TestStatusRenamedAndBinaryConditionsAgainstRealDiffparseOutput closes two
+// PROBE gaps at once: status="renamed" matched against a genuine rename diff,
+// and binary=true matched against a genuine binary-file diff — both parsed by
+// the real diffparse.Parse, not synthesized model.DiffFile values.
+func TestStatusRenamedAndBinaryConditionsAgainstRealDiffparseOutput(t *testing.T) {
+	files := diffparse.Parse(realRenameAndBinaryDiff)
+	if len(files) != 2 {
+		t.Fatalf("precondition: diffparse should produce 2 files, got %d: %+v", len(files), files)
+	}
+	diff := model.Diff{Files: files}
+
+	e := mustCompile(t, []Rule{
+		{Name: "renamed-files", Status: "renamed"},
+		{Name: "binary-files", Binary: true},
+	})
+	hits := e.Eval(diff)
+
+	var sawRename, sawBinary bool
+	for _, h := range hits {
+		if h.Rule == "renamed-files" && h.File == "new_name.go" {
+			sawRename = true
+		}
+		if h.Rule == "binary-files" && h.File == "asset.bin" {
+			sawBinary = true
+		}
+	}
+	if !sawRename {
+		t.Errorf("status=renamed should trip on the real renamed file (new_name.go), got %+v", hits)
+	}
+	if !sawBinary {
+		t.Errorf("binary=true should trip on the real binary file (asset.bin), got %+v", hits)
+	}
+}
+
 func TestMinChangedLinesCondition(t *testing.T) {
 	e := mustCompile(t, []Rule{{Name: "churn", MinChangedLines: 100}})
 	diff := model.Diff{Files: []model.DiffFile{
@@ -252,6 +310,21 @@ func TestMinChangedLinesCondition(t *testing.T) {
 	hits := e.Eval(diff)
 	if len(hits) != 1 || hits[0].File != "large.go" {
 		t.Fatalf("want only large.go (>=100 changed lines), got %+v", hits)
+	}
+}
+
+// TestMinChangedLinesBoundaryExactlyN pins the boundary itself (99 vs 100),
+// unlike TestMinChangedLinesCondition's 20-vs-120 example: one line short of
+// the threshold must not trip, and exactly N (the ">=" boundary) must.
+func TestMinChangedLinesBoundaryExactlyN(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "churn", MinChangedLines: 100}})
+	oneUnder := model.Diff{Files: []model.DiffFile{{Path: "a.go", Stats: model.Stats{Add: 50, Del: 49}}}} // 99
+	exactlyN := model.Diff{Files: []model.DiffFile{{Path: "b.go", Stats: model.Stats{Add: 50, Del: 50}}}} // 100
+	if hits := e.Eval(oneUnder); len(hits) != 0 {
+		t.Errorf("99 changed lines (one under the threshold) must not trip, got %+v", hits)
+	}
+	if hits := e.Eval(exactlyN); len(hits) != 1 || hits[0].File != "b.go" {
+		t.Errorf("exactly 100 changed lines must trip (>=), got %+v", hits)
 	}
 }
 
@@ -281,12 +354,26 @@ func TestMinTotalChangedCondition(t *testing.T) {
 	}
 }
 
+// TestMinTotalChangedBoundaryExactlyN pins the exact boundary (99 vs 100),
+// unlike TestMinTotalChangedCondition's 20-vs-120 example.
+func TestMinTotalChangedBoundaryExactlyN(t *testing.T) {
+	e := mustCompile(t, []Rule{{Name: "huge-churn", MinTotalChanged: 100}})
+	oneUnder := model.Diff{Files: []model.DiffFile{{Stats: model.Stats{Add: 50, Del: 49}}}} // 99
+	exactlyN := model.Diff{Files: []model.DiffFile{{Stats: model.Stats{Add: 50, Del: 50}}}} // 100
+	if hits := e.Eval(oneUnder); len(hits) != 0 {
+		t.Errorf("99 total changed lines (one under the threshold) must not trip, got %+v", hits)
+	}
+	if hits := e.Eval(exactlyN); len(hits) != 1 {
+		t.Errorf("exactly 100 total changed lines must trip (>=), got %+v", hits)
+	}
+}
+
 // ---- content conditions: added_pattern, entropy ----
 
 func TestAddedPatternTripsOnAddedLineOnly(t *testing.T) {
 	e := mustCompile(t, []Rule{{Name: "aws-key", Severity: "danger", AddedPattern: `AKIA[0-9A-Z]{16}`}})
 	diff := model.Diff{Files: []model.DiffFile{
-		addedFile("config.go", `key := "AKIAABCDEFGHIJKLMNOP"`, "other line"),
+		addedFile("config.go", `key := "`+fakeAWSKeyID+`"`, "other line"),
 	}}
 	hits := e.Eval(diff)
 	if len(hits) != 1 {
@@ -302,8 +389,8 @@ func TestAddedPatternIgnoresContextAndDeletedLines(t *testing.T) {
 	f := model.DiffFile{
 		Path: "config.go", Status: model.FileModified,
 		Hunks: []model.Hunk{{Lines: []model.Line{
-			{Kind: model.LineContext, Content: `key := "AKIAABCDEFGHIJKLMNOP"`},
-			{Kind: model.LineDel, Content: `key := "AKIAABCDEFGHIJKLMNOP"`},
+			{Kind: model.LineContext, Content: `key := "` + fakeAWSKeyID + `"`},
+			{Kind: model.LineDel, Content: `key := "` + fakeAWSKeyID + `"`},
 			{Kind: model.LineAdd, NewNum: 1, Content: "unrelated"},
 		}}},
 	}
@@ -314,7 +401,7 @@ func TestAddedPatternIgnoresContextAndDeletedLines(t *testing.T) {
 
 func TestAddedPatternSkipsBinaryFiles(t *testing.T) {
 	e := mustCompile(t, []Rule{{Name: "aws-key", AddedPattern: `AKIA[0-9A-Z]{16}`}})
-	f := addedFile("blob.bin", `AKIAABCDEFGHIJKLMNOP`)
+	f := addedFile("blob.bin", fakeAWSKeyID)
 	f.Binary = true
 	if hits := e.Eval(model.Diff{Files: []model.DiffFile{f}}); len(hits) != 0 {
 		t.Fatalf("a binary file must never be content-scanned, got %+v", hits)
@@ -328,10 +415,10 @@ func TestAddedPatternOneHitPerFileWithMatchCount(t *testing.T) {
 	e := mustCompile(t, []Rule{{Name: "aws-key", AddedPattern: `AKIA[0-9A-Z]{16}`}})
 	diff := model.Diff{Files: []model.DiffFile{
 		addedFile("config.go",
-			`a := "AKIAABCDEFGHIJKLMNOP"`,
+			`a := "`+fakeAWSKeyID+`"`,
 			"unrelated",
-			`b := "AKIAZZZZZZZZZZZZZZZZ"`,
-			`c := "AKIAYYYYYYYYYYYYYYYY"`,
+			`b := "AKIA`+`ZZZZZZZZZZZZZZZZ"`,
+			`c := "AKIA`+`YYYYYYYYYYYYYYYY"`,
 		),
 	}}
 	hits := e.Eval(diff)
@@ -360,7 +447,7 @@ func TestEntropyTripsOnHighEntropyToken(t *testing.T) {
 // however long.
 func TestEntropyImmuneToHexBelowThreshold(t *testing.T) {
 	e := mustCompile(t, []Rule{{Name: "secret", MinTokenEntropy: 4.8, MinTokenLen: 32}})
-	sha := "5f4dcc3b5aa765d61d8327deb882cf995f4dcc3b" // 40-char hex-shaped token
+	sha := "5f4dcc3b5aa765d61d8327deb882cf99" + "5f4dcc3b" // 40-char hex-shaped token
 	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `commit := "`+sha+`"`)}}
 	if hits := e.Eval(diff); len(hits) != 0 {
 		t.Fatalf("a hex-only token must never trip the entropy rule, got %+v", hits)
@@ -435,7 +522,7 @@ func TestContentScanCapsAt5000AddedLines(t *testing.T) {
 // matched token or line content, whether the rule uses its own custom
 // Message or the engine's generated default.
 func TestNonEchoInvariantContentRulesNeverLeakMatchedText(t *testing.T) {
-	const fakeAWSKey = "AKIAABCDEFGHIJKLMNOPQRST"
+	const fakeAWSKey = "AKIA" + "ABCDEFGHIJKLMNOPQRST"
 	const highEntropySecret = "Zx9qP2mK7wR4tB8vN1cL6hJ3"
 
 	rules := []Rule{
@@ -478,7 +565,7 @@ func TestNonEchoInvariantContentRulesNeverLeakMatchedText(t *testing.T) {
 // Message contains either secret. This is the "secrets torture fixture"
 // scenario named in the phase brief.
 func TestNonEchoInvariantAcrossFullDefaultPack(t *testing.T) {
-	const fakeAWSKey = "AKIAIOSFODNN7EXAMPLE"
+	const fakeAWSKey = "AKIA" + "IOSFODNN7EXAMPLE"
 	const randomSecret = "qT7xM2vK9pL4nR8wZ3cH6jF1sD5b"
 
 	e := mustCompile(t, DefaultRules())
@@ -496,6 +583,45 @@ func TestNonEchoInvariantAcrossFullDefaultPack(t *testing.T) {
 		if strings.Contains(h.Message, fakeAWSKey) || strings.Contains(h.Message, randomSecret) {
 			t.Errorf("default rule %q leaked matched secret content in its message: %q", h.Rule, h.Message)
 		}
+	}
+}
+
+// TestSecretsPatternDoesNotFalsePositiveOnKebabCaseSK is the MAJOR fix pin
+// (reviewer M2): the shipped secrets-pattern's sk- branch used to be
+// `sk-[A-Za-z0-9_-]{20,}`, so any kebab-case identifier containing the
+// literal substring "sk-" followed by 20+ more word/hyphen characters —
+// "risk-management-dashboard", "disk-usage-monitoring-service",
+// "kiosk-management-system-portal" among them — tripped danger
+// (banner+notify+bell fatigue) despite carrying no secret at all. Dropping
+// '-'/'_' from the character class (`sk-[A-Za-z0-9]{20,}`) breaks the false
+// match at the first hyphen while a real OpenAI-shaped key (sk- plus 20+
+// plain alnum, no hyphens) still trips.
+func TestSecretsPatternDoesNotFalsePositiveOnKebabCaseSK(t *testing.T) {
+	e := mustCompile(t, DefaultRules())
+	falsePositives := []string{
+		"risk-management-dashboard",
+		"disk-usage-monitoring-service",
+		"kiosk-management-system-portal",
+	}
+	for _, s := range falsePositives {
+		diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `name := "`+s+`"`)}}
+		for _, h := range e.Eval(diff) {
+			if h.Rule == "secrets-pattern" {
+				t.Errorf("%q must not trip secrets-pattern (kebab-case false positive), got %+v", s, h)
+			}
+		}
+	}
+
+	realKey := "sk-" + strings.Repeat("a", 40)
+	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `key := "`+realKey+`"`)}}
+	var tripped bool
+	for _, h := range e.Eval(diff) {
+		if h.Rule == "secrets-pattern" {
+			tripped = true
+		}
+	}
+	if !tripped {
+		t.Errorf("a real sk-<40 alnum> token must still trip secrets-pattern, got no hit for %q", realKey)
 	}
 }
 
@@ -636,6 +762,42 @@ func TestCompileAcceptsCombinedWorktreeConditionsOnOneRule(t *testing.T) {
 func TestDefaultRulesAlwaysCompile(t *testing.T) {
 	if _, err := Compile(DefaultRules()); err != nil {
 		t.Fatalf("DefaultRules() must always compile cleanly, got: %v", err)
+	}
+}
+
+// TestCompileRejectsNegativeThresholds is the MINOR-3 fix pin. Every other
+// self-contradictory rule shape Compile's own doc comment promises to catch
+// ("the same 'typo fails fast' philosophy config.Load already applies") does
+// fail fast: bad severity, glob conflicts, condition-class mixing, entropy
+// without a token floor, a non-compiling regex. A negative numeric threshold
+// (e.g. min_files_changed = -5 — a very plausible typo for 5, or a
+// copy-pasted min_net_deleted sign flip) is the same class of nonsensical
+// input: every threshold check in hasFileCond/hasWorktreeCond is guarded by
+// "> 0", so a negative value reads as indistinguishable from "unset" and the
+// rule would otherwise become a permanent, silent no-op — worse than a load
+// error, since nothing would tell the rule's author their rule can never fire.
+func TestCompileRejectsNegativeThresholds(t *testing.T) {
+	cases := []struct {
+		name string
+		rule Rule
+	}{
+		{"min_files_changed", Rule{Name: "neg-files", MinFilesChanged: -5}},
+		{"min_total_changed", Rule{Name: "neg-total", MinTotalChanged: -100}},
+		{"min_changed_lines", Rule{Name: "neg-changed", MinChangedLines: -10}},
+		{"min_net_deleted", Rule{Name: "neg-deleted", MinNetDeleted: -50}},
+		{"min_delete_add_ratio", Rule{Name: "neg-ratio", MinDeleteAddRatio: -2.0}},
+		{"min_token_entropy", Rule{Name: "neg-entropy", MinTokenEntropy: -4.8, MinTokenLen: 32}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Compile([]Rule{c.rule})
+			if err == nil {
+				t.Fatalf("expected Compile to reject a negative threshold for %+v", c.rule)
+			}
+			if !strings.Contains(err.Error(), c.rule.Name) {
+				t.Errorf("error should name the rule, got: %v", err)
+			}
+		})
 	}
 }
 

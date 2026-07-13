@@ -194,3 +194,43 @@ func TestDefaultCommandIgnoresStdinEntirelyEvenWhenRedirected(t *testing.T) {
 		t.Errorf("defaultCommand(true) with a non-TTY stdin = %q, want %q (stdout alone decides; stdin is never consulted)", got, "tui")
 	}
 }
+
+// ---- shortGuard / renderRadar: pack-authored rule name sanitization ----
+
+// TestShortGuardSanitizesControlBytesInRuleName is the HIGH fix pin (`wt ls`
+// half): a guardrail hit's Rule name comes from a pack-authored rule's own
+// Name field (semi-trusted .wtcockpit.toml), and shortGuard feeds it
+// straight into renderRadar's per-worktree alert line. A control/ESC byte in
+// that name must render as caret notation, not reach the terminal raw.
+func TestShortGuardSanitizesControlBytesInRuleName(t *testing.T) {
+	hits := []model.GuardrailHit{{Rule: "evil\x1b]0;pwned\x07-rule", Severity: "danger"}}
+	got := shortGuard(hits)
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into shortGuard output: %q", got)
+	}
+	if got != "evil^[]0;pwned^G-rule" {
+		t.Errorf("shortGuard(%+v) = %q, want the caret-sanitized rule name", hits, got)
+	}
+}
+
+// TestRenderRadarSanitizesControlBytesInGuardrailRuleName is the same fix,
+// exercised through the real `wt ls` rendering path (renderRadar prints
+// straight to os.Stdout, so captureStdout — defined in probe_test.go, same
+// package — is needed to observe it).
+func TestRenderRadarSanitizesControlBytesInGuardrailRuleName(t *testing.T) {
+	wts := []model.Worktree{
+		{ID: "wt1", Repo: "repo", Name: "feature", State: model.StateDirty,
+			Guardrails: []model.GuardrailHit{{Rule: "evil\x1b]0;pwned\x07-rule", Severity: "danger"}}},
+	}
+	// renderRadar also emits its own legitimate ANSI styling (bold/color)
+	// unrelated to this attack — a blanket "no ESC anywhere" check would
+	// false-fail on those, so this checks specifically for the hostile raw
+	// rule name vs. its caret-sanitized replacement.
+	out := captureStdout(t, func() { renderRadar(wts) })
+	if strings.Contains(out, "evil\x1b]0;pwned\x07-rule") {
+		t.Fatalf("raw ESC/BEL bytes in the rule name leaked into wt ls output:\n%s", out)
+	}
+	if !strings.Contains(out, "evil^[]0;pwned^G-rule") {
+		t.Errorf("expected the caret-sanitized rule name in wt ls output, got:\n%s", out)
+	}
+}

@@ -285,6 +285,16 @@ the rule, file, and line, never the secret itself — true of the JSON API, the 
 stream, and the desktop notifications below, too. See
 [docs/config.example.toml](docs/config.example.toml) for the full field reference.
 
+`secrets-entropy`'s 4.8 bits/char default is calibrated to actual random secrets, not
+every long token — a 32-40 char realistic base64 secret (e.g. an AWS secret access
+key) sometimes falls short of 4.8 in practice, and that's intentional: lowering the
+threshold to catch more of those trades away real detections for false-positive
+notification fatigue on ordinary base64/hex/UUID content, the exact failure mode this
+rule's `exclude_globs` and hex/UUID entropy ceiling already guard against. Known-shape
+secrets (AWS/GitHub/Slack/OpenAI/Google tokens, PEM keys) are the `secrets-pattern`
+rule's job; `secrets-entropy` is a best-effort net for everything else long and
+random-looking, not a guarantee of catching every long token.
+
 ### Per-repo overrides: `.wtcockpit.toml`
 
 A checked-in `.wtcockpit.toml` at a repo's root tunes that repo's rules without

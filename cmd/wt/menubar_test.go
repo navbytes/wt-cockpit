@@ -152,6 +152,54 @@ func TestWriteMenubarEmptyFleetStillEmitsValidPluginText(t *testing.T) {
 	}
 }
 
+// TestWriteMenubarSanitizesPipeInRepoAndBranchName is the BLOCKER-2 fix pin
+// (security HIGH): git allows a branch name to contain "|" — SwiftBar/xbar
+// splits a plugin line on the FIRST "|" into title|params, and params
+// including bash=/shell= run a command when the row is clicked. An
+// agent-named branch like "feat|bash=/tmp/evil.sh" must never reach the
+// emitted line as a raw, unescaped "|" (SwiftBar has no pipe escape) —
+// asserting the exact sanitized output, not just "no bash= substring".
+func TestWriteMenubarSanitizesPipeInRepoAndBranchName(t *testing.T) {
+	var buf bytes.Buffer
+	hostile := []model.Worktree{
+		{ID: "wt-x", Repo: "main-repo", Name: "feat|bash=/tmp/evil.sh", Stats: model.Stats{Files: 1}, Reviewed: 0},
+	}
+	writeMenubar(&buf, hostile, "127.0.0.1:7788")
+	out := buf.String()
+
+	// Exactly two literal "|" bytes may appear anywhere in the output: the
+	// ones THIS code itself inserts before each row's own "href=" (the
+	// worktree row and the trailing "Open cockpit" row). Any more means the
+	// hostile branch name's own "|" leaked through unsanitized.
+	if got := strings.Count(out, "|"); got != 2 {
+		t.Fatalf("expected exactly 2 literal \"|\" bytes (one per href= row), got %d in:\n%s", got, out)
+	}
+	wantLine := "main-repo/feat¦bash=/tmp/evil.sh — 1 files unreviewed | href=http://127.0.0.1:7788/wt/wt-x"
+	if !strings.Contains(out, wantLine) {
+		t.Errorf("expected the sanitized row %q, got:\n%s", wantLine, out)
+	}
+}
+
+// TestWriteMenubarSanitizesControlBytesInRepoName covers the other half of
+// BLOCKER-2: a repo directory name (filesystem-derived, unlike a git branch
+// name) can carry raw control/escape bytes on disk. Those must render as
+// visible caret notation, never as raw bytes reaching the plugin host's
+// terminal/menu renderer.
+func TestWriteMenubarSanitizesControlBytesInRepoName(t *testing.T) {
+	var buf bytes.Buffer
+	hostile := []model.Worktree{
+		{ID: "wt-y", Repo: "repo\x1b]0;pwned\x07", Name: "feature", Stats: model.Stats{Files: 2}, Reviewed: 0},
+	}
+	writeMenubar(&buf, hostile, "")
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into menubar output: %q", out)
+	}
+	if !strings.Contains(out, "repo^[]0;pwned^G/feature") {
+		t.Errorf("expected caret-notation sanitized repo name, got:\n%s", out)
+	}
+}
+
 // ---- full binary round-trip against a fake daemon ----
 
 func menubarFakeDaemonMux(t *testing.T, webAddr string) *http.ServeMux {
@@ -224,6 +272,48 @@ func TestWtMenubarOmitsHrefWhenWebAddrEmptyBinary(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "href=") {
 		t.Errorf("expected no href with an empty webAddr, got:\n%s", stdout.String())
+	}
+}
+
+// TestWtMenubarZeroWorktreesBinaryRoundTripExitsZeroWithValidPluginText is
+// the binary-level twin of TestWriteMenubarEmptyFleetStillEmitsValidPluginText:
+// a real (up) daemon reporting zero worktrees is a normal state, not an
+// error — the real wt binary must still exit 0 and print valid SwiftBar text
+// (title + separators + Open cockpit), not the daemon-down degraded form.
+func TestWtMenubarZeroWorktreesBinaryRoundTripExitsZeroWithValidPluginText(t *testing.T) {
+	bin := requireWtBin(t)
+	sockPath := filepath.Join(shortSocketDir(t), "wtd.sock")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"protocol": model.ProtocolVersion, "version": "x", "goVersion": "go1.24"})
+	})
+	mux.HandleFunc("/api/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]model.Worktree{})
+	})
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"webAddr": "127.0.0.1:7788"})
+	})
+	ts := unixSocketServer(t, sockPath, mux)
+	defer ts.Close()
+
+	cmd := exec.Command(bin, "menubar")
+	cmd.Env = append(os.Environ(), "WTD_SOCKET="+sockPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("wt menubar with zero worktrees failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	out := stdout.String()
+	if !wtMenubarTitleRE.MatchString(strings.SplitN(out, "\n", 2)[0]) {
+		t.Fatalf("title line = %q, want it to match %s (a valid, non-error title even with 0 worktrees)", strings.SplitN(out, "\n", 2)[0], wtMenubarTitleRE)
+	}
+	if !strings.HasPrefix(out, "⚠0 ✓0/0\n---\n") {
+		t.Errorf("stdout = %q, want the empty-fleet title+separator", out)
+	}
+	if !strings.Contains(out, "Open cockpit | href=http://127.0.0.1:7788/") {
+		t.Errorf("expected the Open cockpit row even with zero worktrees, got:\n%s", out)
 	}
 }
 

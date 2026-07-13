@@ -24,6 +24,7 @@ import (
 
 	"github.com/navbytes/wt-cockpit/internal/buildinfo"
 	wtclient "github.com/navbytes/wt-cockpit/internal/client"
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
 	"github.com/navbytes/wt-cockpit/internal/notify"
@@ -673,13 +674,19 @@ func renderRadar(wts []model.Worktree) {
 	fmt.Printf("\n%s↳ wt diff <id>   ·   wt review <id> <file>   ·   wt watch%s\n", dim, reset)
 }
 
+// shortGuard renders a worktree's guardrail hits as a compact "rule, rule,
+// …" summary. h.Rule is a rule NAME, which can come from a semi-trusted
+// pack's own [[rules]] Name field (HIGH security fix) — sanitized here via
+// diffparse.SanitizeControl, the same rule the TUI/web guardrail banners
+// already apply, before it ever reaches renderRadar's terminal output.
 func shortGuard(hits []model.GuardrailHit) string {
 	seen := map[string]bool{}
 	var parts []string
 	for _, h := range hits {
-		if !seen[h.Rule] {
-			seen[h.Rule] = true
-			parts = append(parts, h.Rule)
+		name := diffparse.SanitizeControl(h.Rule)
+		if !seen[name] {
+			seen[name] = true
+			parts = append(parts, name)
 		}
 	}
 	if len(parts) > 2 {
@@ -735,18 +742,27 @@ func renderComments(p model.CommentsPayload) {
 // renderRules is `wt rules <id>`'s human table: NAME SEV SOURCE CONDITIONS
 // MESSAGE, plus the pack file's own path+status when one is in effect — the
 // precedence-confusion antidote named in P5-design.md §1.3.
+//
+// Every one of Name/Message/PackStatus (and, via conditionsSummary,
+// PathGlob/AddedPattern/etc.) can carry a semi-trusted main-worktree pack's
+// own text (HIGH security fix): a hostile .wtcockpit.toml rule's Message
+// using a TOML backslash-u escape can decode to real OSC/ANSI bytes, which
+// this terminal renderer must neutralize before printing — the same
+// treatment the TUI/web guardrail banners already give this exact input via
+// diffparse.SanitizeControl.
 func renderRules(eff guardrail.Effective) {
 	fmt.Printf("%s%srules%s  %s%s%s\n", bold, blue, reset, dim, eff.RepoPath, reset)
 	if eff.PackPath == "" {
 		fmt.Printf("  %spack%s  (none)\n", dim, reset)
 	} else {
-		fmt.Printf("  %spack%s  %s (%s)\n", dim, reset, eff.PackPath, eff.PackStatus)
+		fmt.Printf("  %spack%s  %s (%s)\n", dim, reset, eff.PackPath, diffparse.SanitizeControl(eff.PackStatus))
 	}
 	fmt.Println()
 	fmt.Printf("  %-24s %-7s %-7s %-40s %s\n", "NAME", "SEV", "SOURCE", "CONDITIONS", "MESSAGE")
 	for _, r := range eff.Rules {
 		fmt.Printf("  %-24s %-7s %-7s %-40s %s\n",
-			truncate(r.Name, 24), effectiveSeverity(r.Severity), r.Source, truncate(conditionsSummary(r.Rule), 40), r.Message)
+			truncate(diffparse.SanitizeControl(r.Name), 24), effectiveSeverity(r.Severity), r.Source,
+			truncate(conditionsSummary(r.Rule), 40), diffparse.SanitizeControl(r.Message))
 	}
 }
 
@@ -761,7 +777,10 @@ func effectiveSeverity(s string) string {
 
 // conditionsSummary renders a Rule's set condition fields as a compact,
 // greppable one-liner — cosmetic only (cmd/wt holds no guardrail logic of
-// its own; this just formats the wire type for display).
+// its own; this just formats the wire type for display). Sanitized as a
+// whole before return: several of these fields (path_glob(s), added_pattern)
+// are semi-trusted pack-authored text (HIGH security fix), same as Name/
+// Message above.
 func conditionsSummary(r guardrail.Rule) string {
 	var parts []string
 	add := func(format string, args ...any) { parts = append(parts, fmt.Sprintf(format, args...)) }
@@ -805,7 +824,7 @@ func conditionsSummary(r guardrail.Rule) string {
 	if len(parts) == 0 {
 		return "(none)"
 	}
-	return strings.Join(parts, " ")
+	return diffparse.SanitizeControl(strings.Join(parts, " "))
 }
 
 // ---- menubar: SwiftBar/xbar plugin emitter (P5-design.md §1.7) ----
@@ -874,7 +893,7 @@ func writeMenubar(w io.Writer, wts []model.Worktree, webAddr string) {
 		if label == "" {
 			continue // fully reviewed, no danger hit: nothing to draw attention to
 		}
-		line := wt.Repo + "/" + wt.Name + " — " + label
+		line := sanitizeMenubarField(wt.Repo) + "/" + sanitizeMenubarField(wt.Name) + " — " + label
 		if webAddr != "" {
 			line += " | href=" + roomURL(webAddr, wt.ID)
 		}
@@ -887,6 +906,22 @@ func writeMenubar(w io.Writer, wts []model.Worktree, webAddr string) {
 		openRow += " | href=http://" + webAddr + "/"
 	}
 	fmt.Fprintln(w, openRow)
+}
+
+// sanitizeMenubarField makes worktree-derived text (a repo directory name, a
+// branch name) safe to embed in a SwiftBar/xbar plugin line (BLOCKER-1
+// security fix): git permits a branch name to contain "|", and SwiftBar/xbar
+// splits a line on the FIRST "|" into title|params, where params include
+// bash=/shell= (run a command on click) or href= (open a URL) — SwiftBar has
+// no escape for a literal "|", so an agent-chosen branch name like
+// "feat|bash=/tmp/evil.sh" would otherwise become a clickable run-on-click
+// row for whoever installed the plugin. A repo directory name is
+// filesystem-derived and can carry arbitrary bytes, including raw control
+// bytes/newlines, on some platforms — diffparse.SanitizeControl (the same
+// rule every other renderer of untrusted worktree text already uses) turns
+// those into visible caret notation before the "|" substitution.
+func sanitizeMenubarField(s string) string {
+	return strings.ReplaceAll(diffparse.SanitizeControl(s), "|", "¦")
 }
 
 // menubarLabel is one worktree's row text, or "" when it needs no attention

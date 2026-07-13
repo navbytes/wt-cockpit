@@ -113,14 +113,19 @@ func (c *coalescer) accept(id string, hit model.GuardrailHit) (windowArmed bool)
 }
 
 // flush drains the current window into a flushResult and resets pending
-// state for the next window. cooldownUntil is deliberately NOT reset here —
-// P5-design.md §1.5's per-key cooldown spans windows; that's the point of a
-// 10-minute suppression versus a 5-second one.
+// state for the next window. cooldownUntil entries are NOT wholesale reset
+// here — P5-design.md §1.5's per-key cooldown spans windows; that's the
+// point of a 10-minute suppression versus a 5-second one — but any entry
+// whose deadline has already passed is pruned (pruneExpiredCooldowns): this
+// is a deltas-not-state design meant to run for a long daemon uptime, and
+// cooldownUntil is otherwise never trimmed, so it would otherwise grow with
+// every distinct (worktree,rule,file) key ever seen.
 func (c *coalescer) flush() flushResult {
 	defer func() {
 		c.pending = map[string]*group{}
 		c.order = nil
 	}()
+	c.pruneExpiredCooldowns()
 
 	if len(c.order) > stormThreshold {
 		storm := make([]string, len(c.order))
@@ -132,4 +137,15 @@ func (c *coalescer) flush() flushResult {
 		groups = append(groups, *c.pending[id])
 	}
 	return flushResult{Groups: groups}
+}
+
+// pruneExpiredCooldowns drops every cooldownUntil entry whose deadline has
+// already passed. Safe to delete while ranging over a Go map.
+func (c *coalescer) pruneExpiredCooldowns() {
+	now := c.now()
+	for k, until := range c.cooldownUntil {
+		if !now.Before(until) {
+			delete(c.cooldownUntil, k)
+		}
+	}
 }

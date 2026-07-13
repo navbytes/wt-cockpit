@@ -1,6 +1,8 @@
 package guardrail
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,20 @@ import (
 
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
+
+// captureGuardrailLogs redirects the default slog logger for the duration of
+// fn and returns everything logged as text — same pattern as
+// internal/notify/notify_test.go's captureLogs (test helpers aren't
+// importable across packages in this repo).
+func captureGuardrailLogs(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+	fn()
+	return buf.String()
+}
 
 func mustResolver(t *testing.T, rules []Rule, source string) *Resolver {
 	t.Helper()
@@ -171,6 +187,110 @@ func TestResolverPackRemovedRevertsToGlobal(t *testing.T) {
 	eff := r.Effective("wt1", repo)
 	if eff.PackStatus != "none" || len(eff.Rules) != 1 {
 		t.Errorf("after removing the pack, want packStatus=none and the global rule back, got %+v", eff)
+	}
+}
+
+// TestResolverEmptyOnDiskPackFileResolvesOK covers a genuine 0-byte
+// .wtcockpit.toml on disk (distinct from ParsePack(nil), which is a unit-level
+// check with no filesystem/Resolver involved): empty TOML is valid TOML, so
+// this must resolve as an in-effect-but-empty pack (packStatus "ok", PackPath
+// set), never "none" (which means "no file present at all") and never
+// "error:" (empty is not malformed).
+func TestResolverEmptyOnDiskPackFileResolvesOK(t *testing.T) {
+	repo := t.TempDir()
+	writePack(t, repo, "") // a real, empty (0-byte) file
+	r := mustResolver(t, []Rule{{Name: "a", PathGlob: "**"}}, "default")
+
+	eff := r.Effective("wt1", repo)
+	if eff.PackStatus != "ok" {
+		t.Errorf("PackStatus = %q, want ok (an empty file is valid TOML, not malformed)", eff.PackStatus)
+	}
+	if eff.PackPath == "" {
+		t.Error("PackPath should be set once an (empty) pack file is present on disk")
+	}
+	if len(eff.Rules) != 1 || eff.Rules[0].Name != "a" || eff.Rules[0].Source != "default" {
+		t.Errorf("an empty pack should leave the global rule set untouched, got %+v", eff.Rules)
+	}
+}
+
+// TestResolverMalformedPackLogsOncePerContentHashNotPerRefresh is the
+// "logged once" contract named in loadPack's own doc comment ("logs one
+// warning per (repo, pack-content-hash) — not per refresh"): touching the
+// pack file's mtime WITHOUT changing its (still-malformed) content must not
+// log a second time, but a genuinely different bad edit afterwards must.
+func TestResolverMalformedPackLogsOncePerContentHashNotPerRefresh(t *testing.T) {
+	repo := t.TempDir()
+	packPath := filepath.Join(repo, packFileName)
+	writePack(t, repo, "not valid [ toml")
+	r := mustResolver(t, []Rule{{Name: "a", PathGlob: "**"}}, "default")
+
+	logs1 := captureGuardrailLogs(t, func() { r.Effective("w1", repo) })
+	if got := strings.Count(logs1, "malformed .wtcockpit.toml"); got != 1 {
+		t.Fatalf("first resolve of a malformed pack: log occurrences = %d, want 1; logs=%s", got, logs1)
+	}
+
+	// Bump mtime only (identical content) — resolve() must re-invoke loadPack
+	// (its cache key is mtime+size), but the content-hash dedup must suppress
+	// a second identical warning.
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(packPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	logs2 := captureGuardrailLogs(t, func() {
+		eff := r.Effective("w1", repo)
+		if !strings.HasPrefix(eff.PackStatus, "error:") {
+			t.Fatalf("PackStatus = %q, want an error: prefix (still malformed)", eff.PackStatus)
+		}
+	})
+	if got := strings.Count(logs2, "malformed .wtcockpit.toml"); got != 0 {
+		t.Errorf("re-resolving the SAME malformed content (mtime bump only) logged again (%d occurrences), want 0 (dedup by content hash); logs=%s", got, logs2)
+	}
+
+	// A genuinely NEW bad edit (different content, and bigger, so mtime+size
+	// both change) must log again — the dedup is per content hash, not a
+	// blanket "never log again for this repo."
+	future2 := future.Add(2 * time.Second)
+	writePack(t, repo, "still not valid [ toml, but a different bad edit this time")
+	if err := os.Chtimes(packPath, future2, future2); err != nil {
+		t.Fatal(err)
+	}
+	logs3 := captureGuardrailLogs(t, func() { r.Effective("w1", repo) })
+	if got := strings.Count(logs3, "malformed .wtcockpit.toml"); got != 1 {
+		t.Errorf("a genuinely new malformed pack content should log again (%d occurrences), want 1; logs=%s", got, logs3)
+	}
+}
+
+// TestResolverPackDuplicateRuleNameWithinPackFailsClosedToGlobal is the
+// resolver-level, user-visible face of the MINOR-2 fix (see
+// TestMergePackWithDuplicateRuleNameSilentlyCollapsesToLastOne in
+// pack_test.go for the root-cause fix in Merge itself): a checked-in
+// .wtcockpit.toml whose own [[rules]] list has two entries sharing a name
+// now fails closed to the global rule set — packStatus names the duplicate
+// and logs once, exactly like any other malformed pack — instead of
+// silently keeping only the last entry with no error anywhere.
+func TestResolverPackDuplicateRuleNameWithinPackFailsClosedToGlobal(t *testing.T) {
+	repo := t.TempDir()
+	writePack(t, repo, "[[rules]]\n"+
+		"name = \"dup\"\n"+
+		"severity = \"warn\"\n"+
+		"path_glob = \"a/**\"\n\n"+
+		"[[rules]]\n"+
+		"name = \"dup\"\n"+
+		"severity = \"danger\"\n"+
+		"path_glob = \"b/**\"\n")
+	r := mustResolver(t, []Rule{{Name: "fallback-rule", PathGlob: "**"}}, "default")
+
+	var eff Effective
+	logs := captureGuardrailLogs(t, func() { eff = r.Effective("wt1", repo) })
+
+	if !strings.HasPrefix(eff.PackStatus, "error:") || !strings.Contains(eff.PackStatus, "dup") {
+		t.Fatalf("PackStatus = %q, want an error: prefix naming the duplicate rule %q", eff.PackStatus, "dup")
+	}
+	if len(eff.Rules) != 1 || eff.Rules[0].Name != "fallback-rule" || eff.Rules[0].Source != "default" {
+		t.Errorf("a pack with a duplicate rule name must fail closed to the global rules, got %+v", eff.Rules)
+	}
+	if got := strings.Count(logs, "malformed .wtcockpit.toml"); got != 1 {
+		t.Errorf("expected exactly one malformed-pack warning, got %d; logs=%s", got, logs)
 	}
 }
 

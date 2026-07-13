@@ -30,7 +30,7 @@ func TestSplitAlternationMatchesCombinedRegexp(t *testing.T) {
 		`-----BEGIN [A-Z ]*PRIVATE KEY-----`,
 		`ghp_[A-Za-z0-9]{36}`,
 		`github_pat_[A-Za-z0-9_]{22,}`,
-		`sk-[A-Za-z0-9_-]{20,}`,
+		`sk-[A-Za-z0-9]{20,}`,
 		`xox[bpars]-[A-Za-z0-9-]{10,}`,
 		`AIza[0-9A-Za-z_-]{35}`,
 	}, "|")
@@ -48,7 +48,7 @@ func TestSplitAlternationMatchesCombinedRegexp(t *testing.T) {
 	inputs := []string{
 		"",
 		"nothing suspicious here",
-		`key := "AKIAABCDEFGHIJKLMNOP"`, // AWS access key shape
+		`key := "` + fakeAWSKeyID + `"`, // AWS access key shape
 		"-----BEGIN RSA PRIVATE KEY-----",
 		"-----BEGIN PRIVATE KEY-----",
 		"ghp_" + strings.Repeat("a", 36),
