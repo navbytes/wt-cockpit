@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- Repo discovery filter: `include_repos` and `exclude_repos` config keys (glob patterns matched against repo folder basenames, stdlib `filepath.Match` syntax) filter which discovered repos the daemon watches. Include empty = all admitted; exclude always wins. A filtered-out repo is never watched/refreshed/notified, but its review marks and comments stay dormant in the store and return when un-hidden. Bad pattern = daemon refuses to start, naming it.
+- `wt stop` command: ask wtd to shut down gracefully (send SIGTERM) and wait up to 10 seconds for a clean exit. Exits 0 on success, 1 if not running. No HTTP shutdown endpoint — kill authority stays with the OS (guarantees a hard kill is always possible).
+- `wt status` now reports the daemon's pid and active repo discovery filter (if set). Filter shows both include= and exclude= patterns (or "(none)" for unset halves); the filter line omits when no filter is configured, preserving the unfiltered status output format.
 - Per-file review identity: review marks now survive commits. Only files whose content actually changed flip back to unreviewed; each file's hash includes git blob IDs for real content identity (including binary files).
 - fsnotify git-state-first watcher: watches `.git/HEAD`, `.git/index`, and refs for changes (with fallback to polling for network mounts). Enabled by default; use `-watch fsnotify|poll` to select.
 - Config file `~/.config/wtcockpit/config.toml` (or `$XDG_CONFIG_HOME/wtcockpit/config.toml`): define roots, per-repo base branch overrides, guardrail rules, and daemon options. Precedence: explicit flags > config file > built-in defaults. Config file present-but-malformed is a fatal error (typos in guardrails won't silently fail).

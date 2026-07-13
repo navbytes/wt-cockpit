@@ -74,16 +74,31 @@ go install github.com/navbytes/wt-cockpit/cmd/wtd@latest
 go install github.com/navbytes/wt-cockpit/cmd/wt@latest
 # or from a checkout:
 make build   # → bin/wtd, bin/wt
+```
 
-# start the daemon over one or more roots (uses fsnotify watcher by default)
-wtd -root ~/code -interval 1s &
+**Config-file workflow (recommended):**
 
-# the client (defaults to ~/.wtcockpit/wtd.sock; override with WTD_SOCKET)
+```sh
+# Create a config file once (see Configuration below for the full reference)
+mkdir -p ~/.config/wtcockpit
+cat > ~/.config/wtcockpit/config.toml <<'EOF'
+roots = ["~/code", "~/work"]
+base = "main"
+watch = "fsnotify"
+interval = "2s"
+EOF
+
+# Start the daemon (it reads the config file automatically)
+wtd &
+
+# Client commands (defaults to ~/.wtcockpit/wtd.sock; override with WTD_SOCKET)
 wt                          # on a terminal: full-screen TUI; piped/redirected: same as wt ls
 wt tui                      # explicit: always the full-screen TUI
 wt ls                       # radar: all worktrees, most-recently-changed first
 wt watch                    # live radar, re-renders on every change (SSE)
 wt diff <id>                # a worktree's structured diff
+wt status [--json]          # daemon health: version, pid, uptime, watcher, roots, review counts
+wt stop                     # shut down the daemon gracefully
 wt review <id> <file>       # mark a file reviewed (--off to unmark)
 wt approve <id>             # merge worktree→base & remove it (gated)
 wt refresh                  # force a rescan
@@ -91,6 +106,13 @@ wt comments <id> [--json]   # list comments left on a worktree (agents: see docs
 wt comment <id> <file> <line> <body...>   # leave one (line 0 = file-level)
 wt resolve <id> <comment-id>              # mark a comment addressed
 ```
+
+**One-off override** (for testing; `-root` replaces the config file's roots entirely):
+```sh
+wtd -root ~/tmpdir -interval 1s &
+```
+
+**Optional listeners:**
 
 `wtd -tcp 127.0.0.1:7799` additionally serves the same API over TCP (bind to a Tailscale
 interface for remote/phone viewing).
@@ -197,7 +219,7 @@ guide — the frozen `wt comments --json` schema, stale/orphaned semantics, and 
 ## Configuration
 
 Config file `~/.config/wtcockpit/config.toml` (or `$XDG_CONFIG_HOME/wtcockpit/config.toml`)
-defines roots, per-repo base branch overrides, guardrail rules, and daemon options.
+defines roots, per-repo base branch overrides, repo discovery filters, guardrail rules, and daemon options.
 Precedence: explicit flags > config file > built-in defaults. Malformed TOML is a fatal error.
 
 Example:
@@ -206,6 +228,12 @@ roots = ["~/code", "~/work"]
 base = "main"
 watch = "fsnotify"          # or "poll" to disable file watching
 interval = "2s"
+
+# Repo discovery filters (optional): globs matched against repo folder basenames.
+# Both empty = no filter (watch all repos). Exclude always wins over include.
+# Bad pattern = daemon refuses to start, naming the pattern. Restart to apply changes.
+include_repos = ["api-*", "web-*"]     # watch only repos matching at least one pattern
+exclude_repos = ["archive-*", "test-*"]  # never watch these, even if include matches
 
 [repos."/home/user/code/api"]
 base = "develop"            # per-repo override
@@ -216,9 +244,58 @@ severity = "warn"
 path_glob = "**/*.yaml"
 ```
 
+**Repo discovery filters** (`include_repos` / `exclude_repos`):
+- Globs matched against each repo's folder **basename** (not the full path).
+- Syntax: stdlib `filepath.Match` — `*` (any chars), `?` (any single char), `[abc]` (char class).
+  No `**` (recursive) or regex.
+- `include_repos` empty or unset = admit all repos; non-empty = admit only repos matching
+  at least one pattern.
+- `exclude_repos` = never watch these repos, even if they matched `include_repos`.
+- Bad pattern (e.g. unterminated `[` class) = daemon refuses to start, exits with the error.
+  Restart to apply after fixing it.
+- A filtered-out repo is never watched, refreshed, or notified — but its review marks and
+  comments stay dormant in the store and reappear if you un-hide the repo later.
+
 See [docs/config.example.toml](docs/config.example.toml) for the full reference.
 Use `-config /path/to/config.toml` to specify a custom location, or `-watch fsnotify|poll`
 to override the watcher backend at runtime.
+
+## Stopping wtd
+
+The daemon is meant to stay running for weeks. To shut it down:
+
+**Foreground mode** (if started as `wtd` or `wtd &` on the terminal):
+```sh
+# In the terminal where wtd is running:
+Ctrl-C
+```
+
+**Any mode** (reliable, preferred):
+```sh
+wt stop
+```
+Sends SIGTERM to the daemon, waits up to 10 seconds for a clean exit, prints `wtd (pid
+<N>) stopped` on success, and exits 0. If the daemon isn't running, exits 1 with a message.
+On Windows, prints guidance (SIGTERM isn't available there); use the terminal's task
+manager to stop it instead.
+
+**Service installs** (launchd / systemd):
+
+macOS (launchd):
+```sh
+launchctl bootout gui/$UID/com.wtcockpit.wtd   # stop + unload
+launchctl kickstart -k gui/$UID/com.wtcockpit.wtd   # restart
+```
+launchd has a `KeepAlive` setting that restarts the daemon if it crashes, but not on
+a clean exit — this is why `wt stop` works reliably under it. See
+[packaging/README.md](packaging/README.md) for full install/setup instructions.
+
+Linux (systemd user unit):
+```sh
+systemctl --user stop wtd.service
+systemctl --user restart wtd.service
+```
+See [packaging/README.md](packaging/README.md) for full install/setup instructions.
 
 ## Persistence
 
