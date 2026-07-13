@@ -8,6 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
 // approveModal is the `a` confirm dialog's tiny state machine (P3-design.md
@@ -24,6 +26,7 @@ type approveModal struct {
 	id              string
 	branch, base    string
 	reviewed, total int
+	dirty           bool // Worktree.State == StateDirty as of openApprove — the client's own pre-warn for the daemon's clean-tree gate (ux-expert P3-cheap)
 	submitting      bool
 	errMsg          string // daemon's 409/error body verbatim; non-empty keeps the modal open
 }
@@ -54,6 +57,7 @@ func (m appModel) openApprove() (tea.Model, tea.Cmd) {
 		open: true, id: w.ID,
 		branch: w.Branch, base: w.Base,
 		reviewed: reviewed, total: total,
+		dirty: w.State == model.StateDirty,
 	}
 	return m, nil
 }
@@ -109,17 +113,28 @@ func approveCmd(ctx context.Context, api apiClient, id string) tea.Cmd {
 // line, the client's own gate knowledge, what the daemon enforces, and —
 // only once a submit has been refused — the daemon's message verbatim in
 // red. Composed entirely from styles.go's existing named tokens (frozen);
-// the outer box is a bare, colorless Padding-only style, matching how
-// app.go/diffview.go already use bare lipgloss.NewStyle() for layout.
+// the outer box is styles.Card, a bordered card style (ux-expert P3-cheap —
+// previously a bare, colorless Padding-only style with no visible edge).
+//
+// The reviewed line is joined by a second gate line, ✓/✗ clean tree, from
+// the one dirty-tree signal the client already has (Worktree.State as of
+// openApprove) — a pre-warn for the daemon's own clean-tree gate, not a new
+// check of its own (the daemon still decides; this just tells the user what
+// it's likely to say before they submit and wait on a round trip to find out).
 func renderApproveModal(width, height int, a approveModal) string {
 	mark := styles.Del.Render("✗")
 	if a.total > 0 && a.reviewed >= a.total {
 		mark = styles.Add.Render("✓")
 	}
+	cleanMark := styles.Add.Render("✓")
+	if a.dirty {
+		cleanMark = styles.Del.Render("✗")
+	}
 	lines := []string{
 		styles.Txt.Bold(true).Render(fmt.Sprintf("merge %s → %s", a.branch, a.base)),
 		"",
 		fmt.Sprintf("%s reviewed %d/%d", mark, a.reviewed, a.total),
+		fmt.Sprintf("%s clean tree", cleanMark),
 		styles.Dim.Render("daemon enforces: full review · clean tree · clean merge"),
 	}
 	if a.submitting {
@@ -130,6 +145,6 @@ func renderApproveModal(width, height int, a approveModal) string {
 	}
 	lines = append(lines, "", styles.Dim.Render("⏎ submit   esc cancel"))
 
-	card := lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(lines, "\n"))
+	card := styles.Card.Render(strings.Join(lines, "\n"))
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, card)
 }

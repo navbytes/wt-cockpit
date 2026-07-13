@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
@@ -382,5 +383,67 @@ func TestDiffviewRenderFrameStaysWithinBudget(t *testing.T) {
 	}
 	if best > budget {
 		t.Errorf("best-of-5 render() took %v, want under %v (design budget: <16ms; WP2 measured ~576µs)", best, budget)
+	}
+}
+
+// ---- security: untrusted diff content vs. the render path ----
+
+// TestRenderNeutralizesEmbeddedTerminalEscapeSequencesInDiffContent was
+// DEFECT D2 (fixed): wt-cockpit renders diff *content* it never wrote — a
+// hostile agent worktree's tracked files can contain arbitrary bytes,
+// including raw ANSI/OSC escape sequences (a "set window title" OSC, a
+// cursor-repositioning CSI, etc.). flattenDiff (internal/tui/flatten.go) now
+// runs every hunk-header/code-content string through
+// diffparse.SanitizeControl before it ever reaches a render call, so a
+// hostile ESC byte embedded in diff content is neutralized (visible caret
+// notation) before it reaches the rendered frame a real terminal receives —
+// verified here even with an empty highlight cache (the plain fallback
+// path), which is what actually renders the instant a diff loads.
+func TestRenderNeutralizesEmbeddedTerminalEscapeSequencesInDiffContent(t *testing.T) {
+	const evilTitle = "\x1b]0;PWNED\x07"          // OSC: retitle the user's terminal
+	const evilCursorMove = "\x1b[2J\x1b[999;999H" // CSI: clear screen + move cursor
+
+	v := &diffview{}
+	v.setDiff(model.Diff{Files: []model.DiffFile{
+		{
+			Path: "evil.go", Hash: "h1", Status: model.FileModified,
+			Hunks: []model.Hunk{{Header: "@@ -1,1 +1,1 @@", Lines: []model.Line{
+				line(model.LineAdd, 0, 1, "safe_prefix"+evilTitle+"mid"+evilCursorMove+"safe_suffix"),
+			}}},
+		},
+	}})
+
+	// The plain (no chroma cache) fallback -- what actually renders the
+	// instant a diff loads, and forever for files above the chroma threshold
+	// or with no matching lexer.
+	out := v.render(80, 24, newHighlightCache(), nil)
+	if strings.Contains(out, evilTitle) {
+		t.Errorf("rendered frame contains a raw OSC \"set title\" sequence verbatim: %q", out)
+	}
+	if strings.Contains(out, evilCursorMove) {
+		t.Errorf("rendered frame contains a raw cursor-repositioning/clear-screen CSI verbatim: %q", out)
+	}
+}
+
+// TestFitWidthNeverSplitsAMultiByteRuneOrProducesInvalidUTF8 pins the diff
+// pane's code-column truncation (fitWidth, WP2) against wide CJK runes and
+// multi-byte emoji: the code column must never truncate mid-rune (which
+// would corrupt the byte stream) and must account for double-width runes
+// when padding/truncating so the row still lands on exactly `width` cells.
+// Regression guard, not a defect: lipgloss's rune-aware MaxWidth/Width
+// (confirmed here) already gets this right.
+func TestFitWidthNeverSplitsAMultiByteRuneOrProducesInvalidUTF8(t *testing.T) {
+	cases := []string{
+		"日本語のテキストです日本語のテキストです",                  // wide CJK runes throughout
+		"emoji test 🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉 more text after", // multi-byte emoji mid-string
+		"café 日本語 mixed ASCII and wide runes",
+	}
+	for _, s := range cases {
+		for width := 0; width <= 20; width++ {
+			out := fitWidth(s, width)
+			if !utf8.ValidString(out) {
+				t.Errorf("fitWidth(%q, %d) = %q is not valid UTF-8 (mid-rune split)", s, width, out)
+			}
+		}
 	}
 }

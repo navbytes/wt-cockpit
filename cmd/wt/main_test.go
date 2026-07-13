@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,31 @@ func TestDefaultCommandTTYRunsTUI(t *testing.T) {
 func TestDefaultCommandNonTTYRunsLs(t *testing.T) {
 	if got := defaultCommand(false); got != "ls" {
 		t.Errorf("defaultCommand(false) = %q, want %q", got, "ls")
+	}
+}
+
+// TestDefaultCommandIgnoresStdinEntirelyEvenWhenRedirected pins the
+// "cron-ish edge" from P3-design.md §2.1: stdout TTY-ness is bare `wt`'s
+// *only* signal ("if stdout is a TTY -> tui"), with no stdin carve-out
+// anywhere in the design or in isTerminal/defaultCommand's signatures. This
+// makes the intended behavior for a stdout-TTY-but-stdin-non-TTY combination
+// (e.g. `wt </dev/null` at a real terminal, or any wrapper that reattaches a
+// tty to stdout while redirecting stdin) explicit and pinned: it still opens
+// the TUI, exactly like an ordinary interactive invocation, because
+// defaultCommand structurally has no way to see stdin at all -- it takes a
+// single bool. Redirecting os.Stdin here is a belt-and-suspenders way of
+// making that structural fact concrete rather than merely asserted.
+func TestDefaultCommandIgnoresStdinEntirelyEvenWhenRedirected(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("opening %s: %v", os.DevNull, err)
+	}
+	defer devNull.Close()
+	savedStdin := os.Stdin
+	os.Stdin = devNull
+	defer func() { os.Stdin = savedStdin }()
+
+	if got := defaultCommand(true); got != "tui" {
+		t.Errorf("defaultCommand(true) with a non-TTY stdin = %q, want %q (stdout alone decides; stdin is never consulted)", got, "tui")
 	}
 }

@@ -8,7 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -90,6 +92,8 @@ type appModel struct {
 	approve     approveModal
 	diffFocused bool // true once ⏎ has focused the diff pane (scroll keys act on it)
 	toast       string
+	toastOK     bool // true for a success toast (rendered in styles.Ok, not Warn — ux-expert P3-cheap)
+	toastGen    int  // bumped by setToast; guards a stale expireToastAfter timer from clearing a newer toast
 }
 
 // Run resolves the real client and runs the program until the user quits.
@@ -204,18 +208,18 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case reviewErrMsg:
 		cmd := m.radar.applyReviewErr(m.ctx, m.api, msg)
+		var toastCmd tea.Cmd
 		if msg.Conflict {
-			m.toast = fmt.Sprintf("%s changed since you viewed it — diff refreshed", msg.File)
+			toastCmd = m.setToast(fmt.Sprintf("%s changed since you viewed it — diff refreshed", msg.File))
 		} else {
-			m.toast = msg.Err.Error()
+			toastCmd = m.setToast(msg.Err.Error())
 		}
-		return m, tea.Batch(cmd, expireToastAfter(4*time.Second))
+		return m, tea.Batch(cmd, toastCmd)
 
 	case approveOKMsg:
 		m.approve = approveModal{}
 		m.screen = screenRadar
-		m.toast = fmt.Sprintf("✓ merged %s → %s, worktree removed", msg.Res.Merged, msg.Res.Into)
-		return m, expireToastAfter(4 * time.Second)
+		return m, m.setToastOK(fmt.Sprintf("✓ merged %s → %s, worktree removed", msg.Res.Merged, msg.Res.Into))
 
 	case approveErrMsg:
 		m = m.applyApproveErr(msg)
@@ -223,28 +227,26 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tmuxDoneMsg:
 		if msg.Err != nil {
-			m.toast = msg.Err.Error()
-			return m, expireToastAfter(4 * time.Second)
+			return m, m.setToast(msg.Err.Error())
 		}
 		return m, nil
 
 	case listErrMsg:
 		if !isUnreachable(msg.Err) {
-			m.toast = msg.Err.Error()
-			return m, expireToastAfter(4 * time.Second)
+			return m, m.setToast(msg.Err.Error())
 		}
 		return m, nil
 
 	case refreshDoneMsg:
 		if msg.Err != nil {
-			m.toast = msg.Err.Error()
-		} else {
-			m.toast = "refreshed"
+			return m, m.setToast(msg.Err.Error())
 		}
-		return m, expireToastAfter(4 * time.Second)
+		return m, m.setToastOK("refreshed")
 
 	case toastExpiredMsg:
-		m.toast = ""
+		if msg.Gen == m.toastGen {
+			m.toast = ""
+		}
 		return m, nil
 
 	case tickMsg:
@@ -432,7 +434,7 @@ func setReviewedCmd(ctx context.Context, api apiClient, id, file string, reviewe
 			return reviewOKMsg{ID: id, File: file, Reviewed: reviewed}
 		}
 		var conflict *client.ConflictError
-		return reviewErrMsg{ID: id, File: file, Conflict: errors.As(err, &conflict), Err: err}
+		return reviewErrMsg{ID: id, File: file, Conflict: errors.As(err, &conflict), Reviewed: reviewed, Err: err}
 	}
 }
 
@@ -553,13 +555,68 @@ func tick() tea.Cmd {
 	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func expireToastAfter(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(time.Time) tea.Msg { return toastExpiredMsg{} })
+// setToast records a new transient status-line message (rendered in the
+// keybar's warn style — the default for errors/notices) and arms its
+// auto-expiry, stamped with the generation current as of this call —
+// expireToastAfter's fired message carries that same stamp forward, so a
+// still-pending timer from an already-superseded toast can't clear this (or
+// any later) toast out from under it; see toastExpiredMsg's case in Update.
+func (m *appModel) setToast(msg string) tea.Cmd { return m.setToastKind(msg, false) }
+
+// setToastOK is setToast for a success (rendered in styles.Ok, not Warn —
+// ux-expert P3-cheap: a completed approve or refresh isn't a warning).
+func (m *appModel) setToastOK(msg string) tea.Cmd { return m.setToastKind(msg, true) }
+
+func (m *appModel) setToastKind(msg string, ok bool) tea.Cmd {
+	m.toast = msg
+	m.toastOK = ok
+	m.toastGen++
+	return expireToastAfter(4*time.Second, m.toastGen)
+}
+
+func expireToastAfter(d time.Duration, gen int) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return toastExpiredMsg{Gen: gen} })
+}
+
+// ---- debug-only first-paint timing (WT_TUI_TIMING; unset in normal use) ----
+
+var processStart = time.Now()
+var shellPaintOnce, populatedPaintOnce sync.Once
+
+// recordTiming appends one "<event> <ms since process start>" line to the
+// file named by WT_TUI_TIMING, for honestly measuring first-paint latency
+// (direct PTY vs. tmux) from outside the process. Both call sites below are
+// each guarded by their own sync.Once, so this runs at most twice per
+// process and is otherwise never invoked — zero cost with the env unset.
+func recordTiming(event string) {
+	path := os.Getenv("WT_TUI_TIMING")
+	if path == "" {
+		return
+	}
+	if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		fmt.Fprintf(f, "%s %d\n", event, time.Since(processStart).Milliseconds())
+		f.Close()
+	}
+}
+
+// populated reports whether this frame shows real worktree+diff data for the
+// selected worktree, rather than a loading placeholder — the
+// "populated_paint" moment.
+func (m appModel) populated() bool {
+	if !m.sidebar.hasData {
+		return false
+	}
+	w, ok := m.sidebar.selected()
+	return !ok || m.radar.diffErr != "" || m.radar.pane.diff.WorktreeID == w.ID
 }
 
 // ---- View ----
 
 func (m appModel) View() string {
+	shellPaintOnce.Do(func() { recordTiming("shell_paint") })
+	if m.populated() {
+		populatedPaintOnce.Do(func() { recordTiming("populated_paint") })
+	}
 	switch {
 	case m.width == 0 && m.height == 0:
 		// First frame, rendered before Bubble Tea's own initial
@@ -573,7 +630,7 @@ func (m appModel) View() string {
 		card := styles.FatalCard.Render("protocol mismatch\n\n" + m.fatal + "\n\nany key exits")
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, card)
 	case m.approve.open:
-		return renderApproveModal(m.width, m.height, m.approve)
+		return m.approveView()
 	case !m.sidebar.hasData && (m.conn == connDown || m.conn == connReconnecting):
 		return m.downCardView()
 	default:
@@ -581,8 +638,31 @@ func (m appModel) View() string {
 	}
 }
 
+// approveView composes the confirm modal *over* the still-visible topbar
+// rather than fully replacing the screen (ux-expert P3-cheap: View() used to
+// just `return renderApproveModal(...)`, replacing everything): the topbar
+// carries the connection chip, and a daemon drop while the user is mid-
+// confirm must stay visible, not vanish behind a full-screen modal that
+// shows no connection state at all.
+func (m appModel) approveView() string {
+	top := renderTopbar(m.width, m.sidebar.worktrees(), m.conn, m.connAttempt, m.screen)
+	bodyH := m.height - lipgloss.Height(top)
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	modal := renderApproveModal(m.width, bodyH, m.approve)
+	return lipgloss.JoinVertical(lipgloss.Left, top, modal)
+}
+
 func (m appModel) downCardView() string {
-	lines := []string{fmt.Sprintf("cannot reach wtd at %s — is it running? (wtd -root ~/code)", m.socket)}
+	lines := []string{
+		fmt.Sprintf("cannot reach wtd at %s — is it running?", m.socket),
+		// ux-expert P3-cheap: the old copy embedded a literal, copy-pasteable
+		// "(wtd -root ~/code)" — a real footgun if the user's actual code
+		// lives anywhere else and runs it verbatim. This can't be mis-run: it
+		// names the flag and the config alternative, not a specific path.
+		styles.Dim.Render("start wtd with your roots — wtd -root <dir> or config.toml"),
+	}
 	switch m.conn {
 	case connConnecting:
 		lines = append(lines, "", fmt.Sprintf("connecting… attempt %d", m.connAttempt))
@@ -601,15 +681,15 @@ func (m appModel) shellView() string {
 		bodyH = 1
 	}
 
-	top := renderTopbar(m.width, m.sidebar.worktrees(), m.conn, m.screen)
-	side := m.sidebar.view(sidebarWidth, bodyH)
+	top := renderTopbar(m.width, m.sidebar.worktrees(), m.conn, m.connAttempt, m.screen)
+	side := m.sidebar.view(sidebarWidth, bodyH, m.conn)
 	mainWidth := m.width - sidebarWidth
 	if mainWidth < 0 {
 		mainWidth = 0
 	}
 	main := m.mainPaneView(mainWidth, bodyH)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, side, main)
-	keybar := renderKeybar(m.width, m.screen, m.toast)
+	keybar := renderKeybar(m.width, m.screen, m.diffFocused, m.toast, m.toastOK)
 
 	return lipgloss.JoinVertical(lipgloss.Left, top, body, keybar)
 }
@@ -625,5 +705,5 @@ func (m appModel) mainPaneView(width, height int) string {
 	if m.screen == screenReview {
 		return m.review.view(width, height, w, &m.radar)
 	}
-	return m.radar.view(width, height, w)
+	return m.radar.view(width, height, w, m.diffFocused, false)
 }

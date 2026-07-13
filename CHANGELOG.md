@@ -14,6 +14,8 @@
 ### Fixed
 - Unicode and space-containing filenames in diffs are now decoded correctly (core.quotePath handling).
 - Approve gate now re-diffs the worktree under lock before merging, preventing a commit landing between review and approve from bypassing the gated write path.
+- **Security:** raw control bytes (including terminal escape sequences) in diff content, hunk headers, and file paths are now neutralized to visible caret notation (e.g. ESC → `^[`) before rendering, instead of passing through byte-for-byte. A worktree's tracked files/names are untrusted input — a hostile agent worktree could previously retitle your terminal, move the cursor, or worse, just by being displayed in `wt diff` or the TUI's diff pane. Side effect: the per-file review hash (which covers content) changes for any file that contained a raw control byte, so review marks on such files (rare in real code) reset once.
+- Diff parsing no longer mistakes a deleted or added file's own content for a `--- `/`+++ ` path header when that content itself starts with `-- `/`++ ` — byte-identical to the header prefix once git's per-line delete/add marker is prepended — which previously corrupted the file's path and undercounted its stats. Per-file hashes shift for any file that hit this (a correctness fix, not data loss; review marks on such files, if any, reset once).
 
 ### Changed
 - Review state schema is new (`reviewed_files` field); v0.1 review state is dropped silently on first load (migration is automatic, no user action needed).

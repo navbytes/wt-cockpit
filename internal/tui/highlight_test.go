@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
@@ -348,5 +349,44 @@ func TestHighlightCmdProducesLinesMatchingRealChromaOutput(t *testing.T) {
 	}
 	if _, ok := r.hl.get("hgo"); !ok {
 		t.Error("cache should now hold hgo's highlighted lines")
+	}
+}
+
+// TestHighlightCmdMisdetectedLexerStillProducesLineAlignedSafeOutput covers
+// "a file whose language chroma misdetects": lexers.Match picks by path/
+// extension, so a mismatched or ambiguous extension (or a polyglot file) can
+// hand chroma content that doesn't actually match the chosen grammar. This
+// pins that the async path still degrades safely rather than erroring out or
+// corrupting the line count highlightedMsg promises (one entry per source
+// line, indexed by codeIdx) -- chroma's own lexers fall back to plain/error
+// tokens for anything they can't classify, they don't fail the whole
+// tokenize.
+func TestHighlightCmdMisdetectedLexerStillProducesLineAlignedSafeOutput(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	// main.py's extension selects the Python lexer, but the content is
+	// actually a shell script -- a plausible misdetection (wrong extension,
+	// or a polyglot/templated file).
+	src := "#!/bin/sh\nset -e\nfor f in *.txt; do\n  echo \"$f\"\ndone\n"
+	lexer := lexers.Match("main.py")
+	if lexer == nil {
+		t.Fatal("precondition: expected a lexer match for main.py")
+	}
+
+	msg := highlightCmd("hash1", src, lexer)()
+	hm, ok := msg.(highlightedMsg)
+	if !ok {
+		t.Fatalf("highlightCmd result = %#v (%T), want a highlightedMsg even for mismatched lexer/content", msg, msg)
+	}
+	const wantLines = 5
+	if len(hm.Lines) != wantLines {
+		t.Errorf("Lines = %d, want %d -- a misdetected lexer must not drop/merge source lines", len(hm.Lines), wantLines)
+	}
+	for i, l := range hm.Lines {
+		if !strings.Contains(stripANSI(l), strings.TrimSpace(strings.Split(src, "\n")[i])) {
+			t.Errorf("line %d = %q (visible %q), want it to still contain the original source text", i, l, stripANSI(l))
+		}
 	}
 }

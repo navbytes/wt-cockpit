@@ -322,16 +322,20 @@ func matchesFilter(w model.Worktree, query string, activeOnly bool) bool {
 		strings.Contains(strings.ToLower(w.Branch), q)
 }
 
-// view renders the sidebar into a width-constrained block. WP1: plain rows
-// (state dot, name, agent chip, relative time, +add -del); the mock's ⚠
-// guardrail badge coloring by worst severity, and virtualized scrolling for
-// more rows than height, are WP2/WP3 polish once the diff pane makes a
-// taller sidebar worth scrolling. WP3 adds the "/" search input (shown only
-// while focused) and a dim status line once a query/active-only filter is
-// applied but no longer being typed.
-func (s *sidebar) view(width, height int) string {
+// view renders the sidebar into a width-constrained block. Rows are the
+// mock's two-line layout (renderSidebarRow, ux-expert P1-1). WP3 adds the
+// "/" search input (shown only while focused) and a dim status line once a
+// query/active-only filter is applied but no longer being typed. conn drives
+// the header's LIVE/PAUSED truthfulness (ux-expert P2-4): while a mid-session
+// SSE reconnect is in flight, the data on screen is stale, and the header
+// says so instead of silently claiming LIVE.
+func (s *sidebar) view(width, height int, conn connState) string {
 	var b strings.Builder
-	fmt.Fprintln(&b, styles.Faint.Render("WORKTREES · LIVE"))
+	header, headerStyle := "WORKTREES · LIVE", styles.Faint
+	if conn == connReconnecting {
+		header, headerStyle = "WORKTREES · PAUSED", styles.Warn
+	}
+	fmt.Fprintln(&b, headerStyle.Render(header))
 
 	switch {
 	case s.searching():
@@ -347,7 +351,7 @@ func (s *sidebar) view(width, height int) string {
 	case len(rows) == 0 && len(s.rows) > 0:
 		fmt.Fprint(&b, styles.Dim.Render("  no worktrees match the filter"))
 	case len(rows) == 0:
-		fmt.Fprint(&b, styles.Dim.Render("  no worktrees — wtd -root <dir>"))
+		fmt.Fprint(&b, styles.Dim.Render("  no worktrees — wtd -root <dir> or edit ~/.config/wtcockpit/config.toml"))
 	default:
 		for i, r := range rows {
 			if i > 0 {
@@ -357,27 +361,101 @@ func (s *sidebar) view(width, height int) string {
 				fmt.Fprint(&b, styles.RepoHeader.Render(r.repo))
 				continue
 			}
-			fmt.Fprint(&b, renderSidebarRow(r.wt, r.wt.ID == s.selectedID))
+			fmt.Fprint(&b, renderSidebarRow(r.wt, r.wt.ID == s.selectedID, width))
 		}
 	}
 	return lipgloss.NewStyle().Width(width).Height(height).Render(b.String())
 }
 
-func renderSidebarRow(w model.Worktree, selected bool) string {
+// renderSidebarRow is the mock's two-line worktree row (ux-expert P1-1,
+// P3-design.md §1.1's ASCII sketch):
+//
+//	● name                    +240 −96
+//	  [chip] 3s ago  8 files ⚠
+//
+// Every piece is packed via packRow, which *guarantees* each line is exactly
+// width display cells regardless of how long the name/agent/age/counts are —
+// the previous single-line row had no such guarantee, so an ordinary name
+// (or the selected row's own left border) could push a line one cell past
+// the sidebar's fixed width. lipgloss's Width-wrap (not truncate) then
+// silently wrapped that row's overflow onto a new visual line inside the
+// sidebar's own column — and since relativeTime's text grows a character at
+// various points ("9s ago" -> "10s ago"), a row already right at the edge
+// could start wrapping on a later tick with no other state change: the
+// "reflow on clock tick" bug this rewrite kills by construction (see
+// TestRenderSidebarRowAlwaysExactlyTwoLinesWithinRailWidth).
+func renderSidebarRow(w model.Worktree, selected bool, width int) string {
+	contentWidth := width
+	if selected {
+		contentWidth-- // the accent border below owns one column of its own
+	}
+	if contentWidth < 0 {
+		contentWidth = 0
+	}
+
 	dot := stateDotStyle(w.State).Render("●")
-	name := styles.Txt.Render(clampWidth(w.Name, 24))
+	nameStyle := styles.Txt
+	if selected {
+		nameStyle = nameStyle.Bold(true) // mock's ".wt.sel .name{color:#fff}" — brighter, via weight
+	}
+	name := nameStyle.Render(w.Name)
+	stats := styles.Add.Render(fmt.Sprintf("+%d", w.Stats.Add)) + " " + styles.Del.Render(fmt.Sprintf("-%d", w.Stats.Del))
+	line1 := packRow(fmt.Sprintf(" %s %s", dot, name), stats, contentWidth)
+
 	agent := agentChipStyle(w.Agent).Render(string(w.Agent))
 	age := styles.Dim.Render(relativeTime(w.LastChange))
-	stats := styles.Add.Render(fmt.Sprintf("+%d", w.Stats.Add)) + " " + styles.Del.Render(fmt.Sprintf("-%d", w.Stats.Del))
-	badge := ""
-	if len(w.Guardrails) > 0 {
-		badge = " " + styles.Warn.Render("⚠")
+	right2 := styles.Dim.Render(fmt.Sprintf("%d files", w.Stats.Files))
+	if badge := severityBadge(w.Guardrails); badge != "" {
+		right2 += " " + badge
 	}
-	row := fmt.Sprintf(" %s %s  %s  %s  %s%s", dot, name, agent, age, stats, badge)
-	if selected {
-		return styles.SelectedRow.Render(row)
+	line2 := packRow(fmt.Sprintf("   %s %s", agent, age), right2, contentWidth)
+
+	if !selected {
+		return line1 + "\n" + line2
 	}
-	return row
+	border := styles.Accent.Render("│")
+	bg := bgPrefix(styles.SelectedBg)
+	return border + tintRow(bg, line1) + "\n" + border + tintRow(bg, line2)
+}
+
+// severityBadge is the sidebar row's ⚠ guardrail indicator (ux-expert
+// P2-6/P3-design.md §1.1): worst severity wins — red ("danger" style) if any
+// hit is severity "danger", else amber warn. Empty when there are no hits.
+func severityBadge(hits []model.GuardrailHit) string {
+	if len(hits) == 0 {
+		return ""
+	}
+	for _, h := range hits {
+		if h.Severity == "danger" {
+			return styles.Del.Render("⚠")
+		}
+	}
+	return styles.Warn.Render("⚠")
+}
+
+// packRow lays left flush-start and right flush-end within *exactly* width
+// display columns (ux-expert P1-1) — never wraps, never overshoots. left
+// (the name, or the agent+age pair) is unbounded in principle, so it's
+// clipped first to whatever room remains once right (a short, bounded
+// handful of digits/glyphs) has taken its share; fitWidth is then a hard
+// backstop that pads or truncates the joined result to exactly width, the
+// same never-wrap contract every other row/header in this package already
+// follows (diffview.go's clipWidth/fitWidth).
+func packRow(left, right string, width int) string {
+	if width < 0 {
+		width = 0
+	}
+	rw := lipgloss.Width(right)
+	budget := width - rw - 1 // 1-col minimum gap between left and right
+	if budget < 0 {
+		budget = 0
+	}
+	left = clipWidth(left, budget)
+	gap := width - lipgloss.Width(left) - rw
+	if gap < 0 {
+		gap = 0
+	}
+	return fitWidth(left+strings.Repeat(" ", gap)+right, width)
 }
 
 func stateDotStyle(s model.WorktreeState) lipgloss.Style {
@@ -420,15 +498,17 @@ func relativeTime(t time.Time) string {
 	}
 }
 
-// clampWidth is a byte-length clamp (ellipsize), matching cmd/wt's existing
-// truncate helper. Rune/wide-char-aware truncation (P3-design.md §1.2) is a
-// WP2/WP3 polish item once real narrow-terminal layouts are being tuned.
+// clampWidth ellipsizes s to at most n display cells. Reuses diffview.go's
+// clipWidth (lipgloss's rune/display-width-aware MaxWidth, already proven
+// safe with CJK/wide runes by TestFitWidthNeverSplitsAMultiByteRuneOrProducesInvalidUTF8)
+// rather than the previous byte-length clamp, which could slice a multibyte
+// rune in half and corrupt the UTF-8 stream for any non-ASCII worktree name.
 func clampWidth(s string, n int) string {
-	if len(s) <= n {
+	if lipgloss.Width(s) <= n {
 		return s
 	}
 	if n <= 1 {
-		return s[:n]
+		return clipWidth(s, n)
 	}
-	return s[:n-1] + "…"
+	return clipWidth(s, n-1) + "…"
 }

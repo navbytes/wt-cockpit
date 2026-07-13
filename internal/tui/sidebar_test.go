@@ -1,8 +1,13 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
@@ -369,5 +374,147 @@ func TestMoveUpDownOperateOverFilteredRows(t *testing.T) {
 	s.moveUp()
 	if s.selectedID != "a3" {
 		t.Errorf("selectedID = %q, want back to a3", s.selectedID)
+	}
+}
+
+// ---- clampWidth ----
+
+// TestClampWidthNeverSplitsAMultiByteRuneWithCJKName is the nit fix: the old
+// byte-length clamp could cut a CJK worktree name mid-rune, corrupting the
+// UTF-8 stream. clampWidth now measures/truncates by display width instead
+// (reusing diffview.go's clipWidth), matching the same proof
+// TestFitWidthNeverSplitsAMultiByteRuneOrProducesInvalidUTF8 already gives
+// for the diff pane's own truncation.
+func TestClampWidthNeverSplitsAMultiByteRuneWithCJKName(t *testing.T) {
+	const name = "日本語のワークツリー名前" // wide CJK runes throughout
+	for n := 0; n <= 24; n++ {
+		out := clampWidth(name, n)
+		if !utf8.ValidString(out) {
+			t.Errorf("clampWidth(%q, %d) = %q is not valid UTF-8 (mid-rune split)", name, n, out)
+		}
+	}
+}
+
+// ---- renderSidebarRow: the ux-expert P1-1 two-line row rewrite ----
+
+// TestRenderSidebarRowAlwaysExactlyTwoLinesWithinRailWidth is P1-1's property
+// test: whatever the name/agent/age/stat/badge content, a row must render as
+// exactly two lines, neither exceeding sidebarWidth. This is the root-cause
+// fix for "the sidebar reflows on a clock tick": a live capture showed the
+// selected row's own left border pushing a 34-col rail to 35, past what the
+// sidebar's outer `lipgloss.Style.Width` will pad (it *wraps* an overlong
+// line instead) — and since relativeTime's text grows a character at some
+// ages ("9s ago" -> "10s ago"), a row already at the edge could start
+// wrapping on a later tick alone, no other state change. Every row (and its
+// selected variant, whose border eats one of the same width columns) must
+// hold the budget regardless of a long CJK name, huge stat counts, or a
+// tripped guardrail badge.
+func TestRenderSidebarRowAlwaysExactlyTwoLinesWithinRailWidth(t *testing.T) {
+	cases := []struct {
+		name string
+		w    model.Worktree
+	}{
+		{
+			name: "long CJK name + huge counts + danger badge",
+			w: model.Worktree{
+				Name:  "日本語のワークツリー名前は非常に長いです本当に長い名前ですねこれは",
+				Agent: model.AgentClaude, State: model.StateActive, LastChange: time.Now(),
+				Stats:      model.Stats{Add: 999999, Del: 999999, Files: 123456},
+				Guardrails: []model.GuardrailHit{{Severity: "danger"}},
+			},
+		},
+		{
+			name: "warn-only badge",
+			w: model.Worktree{
+				Name: "warn-only", Agent: model.AgentAider, State: model.StateDirty,
+				Stats:      model.Stats{Add: 1, Del: 1, Files: 1},
+				Guardrails: []model.GuardrailHit{{Severity: "warn"}},
+			},
+		},
+		{name: "zero value", w: model.Worktree{}},
+		{name: "short ordinary row", w: model.Worktree{Name: "short", Agent: model.AgentGit, State: model.StateIdle}},
+	}
+	for _, c := range cases {
+		for _, selected := range []bool{false, true} {
+			out := renderSidebarRow(c.w, selected, sidebarWidth)
+			lines := strings.Split(out, "\n")
+			if len(lines) != 2 {
+				t.Errorf("%s selected=%v: %d lines, want exactly 2", c.name, selected, len(lines))
+				continue
+			}
+			for i, ln := range lines {
+				if got := lipgloss.Width(ln); got > sidebarWidth {
+					t.Errorf("%s selected=%v: line %d width = %d, want <= %d", c.name, selected, i, got, sidebarWidth)
+				}
+			}
+		}
+	}
+}
+
+// TestSeverityBadgeWorstSeverityWins pins the ux-expert P2-6 contract: red
+// (danger style) when any hit is severity "danger", else amber warn; empty
+// when there are no hits at all. Compares under TrueColor (the package's
+// TestMain forces Ascii, which strips all styling) so danger/warn are
+// actually visibly distinct.
+func TestSeverityBadgeWorstSeverityWins(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	if got := severityBadge(nil); got != "" {
+		t.Errorf("severityBadge(nil) = %q, want empty", got)
+	}
+
+	warnOnly := severityBadge([]model.GuardrailHit{{Severity: "warn"}})
+	danger := severityBadge([]model.GuardrailHit{{Severity: "warn"}, {Severity: "danger"}})
+	if stripANSI(warnOnly) != "⚠" || stripANSI(danger) != "⚠" {
+		t.Fatalf("badges = %q / %q, want the ⚠ glyph in both", warnOnly, danger)
+	}
+	if warnOnly == danger {
+		t.Error("a danger hit among several must render differently (worst severity wins) from warn-only")
+	}
+}
+
+// ---- sidebar.view: header truthfulness (P2-4) + empty-state hint ----
+
+// TestSidebarViewHeaderShowsPausedWhileReconnecting pins the ux-expert P2-4
+// contract: the header must not keep claiming LIVE once the connection to
+// wtd is a mid-session reconnect away from actually being live, and must
+// restore once it is again.
+func TestSidebarViewHeaderShowsPausedWhileReconnecting(t *testing.T) {
+	var s sidebar
+	s.setWorktrees([]model.Worktree{wt("a1", "alpha", "one", time.Second)})
+
+	live := stripANSI(s.view(sidebarWidth, 20, connLive))
+	if !strings.Contains(live, "WORKTREES · LIVE") {
+		t.Errorf("live view = %q, want the LIVE header", live)
+	}
+	if strings.Contains(live, "PAUSED") {
+		t.Errorf("live view = %q, must not say PAUSED", live)
+	}
+
+	reconnecting := stripANSI(s.view(sidebarWidth, 20, connReconnecting))
+	if !strings.Contains(reconnecting, "WORKTREES · PAUSED") {
+		t.Errorf("reconnecting view = %q, want the PAUSED header", reconnecting)
+	}
+	if strings.Contains(reconnecting, "· LIVE") {
+		t.Errorf("reconnecting view = %q, must not still claim LIVE", reconnecting)
+	}
+
+	restored := stripANSI(s.view(sidebarWidth, 20, connLive))
+	if !strings.Contains(restored, "WORKTREES · LIVE") || strings.Contains(restored, "PAUSED") {
+		t.Errorf("view after reconnect = %q, want LIVE restored and PAUSED gone", restored)
+	}
+}
+
+// TestSidebarViewEmptyStateMentionsConfigToml pins the ux-expert P3-cheap
+// empty-state copy (design §1.4): the hint should point at config.toml as an
+// alternative to the `-root` flag, not just the flag alone.
+func TestSidebarViewEmptyStateMentionsConfigToml(t *testing.T) {
+	var s sidebar
+	s.setWorktrees(nil)
+	out := stripANSI(s.view(sidebarWidth, 20, connLive))
+	if !strings.Contains(out, "wtd -root <dir>") || !strings.Contains(out, "config.toml") {
+		t.Errorf("empty-state view = %q, want both the -root flag and a config.toml hint", out)
 	}
 }

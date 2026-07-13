@@ -210,6 +210,59 @@ func TestTmuxJumpSwitchClientErrorStopsBeforeSelectWindow(t *testing.T) {
 
 // ---- tmuxJumpCmd / $TMUX-absent behavior ----
 
+// TestTmuxJumpSuccessPathStaysSingleArgvSafeForHostileWorktreePaths extends
+// TestTmuxJumpListPanesArgvIsFixedNoShellInterpolation past the list-panes
+// call (which never puts the path in argv at all) into the full success
+// path, where the worktree path *does* land in argv positions (as the
+// pane's matched cwd flows into pickTmuxPane, and the toast/no-match message
+// embeds it as plain text) -- pinning that a hostile path used as a single
+// exec.Command argv element is never shell-interpreted, for the patterns the
+// brief names explicitly: embedded spaces, a `;` command separator, and a
+// `$(...)` command substitution.
+func TestTmuxJumpSuccessPathStaysSingleArgvSafeForHostileWorktreePaths(t *testing.T) {
+	hostilePaths := []string{
+		"/repo/wt with spaces",
+		"/repo/wt; rm -rf /",
+		"/repo/wt$(touch /tmp/pwned)",
+		"/repo/wt`touch /tmp/pwned`",
+	}
+	for _, path := range hostilePaths {
+		t.Run(path, func(t *testing.T) {
+			var calls [][]string
+			run := func(args ...string) (string, error) {
+				calls = append(calls, append([]string(nil), args...))
+				if args[0] == "list-panes" {
+					return "%3\tmysess\t2\t" + path + "\n", nil
+				}
+				return "", nil
+			}
+			msg := tmuxJump(true, run, path)
+			if msg != "" {
+				t.Fatalf("tmuxJump = %q, want empty (success) for path %q", msg, path)
+			}
+			want := [][]string{
+				{"list-panes", "-a", "-F", tmuxListPanesFormat},
+				{"switch-client", "-t", "mysess"},
+				{"select-window", "-t", "mysess:2"},
+				{"select-pane", "-t", "%3"},
+			}
+			if len(calls) != len(want) {
+				t.Fatalf("calls = %v, want %v", calls, want)
+			}
+			for i := range want {
+				if len(calls[i]) != len(want[i]) {
+					t.Fatalf("call %d = %v, want %d args %v", i, calls[i], len(want[i]), want[i])
+				}
+				for j := range want[i] {
+					if calls[i][j] != want[i][j] {
+						t.Errorf("call %d arg %d = %q, want %q (the hostile path %q must never leak into an unrelated argv slot or get re-split)", i, j, calls[i][j], want[i][j], path)
+					}
+				}
+			}
+		})
+	}
+}
+
 // TestTmuxJumpCmdWithoutTMUXEnvReturnsToastDoneMsg pins the "$TMUX-absent
 // behavior test" the brief asks for at the tea.Cmd boundary (not just the
 // pure tmuxJump function): with TMUX unset, the resulting tmuxDoneMsg

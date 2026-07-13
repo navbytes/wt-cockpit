@@ -1,6 +1,7 @@
 package diffparse
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
@@ -359,5 +360,254 @@ func TestParseNoIndexLineForPureRenameLeavesBlobsEmpty(t *testing.T) {
 	}
 	if len(f.Hunks) != 0 {
 		t.Errorf("pure rename should have zero hunks, got %d", len(f.Hunks))
+	}
+}
+
+// controlByteDiff is DEFECT D2's diffparse-level fixture: a raw ESC (0x1b)
+// reaches Parse three independent ways at once — quoted+octal-escaped in a
+// path (real git core.quotePath output for a file whose name literally
+// contains a control byte, same encoding style as the café.txt fixtures
+// above), verbatim in a hunk header's trailing "nearby function" section
+// (copied straight from source text), and verbatim in hunk line content
+// (added/removed source bytes) — plus a BEL (0x07) in content for good
+// measure. None of these are hand-decoded; this is exactly the byte pattern
+// real git diff output would contain for a hostile/unusual file.
+const controlByteDiff = "diff --git \"a/evil\\033name.go\" \"b/evil\\033name.go\"\n" +
+	"index 1111111..2222222 100644\n" +
+	"--- \"a/evil\\033name.go\"\n" +
+	"+++ \"b/evil\\033name.go\"\n" +
+	"@@ -1,1 +1,1 @@ func Evil\x1bTitle(\n" +
+	"-old\x1bline\n" +
+	"+new\x1bline\x07bell\n"
+
+// TestParseSanitizesControlBytesInContentPathAndHeader is DEFECT D2's
+// diffparse unit test: ESC embedded in content, in a quoted path's octal
+// escape, and in a hunk header's source-derived section must all come out
+// of Parse with zero raw 0x1b (or other control byte) survivors, replaced by
+// visible caret notation instead of silently dropped or left verbatim.
+// ---- FIX: "-- "/"++ " content lines byte-colliding with "--- "/"+++ " headers ----
+//
+// The three fixtures below are captured verbatim from real `git diff`
+// output (git 2.54.0), same as the D1/D2 fixtures above: a deleted content
+// line is prefixed with a single literal '-' marker, and an added line with
+// a single literal '+' — so a deleted line whose own text happens to start
+// with "-- " (two dashes, a space) comes out byte-identical, for the first
+// four columns, to a "--- a/<path>" header line, and symmetrically "++ "
+// content collides with a "+++ b/<path>" header. The parser's per-file
+// state machine matched "--- "/"+++ " (and neighboring header lines) by text
+// alone, with no notion of "are we still in this file's header block, or
+// already inside a hunk body" — so it misfired on hunk-body content lines
+// that happened to share a header's prefix bytes, corrupting Path/OldPath
+// and undercounting Stats.
+
+const deletedFileContentStartsWithDashDashDiff = `diff --git a/old/legacy.sql b/old/legacy.sql
+deleted file mode 100644
+index ed223db..0000000
+--- a/old/legacy.sql
++++ /dev/null
+@@ -1,3 +0,0 @@
+--- one
+---- two
+-plain three
+`
+
+// TestParseDeletedFileContentStartingWithDashesIsNotMistakenForHeader is the
+// core repro: the deleted file's first content line is "-- one" (two
+// dashes, a space) — prefixed with git's single '-' delete marker, the raw
+// diff line is "--- one", byte-identical to a "--- " old-path header up to
+// the 4th column. Before the fix this line was consumed as a header,
+// overwriting Path/OldPath with the comment text and dropping it from
+// Stats.Del.
+func TestParseDeletedFileContentStartingWithDashesIsNotMistakenForHeader(t *testing.T) {
+	files := Parse(deletedFileContentStartsWithDashDashDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+	if f.Status != model.FileDeleted {
+		t.Errorf("status = %q, want deleted", f.Status)
+	}
+	if f.Path != "old/legacy.sql" {
+		t.Errorf("path = %q, want old/legacy.sql (must survive a hunk-body line that looks like a header)", f.Path)
+	}
+	if f.OldPath != "old/legacy.sql" {
+		t.Errorf("oldPath = %q, want old/legacy.sql", f.OldPath)
+	}
+	if f.OldBlob != "ed223db" || f.NewBlob != "0000000" {
+		t.Errorf("blobs = %q..%q, want ed223db..0000000", f.OldBlob, f.NewBlob)
+	}
+	if f.Stats.Del != 3 || f.Stats.Add != 0 {
+		t.Errorf("stats = +%d -%d, want +0 -3 (every content line counted, none stolen by a false header match)", f.Stats.Add, f.Stats.Del)
+	}
+	if len(f.Hunks) != 1 {
+		t.Fatalf("want 1 hunk, got %d", len(f.Hunks))
+	}
+	h := f.Hunks[0]
+	if len(h.Lines) != 3 {
+		t.Fatalf("want 3 hunk lines, got %d: %+v", len(h.Lines), h.Lines)
+	}
+	wantContent := []string{"-- one", "--- two", "plain three"}
+	for i, want := range wantContent {
+		l := h.Lines[i]
+		if l.Kind != model.LineDel {
+			t.Errorf("line %d kind = %q, want del", i, l.Kind)
+		}
+		if l.Content != want {
+			t.Errorf("line %d content = %q, want %q", i, l.Content, want)
+		}
+		if l.OldNum != i+1 {
+			t.Errorf("line %d oldNum = %d, want %d", i, l.OldNum, i+1)
+		}
+	}
+}
+
+const addedFileContentStartsWithPlusPlusDiff = `diff --git a/src/plus.txt b/src/plus.txt
+new file mode 100644
+index 0000000..6f5336a
+--- /dev/null
++++ b/src/plus.txt
+@@ -0,0 +1,3 @@
++++ existing
++++ prefix line
++plain
+`
+
+// TestParseAddedFileContentStartingWithPlusesIsNotMistakenForHeader mirrors
+// the deleted-file repro above for the symmetric "+++ " collision on an
+// added file's content ("++ existing" -> raw line "+++ existing").
+func TestParseAddedFileContentStartingWithPlusesIsNotMistakenForHeader(t *testing.T) {
+	files := Parse(addedFileContentStartsWithPlusPlusDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+	if f.Status != model.FileAdded {
+		t.Errorf("status = %q, want added", f.Status)
+	}
+	if f.Path != "src/plus.txt" {
+		t.Errorf("path = %q, want src/plus.txt (must survive a hunk-body line that looks like a header)", f.Path)
+	}
+	if f.OldBlob != "0000000" || f.NewBlob != "6f5336a" {
+		t.Errorf("blobs = %q..%q, want 0000000..6f5336a", f.OldBlob, f.NewBlob)
+	}
+	if f.Stats.Add != 3 || f.Stats.Del != 0 {
+		t.Errorf("stats = +%d -%d, want +3 -0", f.Stats.Add, f.Stats.Del)
+	}
+	if len(f.Hunks) != 1 {
+		t.Fatalf("want 1 hunk, got %d", len(f.Hunks))
+	}
+	h := f.Hunks[0]
+	if len(h.Lines) != 3 {
+		t.Fatalf("want 3 hunk lines, got %d: %+v", len(h.Lines), h.Lines)
+	}
+	wantContent := []string{"++ existing", "++ prefix line", "plain"}
+	for i, want := range wantContent {
+		l := h.Lines[i]
+		if l.Kind != model.LineAdd {
+			t.Errorf("line %d kind = %q, want add", i, l.Kind)
+		}
+		if l.Content != want {
+			t.Errorf("line %d content = %q, want %q", i, l.Content, want)
+		}
+		if l.NewNum != i+1 {
+			t.Errorf("line %d newNum = %d, want %d", i, l.NewNum, i+1)
+		}
+	}
+}
+
+const modifiedFileContextLinesStartWithDashesAndPlusesDiff = `diff --git a/mod/f.txt b/mod/f.txt
+index e0f6e2b..75a36b7 100644
+--- a/mod/f.txt
++++ b/mod/f.txt
+@@ -1,4 +1,5 @@
+ header
+ -- ctx dash
+ ++ ctx plus
++CHANGED
+ footer
+`
+
+// TestParseModifiedFileContextLinesStartingWithDashesOrPlusesParseCorrectly
+// is the audit's third case: a *context* line (single leading space, not a
+// diff marker) whose own text starts with "--"/"++" can never byte-collide
+// with a "--- "/"+++ " header — the mandatory leading space sits where the
+// header's 3rd/4th dash or plus would need to be — but it's pinned here as a
+// regression guard now that the header cases are gated on hunk state, so a
+// context line starting the same way stays correctly classified.
+func TestParseModifiedFileContextLinesStartingWithDashesOrPlusesParseCorrectly(t *testing.T) {
+	f := Parse(modifiedFileContextLinesStartWithDashesAndPlusesDiff)[0]
+	if f.Status != model.FileModified {
+		t.Errorf("status = %q, want modified", f.Status)
+	}
+	if f.Path != "mod/f.txt" || f.OldPath != "mod/f.txt" {
+		t.Errorf("path/oldPath = %q/%q, want mod/f.txt/mod/f.txt", f.Path, f.OldPath)
+	}
+	if f.OldBlob != "e0f6e2b" || f.NewBlob != "75a36b7" {
+		t.Errorf("blobs = %q..%q, want e0f6e2b..75a36b7", f.OldBlob, f.NewBlob)
+	}
+	if f.Stats.Add != 1 || f.Stats.Del != 0 {
+		t.Errorf("stats = +%d -%d, want +1 -0", f.Stats.Add, f.Stats.Del)
+	}
+	if len(f.Hunks) != 1 {
+		t.Fatalf("want 1 hunk, got %d", len(f.Hunks))
+	}
+	h := f.Hunks[0]
+	if len(h.Lines) != 5 {
+		t.Fatalf("want 5 hunk lines, got %d: %+v", len(h.Lines), h.Lines)
+	}
+	wantKinds := []model.LineKind{model.LineContext, model.LineContext, model.LineContext, model.LineAdd, model.LineContext}
+	wantContent := []string{"header", "-- ctx dash", "++ ctx plus", "CHANGED", "footer"}
+	for i, want := range wantContent {
+		if h.Lines[i].Kind != wantKinds[i] {
+			t.Errorf("line %d kind = %q, want %q", i, h.Lines[i].Kind, wantKinds[i])
+		}
+		if h.Lines[i].Content != want {
+			t.Errorf("line %d content = %q, want %q", i, h.Lines[i].Content, want)
+		}
+	}
+}
+
+func TestParseSanitizesControlBytesInContentPathAndHeader(t *testing.T) {
+	files := Parse(controlByteDiff)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	f := files[0]
+
+	assertClean := func(label, s string) {
+		t.Helper()
+		if strings.ContainsRune(s, 0x1b) {
+			t.Errorf("%s = %q still contains a raw ESC (0x1b)", label, s)
+		}
+	}
+	assertClean("Path", f.Path)
+	assertClean("OldPath", f.OldPath)
+	if !strings.Contains(f.Path, "evil^[name.go") {
+		t.Errorf("Path = %q, want the decoded ESC visibly escaped as ^[", f.Path)
+	}
+
+	if len(f.Hunks) != 1 {
+		t.Fatalf("want 1 hunk, got %d", len(f.Hunks))
+	}
+	h := f.Hunks[0]
+	assertClean("Hunk.Header", h.Header)
+	if !strings.Contains(h.Header, "Evil^[Title(") {
+		t.Errorf("Hunk.Header = %q, want the source-derived ESC visibly escaped as ^[", h.Header)
+	}
+
+	if len(h.Lines) != 2 {
+		t.Fatalf("want 2 lines, got %d", len(h.Lines))
+	}
+	for _, ln := range h.Lines {
+		assertClean("Line.Content", ln.Content)
+		if strings.ContainsRune(ln.Content, 0x07) {
+			t.Errorf("Line.Content = %q still contains a raw BEL (0x07)", ln.Content)
+		}
+	}
+	if !strings.Contains(h.Lines[0].Content, "old^[line") {
+		t.Errorf("Lines[0].Content = %q, want old^[line", h.Lines[0].Content)
+	}
+	if !strings.Contains(h.Lines[1].Content, "new^[line^Gbell") {
+		t.Errorf("Lines[1].Content = %q, want new^[line^Gbell", h.Lines[1].Content)
 	}
 }
