@@ -26,6 +26,17 @@ var ErrCommentNotFound = errors.New("comment not found")
 // slice — both scale badly with no cap at all.
 var ErrTooManyComments = errors.New("comment limit reached for this worktree")
 
+// ErrDuplicateCommentID is returned by AddComment when c.ID collides with an
+// existing comment's id anywhere in the store (DEFECT D1/D2 fix,
+// P6-fixes.md: comments.id is now UNIQUE in the SQLite schema, so a
+// collision is a loud, clear error there instead of a silently duplicated
+// row). model.Comment.ID is a globally-unique, engine-minted token
+// (crypto/rand, "c-"+16 hex, model.go), so a genuine collision should be
+// astronomically rare in practice. jsonStore does not check for this (its
+// pre-v0.6 behavior is unchanged, out of this fix's scope) — only the
+// SQLite backend returns it.
+var ErrDuplicateCommentID = errors.New("comment id already exists")
+
 // maxCommentsPerWorktree caps how many comments a single worktree can
 // accumulate. ponytail: a flat per-worktree cap (not a global one, so one
 // noisy worktree can't starve the rest), chosen far above any real review
