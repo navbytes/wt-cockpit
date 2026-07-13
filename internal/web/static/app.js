@@ -48,12 +48,56 @@ function connectEvents(onMessage) {
   });
   events.onmessage = function (e) {
     if (chip) chip.classList.add("hidden");
+    var data;
+    try { data = JSON.parse(e.data); } catch (err) { data = null; }
+    // guardrail.tripped only ever names a hit whose (rule, file) key is NEW
+    // (the engine's own emission rule, P5-design.md §1.4) and is suppressed
+    // entirely during a daemon's cold-start scan — every frame reaching here
+    // is genuinely toast-worthy on its own, no client-side "is this new?"
+    // bookkeeping needed. Danger-only mirrors the desktop notifier's own
+    // default severity floor (P5-design.md §1.5). Shown on every page (index
+    // and room alike) since this is shared connectEvents plumbing, not
+    // scoped to whichever worktree happens to be open — the same fleet-wide
+    // reach the notifier has.
+    if (data && data.type === "guardrail.tripped" && data.hit && data.hit.severity === "danger") {
+      showGuardrailToast(data.hit);
+    }
     onMessage(e);
   };
   events.onerror = function () {
     if (chip) chip.classList.remove("hidden");
   };
   return events;
+}
+
+// showGuardrailToast renders a transient toast for one guardrail.tripped SSE
+// frame (P5-design.md WP3's web toast). Per this file's own boundary rules:
+// the toast text is rule+file only (never the hit's free-text Message, which
+// is closer to arbitrary pack-authored content, P5-design.md §1.3) and is
+// placed with textContent, never innerHTML/string concatenation — the <div>/
+// <span> structure here is fixed, code-authored markup; only their
+// textContent ever comes from the event, so nothing here is "markup built
+// from data" no matter what bytes a hostile rule name or file path contain.
+function showGuardrailToast(hit) {
+  var region = document.getElementById("toast-region");
+  if (!region) return;
+
+  var el = document.createElement("div");
+  el.className = "toast";
+  el.setAttribute("role", "alert");
+
+  var icon = document.createElement("span");
+  icon.className = "toast-icon";
+  icon.textContent = "⚠";
+
+  var label = document.createElement("span");
+  label.textContent = hit.file ? (hit.rule + " — " + hit.file) : (hit.rule || "guardrail tripped");
+
+  el.appendChild(icon);
+  el.appendChild(label);
+  region.appendChild(el);
+
+  setTimeout(function () { el.remove(); }, 6000);
 }
 
 function csrfToken() {

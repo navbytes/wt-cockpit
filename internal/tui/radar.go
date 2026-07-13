@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -280,7 +281,18 @@ func trimDanglingSeparator(s string) string {
 }
 
 // renderGuardrailBanner is the mock's amber alert box: the featured hit's
-// rule message verbatim, plus a "+N more" suffix when several rules tripped.
+// rule message verbatim, plus — when the featured hit carries a Line (a
+// content-condition hit: secrets-pattern/secrets-entropy, P5-design.md
+// §1.1/§1.6) — a "· file:line" suffix so it's jumpable-by-eye, then a "+N
+// more" suffix when several rules tripped.
+//
+// featured.Message runs through diffparse.SanitizeControl before rendering.
+// Diff content/paths are already sanitized upstream by diffparse.Parse (the
+// same defensive-reuse this package's own flatten.go already applies to hunk
+// text), but a hit's Message can instead be hand-authored directly in a
+// repo's own .wtcockpit.toml pack — semi-trusted input (P5-design.md §1.3)
+// that never passes through that pipeline — so without this, a raw control
+// byte smuggled into one would reach the terminal unescaped.
 func renderGuardrailBanner(width int, hits []model.GuardrailHit) string {
 	if len(hits) == 0 {
 		return ""
@@ -292,7 +304,10 @@ func renderGuardrailBanner(width int, hits []model.GuardrailHit) string {
 			break
 		}
 	}
-	text := styles.Warn.Bold(true).Render("⚠ guardrail: ") + styles.Txt.Render(featured.Message)
+	text := styles.Warn.Bold(true).Render("⚠ guardrail: ") + styles.Txt.Render(diffparse.SanitizeControl(featured.Message))
+	if featured.Line > 0 {
+		text += styles.Dim.Render(fmt.Sprintf(" · %s:%d", featured.File, featured.Line))
+	}
 	if len(hits) > 1 {
 		text += styles.Dim.Render(fmt.Sprintf(" (+%d more)", len(hits)-1))
 	}

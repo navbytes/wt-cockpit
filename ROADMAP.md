@@ -73,14 +73,17 @@ Goal: deliberate side-by-side review when a diff deserves a bigger screen.
 
 Goal: "catch mistakes fast" without watching the screen.
 
-- Rule pack: secrets-shaped strings (entropy + patterns), lockfile/snapshot churn,
+- ✅ Rule pack: secrets-shaped strings (entropy + patterns), lockfile/snapshot churn,
   file-count and total-churn thresholds, protected-path deletes, new-dependency
   detection (go.mod/package.json/Cargo.toml deltas).
-- Per-repo rule overrides (`.wtcockpit.toml` in-repo, checked in by the team).
-- Notifications: terminal bell/OSC in `wt watch`, `notify-send`/`osascript`
-  desktop notifications from the daemon on danger-severity hits.
-- **macOS menu-bar companion** (thin client, ~200 lines against the API): badge
-  count of unreviewed worktrees, click-through to the reading room.
+- ✅ Per-repo rule overrides (`.wtcockpit.toml` in-repo, checked in by the team).
+- ✅ Notifications: terminal bell/OSC in `wt watch`, `notify-send`/`osascript`
+  desktop notifications from the daemon on danger-severity hits; a matching
+  transient toast in the web reading room.
+- ✅ **Menu-bar companion**: `wt menubar` emits SwiftBar/xbar plugin text (danger
+  count + reviewed/total files, per-worktree rows, click-through to the reading
+  room) — a thin emitter against the existing API rather than a native app
+  (avoids a cgo/systray dependency for a status badge).
 
 ## v0.6 — Performance & scale (monorepo-grade)
 

@@ -19,8 +19,8 @@ and [docs/](docs/README.md) for the design history (why a viewer, why a daemon, 
 
 The engine is a headless daemon (`wtd`); every frontend is a thin client over a small
 HTTP API on a Unix socket. This is the anti-bottleneck decision: the TUI, the web
-reading room, and a future menu-bar app are all clients of the same engine, and the
-language or git library can be swapped without touching them.
+reading room, and `wt menubar` (a SwiftBar/xbar plugin emitter) are all clients of the
+same engine, and the language or git library can be swapped without touching them.
 
 ```
 frontends (thin clients)          wt (CLI/radar/TUI) · web · menu-bar
@@ -46,7 +46,10 @@ richer drop-in later:
 
 - `internal/model` — transport-agnostic domain types.
 - `internal/diffparse` — pure unified-diff → structured hunks/lines parser.
-- `internal/guardrail` — declarative glob + threshold rule engine (+ `**` globber).
+- `internal/guardrail` — declarative glob + threshold + RE2/entropy rule engine
+  (+ `**` globber, per-repo `.wtcockpit.toml` pack resolution).
+- `internal/notify` — desktop notifier (`osascript`/`notify-send`, fixed argv only —
+  no shell), coalesced and cooled down.
 - `internal/gitbackend` — `Backend` interface + git-CLI impl (incl. untracked files).
 - `internal/discovery` — scan roots for repos (skips linked worktrees + heavy dirs).
 - `internal/store` — review/comment persistence (JSON).
@@ -62,7 +65,7 @@ richer drop-in later:
 - `cmd/wtd` — daemon: engine + HTTP/SSE over a Unix socket (+ optional TCP, optional
   loopback web listener).
 - `cmd/wt` — terminal client: `ls`, `watch`, `diff`, `review`, `approve`, `refresh`, `tui`,
-  `comments`, `comment`, `resolve`, `open`.
+  `comments`, `comment`, `resolve`, `open`, `rules`, `menubar`.
 
 ## Install & run
 
@@ -182,7 +185,9 @@ that it adds **inline comments** — click a line's gutter (or a file's "comment
 for file-level feedback) to leave a note; threads render right under the file's header,
 with author/age and amber "stale" / grey "orphaned" badges when the commented file has
 since changed or left the diff. Everything live-updates over SSE: a second tab, the CLI,
-or an agent resolving/adding a comment shows up here without a reload.
+or an agent resolving/adding a comment shows up here without a reload. A new
+danger-severity guardrail hit also pops a transient toast (top-right, any page) the
+moment it trips — the same SSE stream, no polling.
 
 This is also the other half of the review→agent loop: comments left here (or via
 `wt comment`) are what an agent consumes to act on feedback and close the loop with
@@ -251,13 +256,153 @@ missing from diffs (agents create new files — now synthesized read-only via
 
 ## Guardrails
 
-Declarative rules (`internal/guardrail`), shipped defaults catch: edits under
-`migrations/`, edits to `.github/workflows/*`, large single-file net deletions, and
-worktree-wide "deletes far more than it adds". Rules are data, so growing the set is a
-config change, not code.
+Declarative rules (`internal/guardrail`) — globs, thresholds, and RE2 patterns, never
+code — evaluated once per refresh. `Compile` validates the whole set at load (bad
+severity, a typo'd condition, a non-compiling pattern), so a mistake fails loudly at
+startup rather than silently never firing. Twelve rules ship by default:
+
+| Rule | Sev | Catches |
+|---|---|---|
+| `touches-migrations` | danger | edits under `migrations/` |
+| `secrets-pattern` | danger | AWS/GitHub/Slack/OpenAI/Google token shapes, or a PEM private key, in added lines |
+| `ci-workflow-delete` | danger | a `.github/workflows/*` file deleted |
+| `secrets-entropy` | warn | a high-entropy (≥4.8 bits/char) added token, 32+ chars |
+| `edits-ci` | warn | edits to `.github/workflows/*` |
+| `lockfile-churn` | warn | 200+ line churn in a lockfile/snapshot |
+| `deps-manifest-changed` | warn | `go.mod`/`package.json`/`Cargo.toml` touched |
+| `large-deletion` | warn | one file net-deletes 80+ lines |
+| `net-negative` | warn | a worktree deletes 3x more than it adds |
+| `big-blast-radius` | warn | 25+ files changed |
+| `huge-churn` | warn | 1,500+ total lines changed |
+| `binary-added` | warn | a new binary file |
+
+A rule matches per-file (`path_glob`/`path_globs`, `exclude_globs`, `status`, `binary`,
+`min_net_deleted`, `min_changed_lines`, `added_pattern`, `min_token_entropy` +
+`min_token_len`) or worktree-wide (`min_delete_add_ratio`, `min_files_changed`,
+`min_total_changed`) — never both. Content conditions (`added_pattern`, entropy) scan
+only *added* lines, skip binaries, and never echo the matched text back: a hit names
+the rule, file, and line, never the secret itself — true of the JSON API, the SSE
+stream, and the desktop notifications below, too. See
+[docs/config.example.toml](docs/config.example.toml) for the full field reference.
+
+### Per-repo overrides: `.wtcockpit.toml`
+
+A checked-in `.wtcockpit.toml` at a repo's root tunes that repo's rules without
+touching your own `config.toml`:
+
+```toml
+# .wtcockpit.toml — reviewed and merged like any other file
+disable_rules = ["net-negative"]
+
+[[rules]]
+name = "touches-payments"
+severity = "danger"
+path_globs = ["internal/payments/**"]
+message = "touches payment code"
+
+[[rules]]                 # same name as a global/default rule -> REPLACES it
+name = "large-deletion"
+severity = "warn"
+min_net_deleted = 200      # this repo deletes a lot; retune, don't disable
+```
+
+Effective rules = the global set, minus `disable_rules`, plus the pack's own
+`[[rules]]` (a name match replaces the global rule in place; anything new is
+additive). **Trust boundary:** the pack is read only from the repo's *main* worktree,
+never from the feature worktree being diffed — an agent editing its own worktree
+cannot weaken the guardrails judging it; that edit is just another diff line, inert
+until merged. A malformed pack fails closed to the global rules (one log line, never a
+crash). `wt rules <id>` shows the fully-resolved set with provenance
+(`default`/`global`/`pack`) and the pack's own path/status — one command that answers
+"why did/didn't this fire".
+
+### Cookbook
+
+Protected-path deletes, beyond the shipped `ci-workflow-delete` default:
+
+```toml
+[[rules]]
+name = "protected-path-delete"
+severity = "danger"
+status = "deleted"
+path_globs = ["internal/auth/**", "**/migrations/**"]
+message = "deletes a file under a protected path"
+```
+
+A sharper "new dependency" signal than the shipped `deps-manifest-changed` (which flags
+the manifest touched at all, any edit):
+
+```toml
+[[rules]]
+name = "new-go-dependency"
+severity = "warn"
+path_glob = "go.mod"
+added_pattern = '^\t[\w./-]+ v'   # a genuinely new `require` line, not a version bump
+message = "adds a new Go dependency"
+```
+
+## Notifications
+
+The daemon can nudge you on a danger-severity hit without watching a screen: an
+`osascript`/`notify-send` desktop notification (title `wt-cockpit — repo/name`, body
+the hit's message). No shell is ever involved — content only travels as trailing argv
+elements, never concatenated into a command string. Bursts coalesce (a 5s window groups
+several hits into one notification per worktree; more than 3 worktrees tripping at once
+collapses to a single summary) and a given rule+file re-notifies at most once per 10
+minutes. On by default; configure in `config.toml`:
+
+```toml
+[notifications]
+enabled  = true      # default true
+severity = "danger"  # "danger" (default) | "warn" (= warn + danger)
+cooldown = "10m"
+```
+
+macOS may prompt for a one-time notification permission the first time `osascript`
+fires — grant it once and it's silent after that. There's no in-app mute or quiet
+hours: your OS's own Do Not Disturb (macOS Focus, GNOME/KDE DND) is the mute button;
+`enabled = false` is the permanent opt-out. `wt status` shows the notifier's resolved
+state (`osascript` / `notify-send` / `disabled (config)` / `unavailable (no notifier
+binary)`). `wt watch` gets its own lightweight signal too — a terminal bell + OSC 9
+popup (honored by iTerm2/kitty/WezTerm, harmlessly ignored elsewhere) on a danger hit,
+throttled to once per 5s.
+
+## Menu bar
+
+`wt menubar` prints [SwiftBar](https://github.com/swiftbar/SwiftBar)/
+[xbar](https://github.com/matryer/xbar) plugin text and exits — a thin emitter against
+the same API every other `wt` command uses, not a native app (no cgo, no systray
+dependency, still one static binary):
+
+```
+⚠1 ✓9/12
+---
+api-server/auth-refactor — 1 danger | href=http://127.0.0.1:7788/wt/<id>
+web/checkout-flow — 3 files unreviewed | href=…
+---
+Open cockpit | href=…
+```
+
+The title is the danger-worktree count and reviewed/total files across the whole
+fleet; rows are worktrees actually needing attention (a danger hit, or unreviewed
+files) and link straight into the reading room when `wtd -web` is running (plain
+labels otherwise). With `wtd` unreachable it renders `wt ◦` instead of failing the
+plugin. To install, drop a two-line wrapper into whichever folder you've configured as
+your plugins directory (SwiftBar/xbar prompt for one on first launch):
+
+```sh
+cat > "$PLUGIN_DIR/wt-cockpit.5m.sh" <<'EOF'
+#!/bin/sh
+exec wt menubar
+EOF
+chmod +x "$PLUGIN_DIR/wt-cockpit.5m.sh"
+```
+
+(`.5m.` in the filename sets the refresh interval — SwiftBar/xbar both read it the same
+way; pick whatever cadence suits you.)
 
 ## Not yet built (deliberately, next phases)
 
 A SQLite store (behind the existing `Store` interface — no engine rework needed, same
-pattern the Bubble Tea TUI and the fsnotify watcher already followed), notifications,
-and remote/auth'd access — see [ROADMAP.md](ROADMAP.md) for the full path.
+pattern the Bubble Tea TUI and the fsnotify watcher already followed) and remote/auth'd
+access — see [ROADMAP.md](ROADMAP.md) for the full path.

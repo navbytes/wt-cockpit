@@ -34,7 +34,16 @@ import (
 // worktree, letting the caller populate the worktree's working tree
 // (untracked files show up as pure "added" diffs — gitbackend's
 // untrackedDiff, no need to commit or even `git add`) before Refresh runs.
+// Rules default to guardrail.DefaultRules(); see buildRepoEngineWithRules for
+// the parameterized variant (the guardrail-message severity/escaping tests
+// need a custom rule no default one produces).
 func buildRepoEngine(t *testing.T, populate func(repo, wt string)) (*engine.Engine, model.Worktree) {
+	t.Helper()
+	return buildRepoEngineWithRules(t, guardrail.DefaultRules(), populate)
+}
+
+// buildRepoEngineWithRules is buildRepoEngine's parameterized-rules variant.
+func buildRepoEngineWithRules(t *testing.T, rules []guardrail.Rule, populate func(repo, wt string)) (*engine.Engine, model.Worktree) {
 	t.Helper()
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -60,7 +69,7 @@ func buildRepoEngine(t *testing.T, populate func(repo, wt string)) (*engine.Engi
 		t.Fatal(err)
 	}
 	be := gitbackend.NewCLIWithEnv(testGitEnv())
-	gr := mustResolver(t, guardrail.DefaultRules())
+	gr := mustResolver(t, rules)
 	eng := engine.New(engine.Config{Roots: []string{root}, MaxDepth: 4, ActivityWindow: 30 * time.Second}, be, reg, st, gr)
 	if err := eng.Refresh(context.Background()); err != nil {
 		t.Fatal(err)

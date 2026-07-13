@@ -475,6 +475,53 @@ func TestSeverityBadgeWorstSeverityWins(t *testing.T) {
 	}
 }
 
+// TestSeverityBadgeAcrossV05RuleTypesTableDriven pins that the worst-
+// severity-wins badge (unchanged since v0.3) keeps behaving correctly for
+// the richer v0.5 rule types (P5-design.md §1.1/§1.2: secrets patterns/
+// entropy, lockfile/manifest churn, blast-radius/total-churn thresholds,
+// protected-path deletes) without any code change here — severityBadge only
+// ever looks at Severity, never Rule, so a hit from e.g. secrets-pattern is
+// indistinguishable to it from any other danger hit. Table-driven per the
+// phase's test list.
+func TestSeverityBadgeAcrossV05RuleTypesTableDriven(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	dangerRef := severityBadge([]model.GuardrailHit{{Severity: "danger"}})
+	warnRef := severityBadge([]model.GuardrailHit{{Severity: "warn"}})
+
+	cases := []struct {
+		name string
+		hits []model.GuardrailHit
+		want string // one of "", dangerRef, warnRef
+	}{
+		{"no hits", nil, ""},
+		{"huge-churn warn only", []model.GuardrailHit{{Rule: "huge-churn", Severity: "warn"}}, warnRef},
+		{"secrets-pattern danger only", []model.GuardrailHit{{Rule: "secrets-pattern", Severity: "danger"}}, dangerRef},
+		{
+			"secrets-entropy warn + secrets-pattern danger: worst wins",
+			[]model.GuardrailHit{{Rule: "secrets-entropy", Severity: "warn"}, {Rule: "secrets-pattern", Severity: "danger"}},
+			dangerRef,
+		},
+		{
+			"lockfile-churn + deps-manifest-changed: both warn stays warn",
+			[]model.GuardrailHit{{Rule: "lockfile-churn", Severity: "warn"}, {Rule: "deps-manifest-changed", Severity: "warn"}},
+			warnRef,
+		},
+		{
+			"ci-workflow-delete (protected-path) danger among several warns",
+			[]model.GuardrailHit{{Rule: "big-blast-radius", Severity: "warn"}, {Rule: "ci-workflow-delete", Severity: "danger"}, {Rule: "binary-added", Severity: "warn"}},
+			dangerRef,
+		},
+	}
+	for _, c := range cases {
+		if got := severityBadge(c.hits); got != c.want {
+			t.Errorf("%s: severityBadge = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // ---- sidebar.view: header truthfulness (P2-4) + empty-state hint ----
 
 // TestSidebarViewHeaderShowsPausedWhileReconnecting pins the ux-expert P2-4
