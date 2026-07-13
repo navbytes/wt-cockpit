@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/navbytes/wt-cockpit/internal/buildinfo"
 	"github.com/navbytes/wt-cockpit/internal/config"
 	"github.com/navbytes/wt-cockpit/internal/engine"
 	"github.com/navbytes/wt-cockpit/internal/gitbackend"
@@ -277,7 +278,7 @@ func main() {
 // outside main) so the flag's actual behaviour is unit-testable without
 // exercising flag.Parse or os.Exit.
 func printVersion(w io.Writer) {
-	fmt.Fprintf(w, "wtd %s (%s)\n", version, runtime.Version())
+	fmt.Fprintf(w, "wtd %s (%s)\n", buildinfo.Version(version), runtime.Version())
 }
 
 // newLogger builds the slog.Logger wtd runs with for the rest of its life. w
