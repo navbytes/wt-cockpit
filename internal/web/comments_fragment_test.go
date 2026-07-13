@@ -269,10 +269,12 @@ func TestRoomPageRendersCommentStripsInline(t *testing.T) {
 	if !strings.Contains(body, `data-line="3"`) || !strings.Contains(body, `data-side="new"`) {
 		t.Errorf("expected gutter cells carrying data-line/data-side for the composer prefill, got:\n%s", body)
 	}
-	// P4-fixes.md #5: a commentable gutter cell is a real <button> (focusable,
-	// keyboard-operable — WCAG 2.1.1), not a hover-only <span>.
-	if !strings.Contains(body, `<button type="button" class="ln" data-file="app.go" data-file-idx="0" data-line="3" data-side="new"`) {
-		t.Errorf("expected the line-3/new gutter cell to be a real <button>, got:\n%s", body)
+	// P4-fixes.md #5: a commentable gutter cell holds a real <button> (focusable,
+	// keyboard-operable — WCAG 2.1.1), not a hover-only bare <span>. The button
+	// nests inside the sticky .ln table-cell rather than being the cell itself
+	// (Safari/WebKit ignores display:table-cell on form controls).
+	if !strings.Contains(body, `<span class="ln"><button type="button" class="ln-btn" data-file="app.go" data-file-idx="0" data-line="3" data-side="new"`) {
+		t.Errorf("expected the line-3/new gutter cell to hold a real <button>, got:\n%s", body)
 	}
 	// P4-fixes.md #10: the strip's own container carries data-file (path),
 	// what app.js's live-refresh reconciles on instead of the index-derived id.

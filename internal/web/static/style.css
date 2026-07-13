@@ -163,40 +163,65 @@ code { font-family: var(--mono); }
 .hunk-h { color: var(--accent); background: #0c1620; padding: 3px 12px; font-size: 11px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 
 /* side-by-side grid. Horizontal scroll (P4-fixes.md #1, the flagship "read
-   wide code" fix): one scroll region per SIDE (.side, below), not one per row
-   — a long line used to make its own .srow the scroll container, so
-   scrolling it right dragged that row's own .ln gutter out of view too, and
-   every row scrolled independently of its neighbours. Moving overflow-x up
-   to .side means all of a pane's rows share one scrollport (a long row's
-   grid track overflows .srow's own box exactly as before — grid items'
-   automatic minimum size is content-based unless overridden — but that
-   overflow now bubbles up to .side, the nearest non-visible-overflow
-   ancestor, instead of scrolling in place); .srow itself is no longer a
-   scroll container at all. The gutter stays visible across that scroll via
-   position: sticky (below), which needs a non-transparent background so the
-   code column scrolling underneath doesn't show through it. */
+   wide code" fix) is a CSS-table frozen-first-column, not grid+sticky: an
+   earlier grid attempt (each .srow a `display:grid` row, gutter
+   `position:sticky`) held only up to the *pane's* width, then detached —
+   measured live at deep scroll, offset went to -187px on a 200+ char line.
+   Root cause: a grid row's own box never grows past its container (a long
+   line only overflows it visually — grid items' automatic min-size is
+   content-based, but that doesn't enlarge the row's own width), so the
+   sticky gutter's containing block topped out at ~pane-width, well short of
+   the actual scrollable content.
+   A table's column-width algorithm is exactly the mechanism that's missing:
+   every cell in a column shares one width — the widest cell's content —
+   which makes the ROW ITSELF (and the whole .srows table) genuinely as wide
+   as the longest line, so the sticky first cell's containing block spans the
+   *entire* scrollable width and holds all the way to the end. It's also what
+   makes a short/empty row's tint span the full scrolled width for free (no
+   per-row padding hacks): every row's code cell is forced to the same shared
+   column width regardless of its own content length. */
 .sxs { display: grid; grid-template-columns: 1fr 1fr; }
 .sxs .side { border-right: 1px solid var(--line); min-width: 0; overflow-x: auto; }
 .sxs .side:last-child { border-right: 0; }
 .sxs .side-lab { padding: 4px 12px; font-size: 10px; color: var(--faint); letter-spacing: .5px; background: #0c1219; border-bottom: 1px solid var(--line); text-transform: uppercase; }
-.srow { display: grid; grid-template-columns: 40px 1fr; font-size: 12px; white-space: pre; min-height: 19px; }
+/* min-width: 100% — not the table's default shrink-to-fit width — so a
+   perfectly ordinary diff (nothing long enough to need scrolling) still
+   fills the pane edge to edge, exactly like before; a genuinely long line
+   still grows the table past that floor. */
+.sxs .side .srows { display: table; min-width: 100%; border-spacing: 0; }
+.srow { display: table-row; font-size: 12px; white-space: pre; min-height: 19px; }
 .srow .ln {
   position: sticky;
   left: 0;
   z-index: 1;
+  display: table-cell;
+  width: 40px;
+  vertical-align: top;
+  color: var(--faint);
+  text-align: right;
+  background: var(--bg2);
+}
+/* The commentable trigger (P4-fixes.md #5) is a <button> *inside* the sticky
+   cell, not the cell itself: Safari/WebKit has a long-standing bug where
+   form controls (button/input/select) ignore display:table-cell/-row, so
+   the cell must stay a plain, table-safe <span> (.ln) — the button is just
+   an ordinary block-level child of it, no table display of its own needed. */
+.ln-btn {
   display: block;
   width: 100%;
   margin: 0;
   border: 0;
   appearance: none;
+  background: none;
   font: inherit;
   line-height: inherit;
-  color: var(--faint);
+  color: inherit;
   text-align: right;
   padding: 0 7px;
-  background: var(--bg2);
+  cursor: pointer;
 }
-.srow .code { padding: 0 9px; }
+.ln-btn:hover, .ln-btn:focus-visible { background: rgba(108, 182, 255, .18); color: var(--accent); }
+.srow .code { display: table-cell; vertical-align: top; padding: 0 9px; }
 .srow.add { background: var(--addbg); }
 .srow.add .code { color: #aff0b5; }
 .srow.del { background: var(--delbg); }
@@ -234,15 +259,6 @@ code { font-family: var(--mono); }
 .btn.ghost.danger { color: var(--del); border-color: var(--delln); }
 .btn.ghost.danger:hover { border-color: var(--del); }
 .file-h .c-add { margin-left: 8px; }
-
-/* a line-number gutter cell that can anchor a comment: a real <button> (see
-   room.tmpl), keyboard-focusable and click-operable, unlike the old
-   hover-only <span> (data-line is only present on cells with a real line
-   number — filler/empty cells stay a plain, inert <span>). :focus-visible
-   gets the same cue as :hover so tabbing to it is as discoverable as
-   hovering it (WCAG 2.1.1/2.4.7). */
-.ln[data-line] { cursor: pointer; }
-.ln[data-line]:hover, .ln[data-line]:focus-visible { background: rgba(108, 182, 255, .18); color: var(--accent); }
 
 /* the per-file comment strip, right under the file header; renders with no
    visible chrome of its own when it has no children so an uncommented file

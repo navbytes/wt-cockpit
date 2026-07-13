@@ -264,7 +264,11 @@ function showBanner(el, text) {
   }
 
   document.addEventListener("click", function (e) {
-    var trigger = e.target.closest(".ln[data-line], .c-add");
+    // .ln-btn is the commentable gutter trigger (nested inside the sticky
+    // .ln table-cell, not the cell itself — see style.css's doc comment on
+    // why); it's only ever rendered on lines with a real line number, so its
+    // mere presence is the "commentable" signal now (no [data-line] filter).
+    var trigger = e.target.closest(".ln-btn, .c-add");
     if (trigger) {
       openComposer(trigger.dataset.fileIdx, trigger.dataset.file, trigger.dataset.line, trigger.dataset.side);
       return;
