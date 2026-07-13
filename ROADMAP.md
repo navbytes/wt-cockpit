@@ -41,9 +41,12 @@ Goal: the daemon becomes something you leave running for weeks.
 - **Service files**: launchd plist (macOS) + systemd unit (Linux), `wtd install`.
 - Structured logging, `wt status` (daemon health, watch counts, scan timings).
 
-## v0.3 — The TUI (daily driver)
+## v0.3 — The TUI (daily driver) ✅ (shipped)
 
 Goal: replace the ANSI `ls`/`watch` with the full-screen cockpit from the UX mock.
+Shipped: radar + virtualized diff pane, chroma highlighting, review/approve flow,
+tmux jump, TTY-default `wt`; unified view in-TUI (side-by-side belongs to v0.4's
+reading room). Deferred within phase: `c` comments key (v0.4), in-diff search.
 
 - **Bubble Tea** radar: project→worktree tree pane + live diff pane, pulse states,
   guardrail badges; `viewport`-virtualized rendering so 5k-line diffs never block.

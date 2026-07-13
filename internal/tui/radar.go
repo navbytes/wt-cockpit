@@ -245,14 +245,38 @@ func renderDiffHeader(width int, w model.Worktree, focused, reviewing bool) stri
 		base = styles.Dim.Render("base ") + styles.Accent.Render(w.Base)
 	}
 
-	summary := fmt.Sprintf("%d files · %s %s · %s",
+	stats := fmt.Sprintf("%d files · %s %s",
 		w.Stats.Files,
 		styles.Add.Render(fmt.Sprintf("+%d", w.Stats.Add)),
 		styles.Del.Render(fmt.Sprintf("-%d", w.Stats.Del)),
-		agentChipStyle(w.Agent).Render(string(w.Agent)),
 	)
-	line := title + "   " + base + "   " + summary
-	return clipWidth(line, width)
+	line := title + "   " + base + "   " + stats
+
+	// The agent chip is the header's lowest-priority, trailing segment.
+	// Review's diff pane (width - railWidth) is far narrower than Radar's
+	// full main pane, so a bare clipWidth on the whole line was much more
+	// likely to cut it off mid-glyph there, leaving the "· " that introduces
+	// it dangling with nothing after it (ux-expert regression,
+	// p3-frames-2/frame_07: "1 files · +1 -1 ·" butted straight against the
+	// rail). Appended only whole, dropped entirely otherwise — never partial.
+	chip := " · " + agentChipStyle(w.Agent).Render(string(w.Agent))
+	if lipgloss.Width(line+chip) <= width {
+		line += chip
+	}
+
+	return trimDanglingSeparator(clipWidth(line, width))
+}
+
+// trimDanglingSeparator strips a trailing "·" (the header's own segment
+// joiner, with or without the space that follows it in the untruncated
+// string) left dangling when clipWidth's width-aware cut lands right after
+// one — a backstop alongside the chip's own whole-or-nothing append above,
+// for whichever width happens to cut the line at that exact boundary
+// instead. The header must never end in a separator with nothing after it.
+func trimDanglingSeparator(s string) string {
+	s = strings.TrimRight(s, " ")
+	s = strings.TrimSuffix(s, "·")
+	return strings.TrimRight(s, " ")
 }
 
 // renderGuardrailBanner is the mock's amber alert box: the featured hit's

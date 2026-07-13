@@ -32,6 +32,18 @@ const (
 
 const sidebarWidth = 34
 
+// gutterWidth is the single column P3-design.md's own ASCII sketch draws
+// between the sidebar and the main pane ("sidebar (34 cols) ─────────┬ main
+// pane"), which mock.html's `.sidebar{border-right:1px solid var(--line)}`
+// agrees with. shellView used to join the two directly against each other
+// with nothing in between: packRow/fitWidth guarantee a sidebar row's own
+// content is exactly sidebarWidth cells (ux-expert P1-1), so its
+// right-aligned counts/badge landed flush against whatever the main pane's
+// leftmost column held next — "+5 -3" butted straight against the diff
+// pane's own content, no separating space at all (ux-expert regression,
+// p3-frames-2/frame_07).
+const gutterWidth = 1
+
 // screenID selects which of the two views (P3-design.md §1.1) app.go routes
 // to. Radar's real composition (radar.go) landed in WP2; Review's rail
 // (review.go) is still WP3's stub.
@@ -683,15 +695,33 @@ func (m appModel) shellView() string {
 
 	top := renderTopbar(m.width, m.sidebar.worktrees(), m.conn, m.connAttempt, m.screen)
 	side := m.sidebar.view(sidebarWidth, bodyH, m.conn)
-	mainWidth := m.width - sidebarWidth
+	gutter := renderGutter(bodyH)
+	mainWidth := m.width - sidebarWidth - gutterWidth
 	if mainWidth < 0 {
 		mainWidth = 0
 	}
 	main := m.mainPaneView(mainWidth, bodyH)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, side, main)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, side, gutter, main)
 	keybar := renderKeybar(m.width, m.screen, m.diffFocused, m.toast, m.toastOK)
 
 	return lipgloss.JoinVertical(lipgloss.Left, top, body, keybar)
+}
+
+// renderGutter is the sidebar/main-pane separator column (gutterWidth wide,
+// height rows tall): the mock's hairline border made real as a dim "│" —
+// P3-design.md's own preference over a blank column when the two don't
+// conflict, and they don't here (a plain background-only gap would work
+// equally well structurally, but the rune is the actual mock cue).
+func renderGutter(height int) string {
+	if height < 1 {
+		height = 1
+	}
+	line := styles.Dim.Render("│")
+	lines := make([]string, height)
+	for i := range lines {
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // mainPaneView renders Radar's diff pane (flatten.go/diffview.go/radar.go)

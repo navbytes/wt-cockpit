@@ -340,6 +340,40 @@ func TestRenderDiffHeaderReviewingShowsBranchVsBase(t *testing.T) {
 	}
 }
 
+// TestRenderDiffHeaderNeverEndsInADanglingSeparator is the ux-expert
+// regression's property test (p3-frames-2/frame_07): a width-starved header
+// — Review's diff pane is width-railWidth, far narrower than Radar's own
+// full main pane — used to blindly clipWidth the whole title+base+stats+chip
+// line, which could cut the trailing agent chip off mid-glyph and leave the
+// "· " that introduces it dangling with nothing after it ("1 files · +1 -1
+// ·" butted straight against the rail). Sweeps every width from 0 up to
+// comfortably past each fixture's own full unclipped length, both reviewing
+// states, and two worktrees (a short one, and one whose branch/base/agent
+// are all long enough to stress every segment) — the invariant must hold
+// regardless of exactly where a given width happens to cut the line.
+func TestRenderDiffHeaderNeverEndsInADanglingSeparator(t *testing.T) {
+	worktrees := []model.Worktree{
+		{Repo: "api", Name: "feature", Branch: "feature", Base: "main", Agent: model.AgentClaude, Stats: model.Stats{Files: 3, Add: 10, Del: 2}},
+		{
+			Repo: "api-server", Name: "a-rather-long-worktree-name-indeed",
+			Branch: "a-rather-long-branch-name-indeed", Base: "release/a-rather-long-base-name",
+			Agent: model.AgentAider, Stats: model.Stats{Files: 123456, Add: 999999, Del: 999999},
+		},
+	}
+	for _, w := range worktrees {
+		for _, reviewing := range []bool{false, true} {
+			full := stripANSI(renderDiffHeader(10000, w, false, reviewing))
+			maxWidth := lipgloss.Width(full) + 2
+			for width := 0; width <= maxWidth; width++ {
+				got := stripANSI(renderDiffHeader(width, w, false, reviewing))
+				if trimmed := strings.TrimRight(got, " "); strings.HasSuffix(trimmed, "·") {
+					t.Fatalf("renderDiffHeader(width=%d, reviewing=%v, %+v) = %q, ends in a dangling separator", width, reviewing, w, got)
+				}
+			}
+		}
+	}
+}
+
 // ---- radarView.view: loading / error / real content ----
 
 func TestRadarViewShowsLoadingPlaceholderBeforeDiffArrives(t *testing.T) {
