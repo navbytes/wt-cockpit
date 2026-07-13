@@ -612,16 +612,26 @@ func TestSecretsPatternDoesNotFalsePositiveOnKebabCaseSK(t *testing.T) {
 		}
 	}
 
-	realKey := "sk-" + strings.Repeat("a", 40)
-	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `key := "`+realKey+`"`)}}
-	var tripped bool
-	for _, h := range e.Eval(diff) {
-		if h.Rule == "secrets-pattern" {
-			tripped = true
-		}
+	// Real OpenAI keys still trip — the classic form and the newer hyphenated
+	// project/service-account forms (`sk-proj-`, `sk-svcacct-`), which the plain
+	// `sk-[A-Za-z0-9]{20,}` narrowing dropped (security closure LOW). Fixtures
+	// are assembled so no contiguous credential literal sits in source.
+	mustTrip := []string{
+		"sk-" + strings.Repeat("a", 40),
+		"sk-" + "proj-" + strings.Repeat("b", 40),
+		"sk-" + "svcacct-" + strings.Repeat("c", 40),
 	}
-	if !tripped {
-		t.Errorf("a real sk-<40 alnum> token must still trip secrets-pattern, got no hit for %q", realKey)
+	for _, realKey := range mustTrip {
+		diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `key := "`+realKey+`"`)}}
+		var tripped bool
+		for _, h := range e.Eval(diff) {
+			if h.Rule == "secrets-pattern" {
+				tripped = true
+			}
+		}
+		if !tripped {
+			t.Errorf("a real OpenAI key %q must trip secrets-pattern, got no hit", realKey)
+		}
 	}
 }
 
