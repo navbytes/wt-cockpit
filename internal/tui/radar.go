@@ -204,7 +204,7 @@ func (r *radarView) view(width, height int, w model.Worktree, focused, reviewing
 	case r.pane.diff.WorktreeID != w.ID:
 		body = lipgloss.NewStyle().Width(width).Height(paneH).Render(styles.Dim.Render("loading diff…"))
 	default:
-		body = r.pane.render(width, paneH, r.hl, dangerFiles(w.Guardrails))
+		body = r.pane.render(width, paneH, r.hl, fileSeverity(w.Guardrails))
 	}
 
 	parts := []string{header}
@@ -280,11 +280,15 @@ func trimDanglingSeparator(s string) string {
 	return strings.TrimRight(s, " ")
 }
 
-// renderGuardrailBanner is the mock's amber alert box: the featured hit's
-// rule message verbatim, plus — when the featured hit carries a Line (a
+// renderGuardrailBanner is the mock's alert box: the featured hit's rule
+// message verbatim, plus — when the featured hit carries a Line (a
 // content-condition hit: secrets-pattern/secrets-entropy, P5-design.md
 // §1.1/§1.6) — a "· file:line" suffix so it's jumpable-by-eye, then a "+N
-// more" suffix when several rules tripped.
+// more" suffix when several rules tripped. Tinted red (styles.Del/DelBg) when
+// the featured hit (worst severity present, picked below) is "danger", else
+// amber (styles.Warn/WarnBg) — ux-expert P1-1b: this used to always render
+// amber regardless of severity, contradicting its own sidebar badge
+// (severityBadge) and the web room banner, both of which already grade.
 //
 // featured.Message runs through diffparse.SanitizeControl before rendering.
 // Diff content/paths are already sanitized upstream by diffparse.Parse (the
@@ -304,28 +308,38 @@ func renderGuardrailBanner(width int, hits []model.GuardrailHit) string {
 			break
 		}
 	}
-	text := styles.Warn.Bold(true).Render("⚠ guardrail: ") + styles.Txt.Render(diffparse.SanitizeControl(featured.Message))
+	fg, bg := styles.Warn, styles.WarnBg
+	if featured.Severity == "danger" {
+		fg, bg = styles.Del, styles.DelBg
+	}
+	text := fg.Bold(true).Render("⚠ guardrail: ") + styles.Txt.Render(diffparse.SanitizeControl(featured.Message))
 	if featured.Line > 0 {
 		text += styles.Dim.Render(fmt.Sprintf(" · %s:%d", featured.File, featured.Line))
 	}
 	if len(hits) > 1 {
 		text += styles.Dim.Render(fmt.Sprintf(" (+%d more)", len(hits)-1))
 	}
-	return styles.WarnBg.Width(width).Padding(0, 1).Render(text)
+	return bg.Width(width).Padding(0, 1).Render(text)
 }
 
-// dangerFiles is the set of file paths a guardrail hit names, regardless of
-// the hit's own severity — P3-design.md §1.1's "danger tag red when a
-// guardrail hit names the file" (the tag's color is fixed; it's not itself
-// severity-graded like the sidebar's ⚠ badge).
-func dangerFiles(hits []model.GuardrailHit) map[string]bool {
-	if len(hits) == 0 {
-		return nil
-	}
-	out := make(map[string]bool, len(hits))
+// fileSeverity computes each named file's own WORST guardrail severity
+// ("danger" beats "warn") — ux-expert P1-1a: the file header's tag now
+// carries this instead of a fixed "any hit = danger" bool, so a warn-only
+// rule (deps-manifest-changed, edits-ci, lockfile-churn, large-deletion,
+// binary-added, secrets-entropy) no longer paints its file red. Grading
+// matches severityBadge/renderGuardrailBanner's own "danger wins" rule.
+func fileSeverity(hits []model.GuardrailHit) map[string]string {
+	out := make(map[string]string, len(hits))
 	for _, h := range hits {
-		if h.File != "" {
-			out[h.File] = true
+		if h.File == "" {
+			continue
+		}
+		sev := "warn"
+		if h.Severity == "danger" {
+			sev = "danger"
+		}
+		if sev == "danger" || out[h.File] == "" {
+			out[h.File] = sev
 		}
 	}
 	return out

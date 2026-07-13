@@ -30,9 +30,10 @@
     <div class="diff" id="diff">
       {{range $fc := .Files}}
       <div class="file" id="file-{{$fc.Idx}}">
-        <div class="file-h {{if $fc.Danger}}flag{{end}}">
+        <div class="file-h {{if $fc.HitSeverity}}flag{{end}}">
           <span class="fname"><span class="path">{{$fc.Dir}}</span>{{$fc.FileName}}</span>
-          {{if $fc.Danger}}<span class="tag danger">danger</span>{{else if ne (print $fc.Status) "modified"}}<span class="tag">{{$fc.Status}}</span>{{end}}
+          {{if ne (print $fc.Status) "modified"}}<span class="tag">{{$fc.Status}}</span>{{end}}
+          {{if $fc.HitSeverity}}<span class="tag {{$fc.HitSeverity}}">{{$fc.HitSeverity}}</span>{{end}}
           <span class="fnums"><span class="add">+{{$fc.Stats.Add}}</span> <span class="del">&minus;{{$fc.Stats.Del}}</span></span>
           <label class="rev-check"><input type="checkbox" class="rev-toggle card-toggle" data-file="{{$fc.Path}}" data-file-hash="{{$fc.Hash}}" {{if $fc.Reviewed}}checked{{end}}> reviewed</label>
           <button type="button" class="btn ghost c-add" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="0" data-side="new" title="comment on this file">&#9998; comment</button>

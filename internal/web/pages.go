@@ -56,7 +56,18 @@ type indexView struct {
 // concern, not required by WP2's done-when (index renders live worktrees).
 type repoGroup struct {
 	Repo      string
-	Worktrees []model.Worktree
+	Worktrees []worktreeRow
+}
+
+// worktreeRow is one worktree in the index's list: the raw model.Worktree
+// (embedded, so index.tmpl's existing field references keep working
+// unchanged) plus its own worst guardrail severity, computed once here so
+// the badge can grade red/amber the same way the TUI sidebar badge
+// (severityBadge) and CLI radar already do (ux-expert P1-1c) instead of a
+// fixed amber regardless of severity.
+type worktreeRow struct {
+	model.Worktree
+	Severity string // "danger" | "warn" | "" (no hits)
 }
 
 // counts are the topbar's live numbers (mock: worktrees/active/unreviewed/
@@ -71,7 +82,7 @@ type counts struct {
 func (a *app) buildIndexView() indexView {
 	wts := a.eng.List()
 
-	byRepo := map[string][]model.Worktree{}
+	byRepo := map[string][]worktreeRow{}
 	var order []string
 	var c counts
 	for _, w := range wts {
@@ -87,7 +98,7 @@ func (a *app) buildIndexView() indexView {
 		if _, ok := byRepo[w.Repo]; !ok {
 			order = append(order, w.Repo)
 		}
-		byRepo[w.Repo] = append(byRepo[w.Repo], w)
+		byRepo[w.Repo] = append(byRepo[w.Repo], worktreeRow{Worktree: w, Severity: worstSeverity(w.Guardrails)})
 	}
 	sort.Strings(order)
 
@@ -154,8 +165,9 @@ type roomView struct {
 }
 
 // fileCardView is one DiffFile's rendered content: the header line (name,
-// status/danger tag, stats, reviewed checkbox) plus however its body renders
-// (binary note, collapsed note, or the side-by-side hunks).
+// status tag, per-file guardrail severity tag, stats, reviewed checkbox)
+// plus however its body renders (binary note, collapsed note, or the
+// side-by-side hunks).
 type fileCardView struct {
 	Idx         int
 	Path        string // == model.DiffFile.Path (data-file/anchor keys)
@@ -163,7 +175,7 @@ type fileCardView struct {
 	Dir         string
 	FileName    string
 	Status      model.FileStatus
-	Danger      bool
+	HitSeverity string // this file's own worst guardrail severity ("danger"|"warn"), "" if none tripped
 	Stats       model.Stats
 	Reviewed    bool
 	Hash        string
@@ -225,12 +237,12 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 
 	hits := guardrailHitsFor(wt)
 	msg, more, severity := guardrailBanner(hits)
-	danger := dangerFiles(hits)
+	sev := fileSeverity(hits)
 
 	files := make([]fileCardView, len(d.Files))
 	reviewedCount := 0
 	for i, f := range d.Files {
-		files[i] = a.buildFileCard(i, f, reviewedMap[f.Path], danger, expanded, views)
+		files[i] = a.buildFileCard(i, f, reviewedMap[f.Path], sev, expanded, views)
 		if reviewedMap[f.Path] {
 			reviewedCount++
 		}
@@ -267,12 +279,16 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 // the file's single per-file highlight pass by a running codeIdx offset —
 // the same "concatenated hunk lines, indexed 1:1" convention
 // internal/tui/flatten.go's codeIdx uses.
-func (a *app) buildFileCard(idx int, f model.DiffFile, reviewed bool, danger map[string]bool, expanded map[string]bool, comments []model.CommentView) fileCardView {
+func (a *app) buildFileCard(idx int, f model.DiffFile, reviewed bool, sev map[string]string, expanded map[string]bool, comments []model.CommentView) fileCardView {
 	disp := displayPath(f)
 	dir, base := dirsplit(disp)
+	hitSev := sev[f.Path]
+	if hitSev == "" && f.OldPath != "" {
+		hitSev = sev[f.OldPath]
+	}
 	card := fileCardView{
 		Idx: idx, Path: f.Path, DisplayPath: disp, Dir: dir, FileName: base,
-		Status: f.Status, Danger: danger[f.Path] || (f.OldPath != "" && danger[f.OldPath]),
+		Status: f.Status, HitSeverity: hitSev,
 		Stats: f.Stats, Reviewed: reviewed, Hash: f.Hash, Binary: f.Binary,
 		CommentGroups: fileCommentGroups(comments, f.Path, idx),
 	}
@@ -355,16 +371,38 @@ func guardrailBanner(hits []model.GuardrailHit) (message string, more int, sever
 	return diffparse.SanitizeControl(featured.Message), len(hits) - 1, sev
 }
 
-// dangerFiles is the set of file paths a guardrail hit names, regardless of
-// the hit's own severity — mirrors internal/tui/radar.go's dangerFiles
-// exactly (P3-design.md §1.1: "danger tag red when a guardrail hit names the
-// file").
-func dangerFiles(hits []model.GuardrailHit) map[string]bool {
-	out := make(map[string]bool, len(hits))
+// worstSeverity grades hits the same "danger wins" rule every other
+// severity-aware surface in this app already applies (internal/tui/
+// sidebar.go's severityBadge, cmd/wt's renderRadar, guardrailBanner above):
+// "danger" if ANY hit is that severity, else "warn" if there's at least one
+// hit, else "" for none at all.
+func worstSeverity(hits []model.GuardrailHit) string {
+	sev := ""
+	for _, h := range hits {
+		if h.Severity == "danger" {
+			return "danger"
+		}
+		sev = "warn"
+	}
+	return sev
+}
+
+// fileSeverity computes each named file's own worst severity — the file
+// card's tag now carries this instead of a single "any hit = red danger"
+// bool (ux-expert P1-1a), mirroring internal/tui/radar.go's identically-named
+// helper: a warn-only rule (deps-manifest-changed, edits-ci, lockfile-churn,
+// large-deletion, binary-added, secrets-entropy) no longer paints its file
+// red, and — per room.tmpl — no longer replaces the file's own status tag.
+func fileSeverity(hits []model.GuardrailHit) map[string]string {
+	byFile := map[string][]model.GuardrailHit{}
 	for _, h := range hits {
 		if h.File != "" {
-			out[h.File] = true
+			byFile[h.File] = append(byFile[h.File], h)
 		}
+	}
+	out := make(map[string]string, len(byFile))
+	for f, hs := range byFile {
+		out[f] = worstSeverity(hs)
 	}
 	return out
 }

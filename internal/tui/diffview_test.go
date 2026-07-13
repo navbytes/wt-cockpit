@@ -7,6 +7,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
 	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
@@ -228,6 +231,64 @@ func TestRenderFileHeaderNoCheckmarkWhenNotReviewed(t *testing.T) {
 	}
 }
 
+// TestRenderFileHeaderTagGradesBySeverityAndKeepsStatus pins ux-expert
+// P1-1a's TUI half: a per-file hit's tag must reflect ITS OWN severity
+// (danger vs warn), not a single "any hit = danger" bool, and must not
+// clobber the file's own status tag — a warn-only added file (the audit's
+// own example: a binary-added hit is always warn+added together) must show
+// BOTH "added" and "warn".
+func TestRenderFileHeaderTagGradesBySeverityAndKeepsStatus(t *testing.T) {
+	d := model.Diff{Files: []model.DiffFile{
+		{Path: "go.mod", Status: model.FileAdded, Hash: "h1"},
+	}}
+	v := newTestPane(d)
+
+	warnTag := stripANSI(v.renderFileHeader(0, 80, map[string]string{"go.mod": "warn"}))
+	if !strings.Contains(warnTag, "warn") {
+		t.Errorf("header = %q, want a warn tag for a warn-severity hit", warnTag)
+	}
+	if strings.Contains(warnTag, "danger") {
+		t.Errorf("header = %q, a warn-only hit must not show the danger tag", warnTag)
+	}
+	if !strings.Contains(warnTag, "added") {
+		t.Errorf("header = %q, want the file's own \"added\" status preserved alongside the severity tag", warnTag)
+	}
+
+	dangerTag := stripANSI(v.renderFileHeader(0, 80, map[string]string{"go.mod": "danger"}))
+	if !strings.Contains(dangerTag, "danger") {
+		t.Errorf("header = %q, want a danger tag for a danger-severity hit", dangerTag)
+	}
+	if !strings.Contains(dangerTag, "added") {
+		t.Errorf("header = %q, want the status tag preserved for a danger hit too", dangerTag)
+	}
+
+	noHit := stripANSI(v.renderFileHeader(0, 80, nil))
+	if strings.Contains(noHit, "warn") || strings.Contains(noHit, "danger") {
+		t.Errorf("header = %q, want no severity tag when the file has no hit", noHit)
+	}
+	if !strings.Contains(noHit, "added") {
+		t.Errorf("header = %q, want the status tag regardless of hit presence", noHit)
+	}
+}
+
+// TestRenderFileHeaderDangerTagStyledDifferentlyFromWarnTag pins the color
+// grading itself (not just the text label): compares under TrueColor, same
+// pattern as sidebar_test.go's TestSeverityBadgeWorstSeverityWins.
+func TestRenderFileHeaderDangerTagStyledDifferentlyFromWarnTag(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	d := model.Diff{Files: []model.DiffFile{{Path: "go.mod", Status: model.FileAdded, Hash: "h1"}}}
+	v := newTestPane(d)
+
+	warnTag := v.renderFileHeader(0, 80, map[string]string{"go.mod": "warn"})
+	dangerTag := v.renderFileHeader(0, 80, map[string]string{"go.mod": "danger"})
+	if warnTag == dangerTag {
+		t.Error("a danger tag must render styled differently from a warn tag")
+	}
+}
+
 func TestCurrentFileReturnsFileUnderCursor(t *testing.T) {
 	d := model.Diff{WorktreeID: "w1", Files: []model.DiffFile{
 		{Path: "a.go", Hash: "ha"}, {Path: "b.go", Hash: "hb"},
@@ -338,13 +399,13 @@ func BenchmarkDiffviewRenderFrame(b *testing.B) {
 		lines := strings.Split(content, "\n")
 		hl.put(f.Hash, lines)
 	}
-	danger := map[string]bool{}
+	sev := map[string]string{}
 
 	maxOffset := len(v.lines) - v.height
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		v.offset = i % (maxOffset + 1)
-		_ = v.render(120, 60, hl, danger)
+		_ = v.render(120, 60, hl, sev)
 	}
 }
 
@@ -369,14 +430,14 @@ func TestDiffviewRenderFrameStaysWithinBudget(t *testing.T) {
 	for _, f := range d.Files {
 		hl.put(f.Hash, strings.Split(concatFileContent(f), "\n"))
 	}
-	danger := map[string]bool{}
+	sev := map[string]string{}
 
 	const budget = 8 * time.Millisecond
 	best := time.Hour
 	for i := 0; i < 5; i++ {
 		v.offset = i
 		start := time.Now()
-		_ = v.render(120, 60, hl, danger)
+		_ = v.render(120, 60, hl, sev)
 		if elapsed := time.Since(start); elapsed < best {
 			best = elapsed
 		}

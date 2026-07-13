@@ -249,19 +249,28 @@ func TestApplyDiffReadyRefetchesOnHashChange(t *testing.T) {
 	}
 }
 
-// ---- guardrail banner / danger tag ----
+// ---- guardrail banner / per-file severity tag ----
 
-func TestDangerFilesIncludesAnyHitRegardlessOfSeverity(t *testing.T) {
-	got := dangerFiles([]model.GuardrailHit{
+// TestFileSeverityGradesWorstPerFile pins ux-expert P1-1a: each named file
+// gets its OWN worst severity ("danger" beats "warn"), not a single "any hit
+// = danger" bool — a warn-only rule (deps-manifest-changed, edits-ci,
+// lockfile-churn, large-deletion, binary-added, secrets-entropy) must no
+// longer paint its file red.
+func TestFileSeverityGradesWorstPerFile(t *testing.T) {
+	got := fileSeverity([]model.GuardrailHit{
 		{File: "a.go", Severity: "warn"},
 		{File: "b.go", Severity: "danger"},
-		{File: "", Severity: "danger"}, // no file named: not a per-file tag
+		{File: "b.go", Severity: "warn"}, // b.go also warn-tagged elsewhere: danger still wins
+		{File: "", Severity: "danger"},   // no file named: not a per-file tag
 	})
-	if !got["a.go"] || !got["b.go"] {
-		t.Errorf("dangerFiles = %v, want both a.go and b.go present", got)
+	if got["a.go"] != "warn" {
+		t.Errorf("fileSeverity[a.go] = %q, want warn", got["a.go"])
+	}
+	if got["b.go"] != "danger" {
+		t.Errorf("fileSeverity[b.go] = %q, want danger (worst of warn+danger)", got["b.go"])
 	}
 	if len(got) != 2 {
-		t.Errorf("dangerFiles = %v, want exactly 2 entries", got)
+		t.Errorf("fileSeverity = %v, want exactly 2 entries", got)
 	}
 }
 
@@ -331,6 +340,52 @@ func TestRenderGuardrailBannerSanitizesControlBytesInMessage(t *testing.T) {
 	}
 	if !strings.Contains(stripANSI(got), "^[") {
 		t.Errorf("banner = %q, want the sanitized ESC byte rendered as caret notation \"^[\"", stripANSI(got))
+	}
+}
+
+// TestRenderGuardrailBannerGradesByWorstSeverity pins ux-expert P1-1b: the
+// diff-pane banner must grade red for a danger-severity featured hit and
+// amber for a warn-only one — matching its own sidebar badge (severityBadge,
+// sidebar_test.go's TestSeverityBadgeWorstSeverityWins) and the web room
+// banner instead of always rendering amber regardless of severity. Compares
+// under TrueColor (the package's TestMain forces Ascii, which strips all
+// styling) so the two grades are actually visibly distinct: each case is
+// checked for containing its own severity's styled "⚠ guardrail: " prefix
+// (not the other's) rather than a whole-string ref, since the mixed case's
+// extra "+N more" suffix would otherwise make it differ from a single-hit
+// danger fixture even with identical grading.
+func TestRenderGuardrailBannerGradesByWorstSeverity(t *testing.T) {
+	saved := lipgloss.ColorProfile()
+	defer lipgloss.SetColorProfile(saved)
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	dangerPrefix := styles.Del.Bold(true).Render("⚠ guardrail: ")
+	warnPrefix := styles.Warn.Bold(true).Render("⚠ guardrail: ")
+	if dangerPrefix == warnPrefix {
+		t.Fatal("precondition: styles.Del and styles.Warn must render distinctly under TrueColor")
+	}
+
+	cases := []struct {
+		name       string
+		hits       []model.GuardrailHit
+		wantDanger bool
+	}{
+		{"warn only", []model.GuardrailHit{{Severity: "warn", Message: "m"}}, false},
+		{"danger only", []model.GuardrailHit{{Severity: "danger", Message: "m"}}, true},
+		{"mixed: worst (danger) wins", []model.GuardrailHit{{Severity: "warn", Message: "m1"}, {Severity: "danger", Message: "m2"}}, true},
+	}
+	for _, c := range cases {
+		got := renderGuardrailBanner(80, c.hits)
+		want, notWant := warnPrefix, dangerPrefix
+		if c.wantDanger {
+			want, notWant = dangerPrefix, warnPrefix
+		}
+		if !strings.Contains(got, want) {
+			t.Errorf("%s: renderGuardrailBanner = %q, missing its expected severity-graded prefix", c.name, got)
+		}
+		if strings.Contains(got, notWant) {
+			t.Errorf("%s: renderGuardrailBanner = %q, must not use the other severity's prefix", c.name, got)
+		}
 	}
 }
 

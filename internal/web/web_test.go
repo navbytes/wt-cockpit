@@ -204,6 +204,60 @@ func TestIndexPageEmbedsCSRFMetaTag(t *testing.T) {
 	}
 }
 
+// ---- index worktree badge severity grading (ux-expert P1-1c) ----
+//
+// buildRepoEngine/buildRepoEngineWithRules/mustWriteFile come from
+// room_test.go (same package): a fixture worktree whose populate func writes
+// files that trip specific default guardrail rules.
+
+// TestIndexBadgeGradesDangerForDangerHit pins that the index's worktree
+// badge grades red for a danger-severity hit, matching the TUI sidebar badge
+// and CLI radar (both already correct) instead of a fixed amber.
+func TestIndexBadgeGradesDangerForDangerHit(t *testing.T) {
+	eng, _ := buildRepoEngine(t, func(_, wt string) {
+		mustWriteFile(t, filepath.Join(wt, "migrations", "014_drop.sql"), []byte("DROP TABLE x;\n"))
+	})
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	body := getPage(t, h, "/").Body.String()
+	if !strings.Contains(body, `class="badge-alert danger"`) {
+		t.Errorf("expected the danger-hit worktree's badge graded danger, got:\n%s", body)
+	}
+}
+
+// TestIndexBadgeGradesWarnForWarnOnlyHit is the other half: a worktree
+// tripping only a warn-severity rule must show the amber grade, not danger.
+func TestIndexBadgeGradesWarnForWarnOnlyHit(t *testing.T) {
+	eng, _ := buildRepoEngine(t, func(_, wt string) {
+		mustWriteFile(t, filepath.Join(wt, "go.mod"), []byte("module x\n\ngo 1.22\n"))
+	})
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	body := getPage(t, h, "/").Body.String()
+	if !strings.Contains(body, `class="badge-alert warn"`) {
+		t.Errorf("expected the warn-only worktree's badge graded warn, got:\n%s", body)
+	}
+	if strings.Contains(body, `class="badge-alert danger"`) {
+		t.Errorf("a warn-only worktree must not show a danger-graded badge, got:\n%s", body)
+	}
+}
+
+// TestIndexBadgeGradesDangerForMixedWorktree pins the consistency-check's
+// "mixed worktree" case at the worktree level: worst severity (danger) wins
+// on the index badge even though the same worktree also has a warn hit.
+func TestIndexBadgeGradesDangerForMixedWorktree(t *testing.T) {
+	eng, _ := buildRepoEngine(t, func(_, wt string) {
+		mustWriteFile(t, filepath.Join(wt, "go.mod"), []byte("module x\n\ngo 1.22\n"))
+		mustWriteFile(t, filepath.Join(wt, "migrations", "014_drop.sql"), []byte("DROP TABLE x;\n"))
+	})
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	body := getPage(t, h, "/").Body.String()
+	if !strings.Contains(body, `class="badge-alert danger"`) {
+		t.Errorf("expected a mixed warn+danger worktree's badge graded danger (worst wins), got:\n%s", body)
+	}
+}
+
 // ---- room: see room_test.go for the full WP3 suite (side-by-side rendering,
 // escaping torture, collapse/expand, 404/empty states, review/approve) ----
 
