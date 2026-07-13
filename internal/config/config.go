@@ -21,6 +21,47 @@ type RepoConfig struct {
 	Base string `toml:"base"`
 }
 
+// NotificationsConfig is [notifications]'s parsed shape (P5-design.md §1.5,
+// §2): the desktop-notifier's enable switch, severity floor, and per-key
+// re-notify cooldown. EnabledSet distinguishes an absent [notifications]
+// table (or a present one that just never sets `enabled`) from an explicit
+// `enabled = false` — both decode Enabled to Go's bool zero value, but only
+// the latter should actually turn notifications off; see EnabledOr.
+type NotificationsConfig struct {
+	Enabled  bool          `toml:"enabled"`
+	Severity string        `toml:"severity"`
+	Cooldown time.Duration `toml:"cooldown"`
+
+	EnabledSet bool `toml:"-"`
+}
+
+// EnabledOr resolves the frozen default: notifications are on unless the
+// config explicitly says `enabled = false` (P5-design.md §1.5 — "Default ON
+// because danger hits are rare by design").
+func (n NotificationsConfig) EnabledOr() bool {
+	if !n.EnabledSet {
+		return true
+	}
+	return n.Enabled
+}
+
+// SeverityOr resolves the frozen default floor: "danger" only, unless the
+// config sets "warn" (which admits warn+danger).
+func (n NotificationsConfig) SeverityOr() string {
+	if n.Severity == "" {
+		return "danger"
+	}
+	return n.Severity
+}
+
+// CooldownOr resolves the frozen default: 10 minutes.
+func (n NotificationsConfig) CooldownOr() time.Duration {
+	if n.Cooldown <= 0 {
+		return 10 * time.Minute
+	}
+	return n.Cooldown
+}
+
 // Config is the on-disk shape of config.toml. The zero value (returned when
 // the file doesn't exist) means "nothing configured" — every field left unset.
 type Config struct {
@@ -42,6 +83,8 @@ type Config struct {
 	// however short — replaces the defaults outright, because append-only
 	// would make the defaults un-disableable.
 	RulesSet bool `toml:"-"`
+
+	Notifications NotificationsConfig `toml:"notifications"`
 }
 
 // RulesOr returns the config's own rules if [[rules]] was present in the file,
@@ -72,6 +115,11 @@ func DefaultPath() string {
 // self-contradictory hand-edited rule (bad severity, a non-compiling
 // added_pattern, ...) fails fast at load time too — the same "typo fails
 // fast" philosophy, extended from the TOML shape to the rule semantics.
+// [notifications].severity is validated as an enum here too; .cooldown's
+// "parseable duration" half of P5-design.md §1.5's "Validated at load" is
+// already enforced by BurntSushi's own time.Duration decoding (same as the
+// existing top-level `interval` field) — a malformed string like "abc"
+// fails at the toml.DecodeFile call above, before this function ever sees it.
 func Load(path string) (Config, error) {
 	var cfg Config
 	meta, err := toml.DecodeFile(path, &cfg)
@@ -89,6 +137,12 @@ func Load(path string) (Config, error) {
 		if _, err := guardrail.Compile(cfg.Rules); err != nil {
 			return Config{}, fmt.Errorf("%s: %w", path, err)
 		}
+	}
+	cfg.Notifications.EnabledSet = meta.IsDefined("notifications", "enabled")
+	switch cfg.Notifications.Severity {
+	case "", "danger", "warn":
+	default:
+		return Config{}, fmt.Errorf("%s: invalid notifications.severity %q (want \"danger\" or \"warn\")", path, cfg.Notifications.Severity)
 	}
 	return cfg, nil
 }

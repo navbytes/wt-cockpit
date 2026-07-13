@@ -20,6 +20,7 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/gitbackend"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
+	"github.com/navbytes/wt-cockpit/internal/notify"
 	"github.com/navbytes/wt-cockpit/internal/registry"
 	"github.com/navbytes/wt-cockpit/internal/store"
 )
@@ -440,6 +441,79 @@ func TestHandleStatusIncludesRulePacksField(t *testing.T) {
 	}
 	if got.RulePacks.Loaded != 0 || got.RulePacks.Errors != 0 {
 		t.Errorf("RulePacks = %+v, want {0 0} for a fixture with no packs", got.RulePacks)
+	}
+}
+
+// ---- notifier wiring (P5-design.md §1.5) ----
+
+// TestNotifyLookupResolvesKnownWorktree pins notifyLookup's adaptation of
+// registry.Get into notify.Lookup: repo and name (branch/worktree name) come
+// straight off the registry snapshot.
+func TestNotifyLookupResolvesKnownWorktree(t *testing.T) {
+	reg := registry.New()
+	reg.Upsert(model.Worktree{ID: "wt1", Repo: "api-server", Name: "auth-refactor"})
+
+	lookup := notifyLookup(reg)
+	repo, name, ok := lookup("wt1")
+	if !ok || repo != "api-server" || name != "auth-refactor" {
+		t.Errorf("lookup(wt1) = (%q, %q, %v), want (api-server, auth-refactor, true)", repo, name, ok)
+	}
+}
+
+// TestNotifyLookupUnknownWorktreeReturnsFalse: a worktree that has vanished
+// (or never existed) must report ok=false, not panic or return stale data —
+// notify.Notifier.label falls back to the bare id in this case.
+func TestNotifyLookupUnknownWorktreeReturnsFalse(t *testing.T) {
+	reg := registry.New()
+	lookup := notifyLookup(reg)
+	if _, _, ok := lookup("no-such-id"); ok {
+		t.Error("lookup of an unknown worktree id should report ok=false")
+	}
+}
+
+// TestHandleStatusNotifierFieldReflectsNilNotifierAsDisabled: a *server
+// built directly (as every other test in this file does, without going
+// through main's wiring) has a nil notifier — handleStatus must still
+// answer with a sane, documented value rather than panicking.
+func TestHandleStatusNotifierFieldReflectsNilNotifierAsDisabled(t *testing.T) {
+	srv, _ := buildTestServer(t)
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got statusPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if got.Notifier != "disabled (config)" {
+		t.Errorf("Notifier = %q, want %q for a nil notifier", got.Notifier, "disabled (config)")
+	}
+}
+
+// TestHandleStatusNotifierFieldReflectsRealNotifierStatus: when a *server
+// carries a real, ENABLED notifier with no binary on PATH, /api/status must
+// surface its actual resolved Status() — "unavailable (no notifier binary)"
+// — proving handleStatus reads s.notifier.Status() and isn't coincidentally
+// always returning the nil-guard's "disabled (config)" default.
+func TestHandleStatusNotifierFieldReflectsRealNotifierStatus(t *testing.T) {
+	srv, _ := buildTestServer(t)  // needs git on PATH — build before clobbering it below
+	t.Setenv("PATH", t.TempDir()) // guarantees a LookPath miss regardless of host OS
+	srv.notifier = notify.New(notify.Config{Enabled: true}, func(string) (string, string, bool) { return "", "", false })
+	handler := srv.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var got statusPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if got.Notifier != "unavailable (no notifier binary)" {
+		t.Errorf("Notifier = %q, want %q from the real notifier's Status()", got.Notifier, "unavailable (no notifier binary)")
 	}
 }
 

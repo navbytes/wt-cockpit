@@ -28,6 +28,7 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/gitbackend"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
+	"github.com/navbytes/wt-cockpit/internal/notify"
 	"github.com/navbytes/wt-cockpit/internal/registry"
 	"github.com/navbytes/wt-cockpit/internal/store"
 	"github.com/navbytes/wt-cockpit/internal/watcher"
@@ -198,6 +199,26 @@ func main() {
 		}
 	})
 
+	// The desktop notifier is just another registry-bus subscriber (P5-
+	// design.md §1.5), constructed unconditionally (cheap: New probes PATH
+	// only when cfg.Notifications is actually enabled) so its Status() is
+	// always available for /api/status regardless of the enabled/disabled
+	// state. The subscription itself is only created when enabled — "enabled
+	// = false skips the subscription entirely" — a disabled-by-config
+	// notifier never even occupies a registry channel slot.
+	notifier := notify.New(notify.Config{
+		Enabled:  cfg.Notifications.EnabledOr(),
+		Severity: cfg.Notifications.SeverityOr(),
+		Cooldown: cfg.Notifications.CooldownOr(),
+	}, notifyLookup(reg))
+	if cfg.Notifications.EnabledOr() {
+		notifyCh, notifyCancel := reg.Subscribe(256)
+		go func() {
+			notifier.Run(ctx, notifyCh)
+			notifyCancel()
+		}()
+	}
+
 	// The web listener is opened before srv exists (and so before any
 	// handler goroutine can start reading srv.webAddr concurrently): doing
 	// it here is also what resolves an ephemeral "127.0.0.1:0" -web bind to
@@ -223,6 +244,7 @@ func main() {
 		statePath:   *statePath,
 		startedAt:   time.Now(),
 		webAddr:     resolvedWebAddr,
+		notifier:    notifier,
 	}
 	handler := srv.routes()
 
@@ -454,9 +476,25 @@ func expandHome(p string) string {
 	return p
 }
 
+// notifyLookup adapts the registry's Get into notify.Lookup: the notifier
+// resolves a worktree id to its repo/name for notification titles without
+// ever importing the engine (P5-design.md §1.5).
+func notifyLookup(reg *registry.Registry) notify.Lookup {
+	return func(id string) (repo, name string, ok bool) {
+		w := reg.Get(id)
+		if w == nil {
+			return "", "", false
+		}
+		return w.Repo, w.Name, true
+	}
+}
+
 // server holds everything an HTTP handler needs. socketPath/watcherMode/
 // roots/statePath/startedAt only exist for /api/status to report — main is
-// otherwise the sole owner of those settings, as resolved flags.
+// otherwise the sole owner of those settings, as resolved flags. notifier is
+// nil in tests that build a *server literal directly without going through
+// main (see handleStatus's nil guard) — every production server always has
+// one (main always constructs it, even when notifications are disabled).
 type server struct {
 	eng         *engine.Engine
 	socketPath  string
@@ -465,6 +503,7 @@ type server struct {
 	statePath   string
 	startedAt   time.Time
 	webAddr     string // "" when -web is off; else the actual bound address (correct under port 0)
+	notifier    *notify.Notifier
 }
 
 func (s *server) routes() http.Handler {
@@ -534,6 +573,7 @@ type statusPayload struct {
 	ReviewedFiles int              `json:"reviewedFiles"`
 	TotalFiles    int              `json:"totalFiles"`
 	RulePacks     rulePacksPayload `json:"rulePacks"`
+	Notifier      string           `json:"notifier"` // "osascript" | "notify-send" | "disabled (config)" | "unavailable (no notifier binary)"
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -546,6 +586,13 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		total += wt.Stats.Files
 	}
 	loaded, errs := s.eng.RulePackStats()
+	// s.notifier is nil only for a *server built directly in a test without
+	// going through main (see the server struct's doc comment) — every
+	// production daemon always has one.
+	notifierStatus := "disabled (config)"
+	if s.notifier != nil {
+		notifierStatus = s.notifier.Status()
+	}
 	writeJSON(w, statusPayload{
 		Version:       version,
 		Protocol:      model.ProtocolVersion,
@@ -560,6 +607,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ReviewedFiles: reviewed,
 		TotalFiles:    total,
 		RulePacks:     rulePacksPayload{Loaded: loaded, Errors: errs},
+		Notifier:      notifierStatus,
 	})
 }
 
