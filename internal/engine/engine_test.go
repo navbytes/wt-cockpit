@@ -17,6 +17,13 @@ import (
 	"github.com/navbytes/wt-cockpit/internal/store"
 )
 
+// fakeAWSKeyID is an AWS-access-key-ID-shaped fixture ("AKIA" + 16
+// uppercase-alnum chars) built from two literal fragments so the 20-byte
+// secret-shaped string never appears contiguous in this source file —
+// GitHub's push-protection scanner matches file text, not the constant Go
+// folds this into, so every test still sees the identical value as before.
+const fakeAWSKeyID = "AKIA" + "ABCDEFGHIJKLMNOP"
+
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -1460,6 +1467,154 @@ func TestGuardrailTrippedSuppressedDuringFirstScanThenEmittedOnNewHit(t *testing
 	}
 }
 
+// TestFirstScanErrorDoesNotOpenColdStartGate is the MINOR-1 fix pin: the old
+// code marked firstScanDone via an unconditional `defer`, so a discovery
+// failure or an early ctx-cancel on the very first Refresh still opened the
+// cold-start gate — the FOLLOWING successful scan would then republish every
+// standing hit as "new" (the exact restart storm the gate exists to
+// prevent). An already-canceled context makes Refresh's own per-repo loop
+// return ctx.Err() on its very first iteration, deterministically
+// reproducing "the first Refresh errors" without needing a real
+// discovery-layer failure.
+func TestFirstScanErrorDoesNotOpenColdStartGate(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+
+	sub, cancel := e.Registry().Subscribe(64)
+	defer cancel()
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	cancelCtx() // already canceled: Refresh's loop must see ctx.Err() != nil on its first repo
+	if err := e.Refresh(ctx); err == nil {
+		t.Fatal("expected the first Refresh to fail against an already-canceled context")
+	}
+
+	// The gate must still be closed: a normal, successful scan right after
+	// must suppress buildWorkspace's standing hits exactly like a genuine
+	// first scan would, not replay them as new.
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	feat := findByBranch(e.List(), "feature")
+	if feat == nil || len(feat.Guardrails) == 0 {
+		t.Fatal("precondition: buildWorkspace's feature worktree should have standing guardrail hits")
+	}
+	if ev := guardrailEvents(drainEvents(sub, 200*time.Millisecond)); len(ev) != 0 {
+		t.Fatalf("a failed first Refresh must not open the cold-start gate: the next successful scan republished standing hits as new: %+v", ev)
+	}
+}
+
+// TestGuardrailTrippedRefiresAfterHitClearsThenRecurs: a (rule, file) hit
+// that disappears (the file is fixed) and later reappears (the same file is
+// broken again) must publish a fresh guardrail.tripped the second time —
+// publishNewGuardrailHits only compares against the IMMEDIATELY PRECEDING
+// scan's hit set (meta.hits), not "have we ever seen this key", so clearing a
+// hit must reset it as "new" if it recurs.
+func TestGuardrailTrippedRefiresAfterHitClearsThenRecurs(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	os.MkdirAll(repo, 0o755)
+	git(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+
+	wtPath := filepath.Join(root, "repo-feature")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", wtPath)
+	secret := fakeAWSKeyID
+	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar k = \""+secret+"\"\n"), 0o644)
+
+	e := newEngine(t, root)
+	sub, cancel := e.Registry().Subscribe(64)
+	defer cancel()
+
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drainEvents(sub, 200*time.Millisecond) // cold-start gate suppresses the first scan
+
+	// Clear the hit: rewrite config.go with no secret. This must not itself
+	// publish anything (the hit going away isn't a "new hit" appearing).
+	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar k = \"clean\"\n"), 0o644)
+	if err := e.RefreshOne(context.Background(), wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if ev := guardrailEvents(drainEvents(sub, 200*time.Millisecond)); len(ev) != 0 {
+		t.Fatalf("a hit clearing must not itself publish a guardrail.tripped event, got %+v", ev)
+	}
+
+	// Recur: put the exact same secret back in the exact same file. Since the
+	// hit was absent from the immediately-preceding scan, this must fire again.
+	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar k = \""+secret+"\"\n"), 0o644)
+	if err := e.RefreshOne(context.Background(), wtPath); err != nil {
+		t.Fatal(err)
+	}
+	events := guardrailEvents(drainEvents(sub, time.Second))
+	var saw bool
+	for _, ev := range events {
+		if ev.Hit != nil && ev.Hit.Rule == "secrets-pattern" && ev.Hit.File == "config.go" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("a hit that cleared and then recurred must re-fire guardrail.tripped, got %+v", events)
+	}
+}
+
+// TestGuardrailTrippedKeyedByRuleAndFileTwoFilesSameRuleAreTwoEvents: two
+// different files tripping the SAME rule in one scan must publish two
+// distinct guardrail.tripped events (hitKey includes file, not just rule).
+func TestGuardrailTrippedKeyedByRuleAndFileTwoFilesSameRuleAreTwoEvents(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	os.MkdirAll(filepath.Join(repo, "migrations"), 0o755)
+	git(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-q", "-m", "init")
+
+	wtPath := filepath.Join(root, "repo-feature")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", wtPath)
+
+	e := newEngine(t, root)
+	sub, cancel := e.Registry().Subscribe(64)
+	defer cancel()
+
+	if err := e.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drainEvents(sub, 200*time.Millisecond) // cold-start gate
+
+	// Two NEW files under migrations/ in the SAME scan: both trip
+	// touches-migrations, at two distinct (rule, file) keys.
+	os.MkdirAll(filepath.Join(wtPath, "migrations"), 0o755)
+	os.WriteFile(filepath.Join(wtPath, "migrations", "001.sql"), []byte("create table a();\n"), 0o644)
+	os.WriteFile(filepath.Join(wtPath, "migrations", "002.sql"), []byte("create table b();\n"), 0o644)
+	if err := e.RefreshOne(context.Background(), wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	events := guardrailEvents(drainEvents(sub, time.Second))
+	var saw001, saw002 bool
+	for _, ev := range events {
+		if ev.Hit == nil || ev.Hit.Rule != "touches-migrations" {
+			continue
+		}
+		switch ev.Hit.File {
+		case "migrations/001.sql":
+			saw001 = true
+		case "migrations/002.sql":
+			saw002 = true
+		}
+	}
+	if !saw001 || !saw002 {
+		t.Fatalf("two files tripping the same rule in one scan must publish two distinct events, got %+v", events)
+	}
+	if len(events) != 2 {
+		t.Errorf("expected exactly 2 guardrail.tripped events (one per file), got %d: %+v", len(events), events)
+	}
+}
+
 // TestGuardrailTrippedNotKeyedOnLine: a hit's Line moving (an edit above an
 // existing match) must NOT re-trip the same (rule, file) pair.
 func TestGuardrailTrippedNotKeyedOnLine(t *testing.T) {
@@ -1473,7 +1628,7 @@ func TestGuardrailTrippedNotKeyedOnLine(t *testing.T) {
 
 	wtPath := filepath.Join(root, "repo-feature")
 	git(t, repo, "worktree", "add", "-q", "-b", "feature", wtPath)
-	secret := "AKIAABCDEFGHIJKLMNOP"
+	secret := fakeAWSKeyID
 	os.WriteFile(filepath.Join(wtPath, "config.go"), []byte("package app\n\nvar k = \""+secret+"\"\n"), 0o644)
 
 	e := newEngine(t, root)

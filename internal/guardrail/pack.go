@@ -59,6 +59,15 @@ type Effective struct {
 // caller Compiles the resulting rules (via RuleWithSource.Rule) separately,
 // which is what catches a pack rule that's individually fine but breaks the
 // combined set (e.g. a duplicate name against a rule Merge didn't replace).
+//
+// A name is only ever replaced-in-place once per Merge call: the first pack
+// rule matching a surviving global name overrides it as before, but a LATER
+// pack rule reusing that same name (a duplicate [[rules]] entry within the
+// pack itself, not an override of anything global) is appended as a second,
+// distinct entry instead of silently overwriting the first — that's what
+// lets the caller's subsequent Compile catch it as a duplicate rule name,
+// exactly like the identical mistake in config.toml's [[rules]] list already
+// does, rather than one pack rule vanishing with no error anywhere.
 func Merge(global []Rule, globalSource string, pack Pack) []RuleWithSource {
 	disabled := make(map[string]bool, len(pack.DisableRules))
 	for _, n := range pack.DisableRules {
@@ -66,7 +75,7 @@ func Merge(global []Rule, globalSource string, pack Pack) []RuleWithSource {
 	}
 
 	out := make([]RuleWithSource, 0, len(global)+len(pack.Rules))
-	index := make(map[string]int, len(global)) // rule name -> its index in out
+	index := make(map[string]int, len(global)) // rule name -> its index in out (global rules only)
 	for _, r := range global {
 		if disabled[r.Name] {
 			continue
@@ -74,13 +83,15 @@ func Merge(global []Rule, globalSource string, pack Pack) []RuleWithSource {
 		index[r.Name] = len(out)
 		out = append(out, RuleWithSource{Rule: r, Source: globalSource})
 	}
+
+	fromPack := make(map[string]bool, len(pack.Rules)) // names a pack rule has already contributed this loop
 	for _, r := range pack.Rules {
-		if i, ok := index[r.Name]; ok {
+		if i, ok := index[r.Name]; ok && !fromPack[r.Name] {
 			out[i] = RuleWithSource{Rule: r, Source: "pack"}
-			continue
+		} else {
+			out = append(out, RuleWithSource{Rule: r, Source: "pack"})
 		}
-		index[r.Name] = len(out)
-		out = append(out, RuleWithSource{Rule: r, Source: "pack"})
+		fromPack[r.Name] = true
 	}
 	return out
 }

@@ -3,6 +3,8 @@ package guardrail
 import (
 	"math"
 	"testing"
+
+	"github.com/navbytes/wt-cockpit/internal/model"
 )
 
 // approxEqual compares floats with a small tolerance — entropy math involves
@@ -67,6 +69,79 @@ func TestShannonEntropyHexNeverReachesThreshold(t *testing.T) {
 	}
 }
 
+// TestShannonEntropyUUIDShapedNeverReachesThreshold extends the hex-ceiling
+// property to a dash-containing shape a real secret scanner is far more
+// likely to actually be handed: a UUID. '-' is itself a token-alphabet byte
+// (isTokenByte), so a UUID scans as ONE 36-byte token, not five separate
+// ones — its alphabet is hex plus '-' (17 symbols), so its entropy ceiling is
+// log2(17)~=4.087, still comfortably under the shipped 4.8 threshold.
+func TestShannonEntropyUUIDShapedNeverReachesThreshold(t *testing.T) {
+	uuids := []string{
+		"550e8400-e29b-41d4-a716-446655440000",
+		"f47ac10b-58cc-4372-a567-0e02b2c3d479",
+		"00000000-0000-0000-0000-000000000000",
+	}
+	for _, u := range uuids {
+		if h := shannonEntropy(u); h > 4.8 {
+			t.Errorf("shannonEntropy(%q) = %v, want <= 4.8 (UUID/hex+dash ceiling log2(17)~=4.087)", u, h)
+		}
+	}
+}
+
+// TestUUIDShapedTokenDoesNotTripSecretsEntropyDefault is the end-to-end
+// twin, run over the actual shipped DefaultRules(): a UUID in added content
+// must never trip secrets-entropy — the false-positive boundary the PROBE
+// calls out by name.
+func TestUUIDShapedTokenDoesNotTripSecretsEntropyDefault(t *testing.T) {
+	e := mustCompile(t, DefaultRules())
+	diff := model.Diff{Files: []model.DiffFile{addedFile("app.go", `id := "550e8400-e29b-41d4-a716-446655440000"`)}}
+	for _, h := range e.Eval(diff) {
+		if h.Rule == "secrets-entropy" {
+			t.Errorf("a UUID-shaped token should not trip secrets-entropy (hex+dash ceiling under 4.8), got %+v", h)
+		}
+	}
+}
+
+// TestEntropyThresholdBoundaryInclusiveGTE pins hasHighEntropyToken's
+// comparison operator: a token whose entropy exactly equals the threshold
+// must trip (the code uses ">=", not ">"), and a threshold a hair above the
+// token's own entropy must not.
+func TestEntropyThresholdBoundaryInclusiveGTE(t *testing.T) {
+	token := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0" // 27 distinct symbols, uniform: H = log2(27)
+	h := shannonEntropy(token)
+	if !hasHighEntropyToken(token, 8, h) {
+		t.Errorf("a token whose entropy exactly equals the threshold must trip (>=, not >): H=%v", h)
+	}
+	if hasHighEntropyToken(token, 8, h+0.001) {
+		t.Error("a threshold a hair above the token's own entropy must not trip")
+	}
+}
+
+// TestEntropyJustBelowAndJustAboveSharedDefaultThreshold is the false-pos/
+// false-neg boundary the PROBE calls out explicitly: two hand-computed
+// tokens straddling the shipped 4.8 threshold as tightly as an exact
+// integer-distinct-symbol construction allows (log2(27)~=4.755 just under,
+// log2(28)~=4.807 just over), run through the full engine (not just
+// shannonEntropy directly).
+func TestEntropyJustBelowAndJustAboveSharedDefaultThreshold(t *testing.T) {
+	below := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0"  // 27 distinct symbols: H=log2(27)~=4.755
+	above := "ABCDEFGHIJKLMNOPQRSTUVWXYZ01" // 28 distinct symbols: H=log2(28)~=4.807
+	if h := shannonEntropy(below); h >= 4.8 {
+		t.Fatalf("precondition: %q should have entropy < 4.8, got %v", below, h)
+	}
+	if h := shannonEntropy(above); h < 4.8 {
+		t.Fatalf("precondition: %q should have entropy >= 4.8, got %v", above, h)
+	}
+
+	e := mustCompile(t, []Rule{{Name: "secret", MinTokenEntropy: 4.8, MinTokenLen: 8}})
+	if hits := e.Eval(model.Diff{Files: []model.DiffFile{addedFile("a.go", `x := "`+below+`"`)}}); len(hits) != 0 {
+		t.Errorf("a token just under the 4.8 threshold must not trip, got %+v", hits)
+	}
+	if hits := e.Eval(model.Diff{Files: []model.DiffFile{addedFile("b.go", `x := "`+above+`"`)}}); len(hits) != 1 {
+		t.Errorf("a token just over the 4.8 threshold should trip, got %+v", hits)
+	}
+}
+
 // TestTokensFindsMaximalRunsAtOrAboveMinLen pins the token scanner: runs of
 // [A-Za-z0-9+/=_-] shorter than minLen are dropped, adjacent runs separated by
 // a non-token byte (space, punctuation) are distinct tokens, and a run is
@@ -75,13 +150,13 @@ func TestTokensFindsMaximalRunsAtOrAboveMinLen(t *testing.T) {
 	// "=", "+", "/", "_", "-" are themselves token bytes (base64 padding/URL-
 	// safe alphabet), so separators here are space/colon/quote — bytes
 	// actually outside [A-Za-z0-9+/=_-].
-	s := `key: "AKIAABCDEFGHIJKLMNOP" short:ab padded:zzzzzz`
+	s := `key: "` + fakeAWSKeyID + `" short:ab padded:zzzzzz`
 	got := tokens(s, 8)
 	found := map[string]bool{}
 	for _, tok := range got {
 		found[tok] = true
 	}
-	if !found["AKIAABCDEFGHIJKLMNOP"] {
+	if !found[fakeAWSKeyID] {
 		t.Errorf("tokens(%q, 8) = %v, want it to include the 20-byte run", s, got)
 	}
 	for _, short := range []string{"key", "short", "ab", "padded", "zzzzzz"} {

@@ -114,6 +114,28 @@ func TestIngestIgnoresNonGuardrailEvents(t *testing.T) {
 	}
 }
 
+// TestRunWithNoBinaryLogsExactlyOneInfoLineWithExpectedContent closes a gap
+// TestRunWithNoBinaryLogsOnceAndReturnsWithoutBlocking leaves open: that test
+// proves Run doesn't block, but never actually inspects what (if anything)
+// got logged. This asserts the log content the "missing binary -> one info
+// log" contract (P5-design.md §1.5's "Graceful absence") promises.
+func TestRunWithNoBinaryLogsExactlyOneInfoLineWithExpectedContent(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	n := New(Config{Enabled: true, Severity: "danger"}, noopLookup)
+
+	ch := make(chan model.Event, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	logs := captureLogs(t, func() { n.Run(ctx, ch) })
+	if got := strings.Count(logs, "desktop notifications unavailable"); got != 1 {
+		t.Errorf("missing-binary Run should log exactly one line about unavailable notifications, got %d; logs=%s", got, logs)
+	}
+	if !strings.Contains(logs, "notifier binary not found in PATH") {
+		t.Errorf("expected the log to mention the binary wasn't found in PATH, got: %s", logs)
+	}
+}
+
 // ---- Run: missing binary / disabled ----
 
 // TestRunWithNoBinaryLogsOnceAndReturnsWithoutBlocking pins the "missing
@@ -573,6 +595,125 @@ func TestRunBrokenNotifierExitNonZeroDoesNotCrashOrBlock(t *testing.T) {
 
 	if got := strings.Count(logs, "desktop notification exec failed"); got != 1 {
 		t.Errorf("warn log occurrences = %d, want exactly 1 (rate-limited: first failure only, out of 2)", got)
+	}
+}
+
+// prependToPATH puts dir first on PATH (so exec.LookPath resolves a stub
+// named "osascript"/"notify-send" placed there) while leaving the rest of
+// the real PATH intact — unlike t.Setenv("PATH", dir), which would ALSO
+// break any external command (touch, sleep, sh itself resolving them) that
+// the stub script's own body shells out to.
+func prependToPATH(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// writeHangOnceStub writes an executable stub that HANGS (sleeps well past
+// execTimeout) on its first invocation, then exits 0 immediately on every
+// invocation after — distinguished via a marker file baked into the script,
+// created before the hang starts so it survives the process being killed
+// mid-sleep. "exec sleep" (not a backgrounded/forked sleep) replaces the
+// script's own shell process in place, so a SIGKILL aimed at the single
+// pid exec.CommandContext tracks reaches the actual sleeping process
+// directly — no orphaned child left behind once the context times out.
+func writeHangOnceStub(t *testing.T, dir string) {
+	t.Helper()
+	name := wantBinaryName(runtime.GOOS)
+	if name == "" {
+		t.Skipf("no notifier binary defined for GOOS %q", runtime.GOOS)
+	}
+	marker := filepath.Join(dir, "hung-once.marker")
+	script := "#!/bin/sh\n" +
+		"if [ -f \"" + marker + "\" ]; then\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"touch \"" + marker + "\"\n" +
+		"exec sleep 30\n"
+	writeStub(t, dir, name, script)
+}
+
+// TestRunHungNotifierExecTimesOutAndDoesNotBlockNextEvent is the PROBE's
+// "a notify exec that hangs doesn't block the bus/next events (timeout)"
+// case: a stub that hangs well past execTimeout (5s) on its first
+// invocation must be killed by fire's own context timeout (logged as
+// exactly one failure), and Run's single worker goroutine must recover and
+// process a second, later window normally afterwards rather than staying
+// wedged.
+func TestRunHungNotifierExecTimesOutAndDoesNotBlockNextEvent(t *testing.T) {
+	dir := t.TempDir()
+	writeHangOnceStub(t, dir)
+	prependToPATH(t, dir)
+
+	n := New(Config{Enabled: true, Severity: "danger"}, noopLookup)
+	fa := newFakeAfter()
+	n.after = fa.after
+
+	ch := make(chan model.Event, 4)
+	stop := runNotifierForTest(n, ch)
+
+	logs := captureLogs(t, func() {
+		ch <- model.Event{Type: model.EventGuardrail, ID: "wt1", Hit: &model.GuardrailHit{Rule: "r", File: "f", Severity: "danger", Message: "m"}}
+		fa.waitArmed(t)
+		fa.trigger() // fires the hanging exec; its own 5s context timeout must kill it
+
+		// A SECOND, distinct window must still be processed normally once the
+		// hang is killed — waitArmed blocking here (up to its own 10s budget)
+		// until Run has looped back and re-armed is itself the "not wedged"
+		// proof; a stuck Run would time this test out.
+		ch <- model.Event{Type: model.EventGuardrail, ID: "wt2", Hit: &model.GuardrailHit{Rule: "r", File: "f", Severity: "danger", Message: "m"}}
+		fa.waitArmed(t)
+		fa.trigger()
+
+		stop() // waits for Run to actually exit — proves it isn't wedged
+	})
+
+	if got := strings.Count(logs, "desktop notification exec failed"); got != 1 {
+		t.Errorf("the hung exec should log exactly one failure (context deadline exceeded), got %d; logs=%s", got, logs)
+	}
+}
+
+// TestRunShutdownWhileExecInFlightReturnsPromptlyNotWaitingFullTimeout is
+// the PROBE's "shutdown mid-flight, race-clean" case: cancelling Run's ctx
+// while fire() is blocked inside a hung exec must cut that exec short via
+// the LINKED execCtx (context.WithTimeout(ctx, execTimeout) in fire), so Run
+// returns promptly — not after waiting out the full 5s execTimeout on its
+// own. Uses an ALWAYS-hanging stub (not writeHangOnceStub) since there is
+// only ever one invocation here.
+func TestRunShutdownWhileExecInFlightReturnsPromptlyNotWaitingFullTimeout(t *testing.T) {
+	dir := t.TempDir()
+	name := wantBinaryName(runtime.GOOS)
+	if name == "" {
+		t.Skipf("no notifier binary defined for GOOS %q", runtime.GOOS)
+	}
+	writeStub(t, dir, name, "#!/bin/sh\nexec sleep 30\n")
+	prependToPATH(t, dir)
+
+	n := New(Config{Enabled: true, Severity: "danger"}, noopLookup)
+	fa := newFakeAfter()
+	n.after = fa.after
+
+	ch := make(chan model.Event, 4)
+	stop := runNotifierForTest(n, ch)
+
+	ch <- model.Event{Type: model.EventGuardrail, ID: "wt1", Hit: &model.GuardrailHit{Rule: "r", File: "f", Severity: "danger", Message: "m"}}
+	fa.waitArmed(t)
+	fa.trigger() // Run is now blocked inside fire()'s cmd.Run(), executing the always-hanging stub
+
+	// Let fire() actually start the exec before cancelling, so this genuinely
+	// exercises "cancel while in flight" rather than racing cancel() ahead of
+	// flushAndFire even beginning.
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("Run did not return within 4s of ctx cancellation while an exec was in flight (want well under the 5s exec timeout)")
+	}
+	if elapsed := time.Since(start); elapsed >= execTimeout {
+		t.Errorf("Run took %v to return after cancellation (>= the %v exec timeout) — shutdown should cut a hung exec short via the linked context, not merely wait for its own natural timeout", elapsed, execTimeout)
 	}
 }
 

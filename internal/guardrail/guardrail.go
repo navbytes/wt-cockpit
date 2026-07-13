@@ -77,6 +77,36 @@ func hasWorktreeCond(r Rule) bool {
 	return r.MinDeleteAddRatio > 0 || r.MinFilesChanged > 0 || r.MinTotalChanged > 0
 }
 
+// negativeThresholdFields names every threshold-shaped field on r that's set
+// to a negative value, TOML-key first (empty when none). Every field named
+// here is otherwise gated by "> 0" in hasFileCond/hasWorktreeCond, so a
+// negative value reads as indistinguishable from "unset" there — without
+// this check (called from Compile) the rule would silently become a
+// permanent no-op instead of failing fast like every other self-
+// contradictory rule shape (bad severity, glob conflicts, condition mixing).
+func negativeThresholdFields(r Rule) []string {
+	var bad []string
+	if r.MinNetDeleted < 0 {
+		bad = append(bad, "min_net_deleted")
+	}
+	if r.MinChangedLines < 0 {
+		bad = append(bad, "min_changed_lines")
+	}
+	if r.MinTokenEntropy < 0 {
+		bad = append(bad, "min_token_entropy")
+	}
+	if r.MinDeleteAddRatio < 0 {
+		bad = append(bad, "min_delete_add_ratio")
+	}
+	if r.MinFilesChanged < 0 {
+		bad = append(bad, "min_files_changed")
+	}
+	if r.MinTotalChanged < 0 {
+		bad = append(bad, "min_total_changed")
+	}
+	return bad
+}
+
 // compiledRule pairs a validated Rule with its once-compiled added_pattern
 // matcher(s) (empty unless AddedPattern is set). Rule itself stays pure data
 // — the constitution bars code on a rule — so the compiled regexp lives only
@@ -183,6 +213,9 @@ func Compile(rules []Rule) (*Engine, error) {
 		case "", "warn", "danger":
 		default:
 			return nil, fmt.Errorf("guardrail: rule %q: invalid severity %q (want \"\", \"warn\", or \"danger\")", r.Name, r.Severity)
+		}
+		if bad := negativeThresholdFields(r); len(bad) > 0 {
+			return nil, fmt.Errorf("guardrail: rule %q: negative threshold value(s): %s (thresholds must be >= 0)", r.Name, strings.Join(bad, ", "))
 		}
 		if r.PathGlob != "" && len(r.PathGlobs) > 0 {
 			return nil, fmt.Errorf("guardrail: rule %q: path_glob and path_globs are mutually exclusive", r.Name)
@@ -461,7 +494,7 @@ func DefaultRules() []Rule {
 				`-----BEGIN [A-Z ]*PRIVATE KEY-----`,
 				`ghp_[A-Za-z0-9]{36}`,
 				`github_pat_[A-Za-z0-9_]{22,}`,
-				`sk-[A-Za-z0-9_-]{20,}`,
+				`sk-[A-Za-z0-9]{20,}`,
 				`xox[bpars]-[A-Za-z0-9-]{10,}`,
 				`AIza[0-9A-Za-z_-]{35}`,
 			}, "|"),
@@ -515,51 +548,94 @@ func DefaultRules() []Rule {
 //   - "?"  matches a single non-slash character
 //
 // It is anchored (must match the whole path).
+//
+// Matching runs a bounded dynamic-programming scan over (pattern tokens ×
+// path bytes) — O(len(pattern)*len(path)) time, never exponential. This
+// replaced a recursive "try every split point at every '*'/'**'" matcher:
+// against an adversarial pattern (repeated "**a", or even repeated "*a")
+// matched against a long non-matching path, that matcher ran
+// superpolynomially — the same catastrophic-backtracking class RE2 was
+// chosen to avoid for added_pattern regexes, left open here until this fix
+// (BLOCKER-1). A pack's globs are semi-trusted (checked-in .wtcockpit.toml)
+// input evaluated on every refresh; Eval must never be able to wedge on one.
 func GlobMatch(pattern, path string) bool {
-	return globHelper(pattern, path)
+	return globTokensMatch(globTokenize(pattern), path)
 }
 
-func globHelper(p, s string) bool {
-	for len(p) > 0 {
-		switch p[0] {
-		case '*':
-			if len(p) > 1 && p[1] == '*' {
-				// "**" — consume it (and an optional trailing slash) and try to
-				// match the remainder at every position, including across slashes.
-				rest := p[2:]
-				rest = strings.TrimPrefix(rest, "/")
-				if rest == "" {
-					return true // trailing ** matches anything
-				}
-				for i := 0; i <= len(s); i++ {
-					if globHelper(rest, s[i:]) {
-						return true
-					}
-				}
-				return false
+// globTokKind is one unit of a tokenized glob pattern (see globTokenize).
+type globTokKind uint8
+
+const (
+	globLiteral    globTokKind = iota // a single literal byte
+	globQuestion                      // "?": exactly one non-'/' byte
+	globStar                          // "*": a run of 0+ non-'/' bytes
+	globDoubleStar                    // "**": a run of 0+ bytes, '/' included
+)
+
+type globTok struct {
+	kind globTokKind
+	b    byte // meaningful only for globLiteral
+}
+
+// globTokenize parses pattern into matcher tokens left to right. "**"
+// optionally swallows one immediately-following '/' in the PATTERN (so
+// "a/**/b" also matches "a/b", zero directories in between) — mirrors the
+// old recursive parser's own precedence exactly, so behaviour is unchanged.
+func globTokenize(pattern string) []globTok {
+	toks := make([]globTok, 0, len(pattern))
+	for i := 0; i < len(pattern); {
+		switch {
+		case pattern[i] == '*' && i+1 < len(pattern) && pattern[i+1] == '*':
+			i += 2
+			if i < len(pattern) && pattern[i] == '/' {
+				i++
 			}
-			// single "*" — match zero+ non-slash chars.
-			rest := p[1:]
-			for i := 0; i <= len(s); i++ {
-				if i > 0 && s[i-1] == '/' {
-					break
-				}
-				if globHelper(rest, s[i:]) {
-					return true
-				}
-			}
-			return false
-		case '?':
-			if len(s) == 0 || s[0] == '/' {
-				return false
-			}
-			p, s = p[1:], s[1:]
+			toks = append(toks, globTok{kind: globDoubleStar})
+		case pattern[i] == '*':
+			i++
+			toks = append(toks, globTok{kind: globStar})
+		case pattern[i] == '?':
+			i++
+			toks = append(toks, globTok{kind: globQuestion})
 		default:
-			if len(s) == 0 || s[0] != p[0] {
-				return false
-			}
-			p, s = p[1:], s[1:]
+			toks = append(toks, globTok{kind: globLiteral, b: pattern[i]})
+			i++
 		}
 	}
-	return len(s) == 0
+	return toks
+}
+
+// globTokensMatch reports whether toks matches path in full (anchored), via
+// a classic "wildcard matching" DP: dp[j] after processing token i means
+// toks[:i] matches path[:j]. Two rolled rows (prev/cur), no recursion — this
+// is what bounds the whole match to O(len(toks)*len(path)), regardless of
+// how many "*"/"**" tokens the pattern repeats.
+func globTokensMatch(toks []globTok, path string) bool {
+	n := len(path)
+	prev := make([]bool, n+1)
+	prev[0] = true // zero tokens match only the empty prefix
+	cur := make([]bool, n+1)
+
+	for _, tok := range toks {
+		switch tok.kind {
+		case globStar, globDoubleStar:
+			cur[0] = prev[0] // this token can also match zero bytes
+		default:
+			cur[0] = false // a literal/"?" always consumes exactly one byte
+		}
+		for j := 1; j <= n; j++ {
+			switch tok.kind {
+			case globDoubleStar:
+				cur[j] = prev[j] || cur[j-1]
+			case globStar:
+				cur[j] = prev[j] || (path[j-1] != '/' && cur[j-1])
+			case globQuestion:
+				cur[j] = path[j-1] != '/' && prev[j-1]
+			default: // globLiteral
+				cur[j] = path[j-1] == tok.b && prev[j-1]
+			}
+		}
+		prev, cur = cur, prev
+	}
+	return prev[n]
 }

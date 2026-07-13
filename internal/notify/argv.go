@@ -80,9 +80,9 @@ func Sanitize(s string, max int) string {
 	lastWasSpace := false
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {
-			r = ' '
+			r = ' ' // also normalizes '\t' (0x09): the r == ' ' check below never sees a raw tab
 		}
-		if r == ' ' || r == '\t' {
+		if r == ' ' {
 			if lastWasSpace {
 				continue
 			}

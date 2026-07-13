@@ -156,6 +156,57 @@ func TestCoalescerCooldownExpiresAndAllowsRefire(t *testing.T) {
 	}
 }
 
+// TestCoalescerCooldownExactBoundaryAllowsRefire pins the boundary itself
+// (accept's check is `now.Before(until)`, so equality is NOT "still in
+// cooldown"): at the exact instant the cooldown deadline elapses, a repeat
+// must be allowed; one nanosecond earlier it must still be suppressed.
+func TestCoalescerCooldownExactBoundaryAllowsRefire(t *testing.T) {
+	now := time.Now()
+	c := newCoalescer(10*time.Minute, fakeNow(&now))
+
+	c.accept("wt1", hit("secrets-pattern", "a.go", "danger"))
+	c.flush()
+	deadline := now.Add(10 * time.Minute) // the exact cooldownUntil value accept() set
+
+	now = deadline.Add(-1 * time.Nanosecond)
+	if armed := c.accept("wt1", hit("secrets-pattern", "a.go", "danger")); armed {
+		t.Error("one nanosecond before the cooldown deadline, a repeat must still be suppressed")
+	}
+
+	now = deadline
+	if armed := c.accept("wt1", hit("secrets-pattern", "a.go", "danger")); !armed {
+		t.Error("exactly at the cooldown deadline, a repeat must be allowed (accept uses Before, not Before-or-equal)")
+	}
+}
+
+// TestCoalescerFlushPrunesExpiredCooldownKeys is the NIT fix pin:
+// cooldownUntil is otherwise never reset (it deliberately spans windows —
+// see flush's own doc comment), so over a long daemon uptime with many
+// distinct (worktree,rule,file) keys cycling through, it would grow
+// unboundedly even though most entries are long expired. flush now prunes
+// any entry whose deadline has already passed.
+func TestCoalescerFlushPrunesExpiredCooldownKeys(t *testing.T) {
+	now := time.Now()
+	c := newCoalescer(1*time.Minute, fakeNow(&now))
+
+	c.accept("wt1", hit("r1", "f1", "danger"))
+	c.flush()
+	if _, ok := c.cooldownUntil[hitKey{worktreeID: "wt1", rule: "r1", file: "f1"}]; !ok {
+		t.Fatal("precondition: accept should have set a cooldown entry")
+	}
+
+	now = now.Add(2 * time.Minute) // well past the 1-minute cooldown
+	c.accept("wt2", hit("r2", "f2", "danger"))
+	c.flush()
+
+	if _, ok := c.cooldownUntil[hitKey{worktreeID: "wt1", rule: "r1", file: "f1"}]; ok {
+		t.Error("flush should prune a cooldown entry whose deadline has already passed")
+	}
+	if _, ok := c.cooldownUntil[hitKey{worktreeID: "wt2", rule: "r2", file: "f2"}]; !ok {
+		t.Error("flush must not prune a cooldown entry that's still active")
+	}
+}
+
 // TestCoalescerDistinctKeysIndependent: cooldown on one (worktree,rule,file)
 // key must not suppress a different key, even for the same worktree.
 func TestCoalescerDistinctKeysIndependent(t *testing.T) {

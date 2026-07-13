@@ -123,6 +123,66 @@ func TestWtRulesUnknownIDPrintsDaemonErrorAndExitsNonZero(t *testing.T) {
 	}
 }
 
+// TestWtRulesSanitizesControlBytesInPackNameAndMessage is the HIGH fix pin
+// (security MEDIUM + reviewer m3): a main-worktree .wtcockpit.toml is
+// semi-trusted, but its own rule Name/Message/conditions were previously
+// printed raw by renderRules — a TOML backslash-u escape can decode to a
+// literal ESC/BEL byte that then reaches the terminal as a real escape
+// sequence. The TUI/web banners already sanitize via
+// diffparse.SanitizeControl; this pins the same treatment for wt rules,
+// asserting caret notation, not raw bytes, in the real binary's stdout.
+func TestWtRulesSanitizesControlBytesInPackNameAndMessage(t *testing.T) {
+	bin := requireWtBin(t)
+	sockPath := filepath.Join(shortSocketDir(t), "wtd.sock")
+	const wtID = "hostile-repo-feature"
+	hostileMessage := "click here\x1b]0;pwned\x07 now"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"protocol": model.ProtocolVersion, "version": "x", "goVersion": "go1.24"})
+	})
+	mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(guardrail.Effective{
+			WorktreeID: wtID,
+			RepoPath:   "/repo/hostile",
+			PackPath:   "/repo/hostile/.wtcockpit.toml",
+			PackStatus: "ok",
+			Rules: []guardrail.RuleWithSource{
+				{Rule: guardrail.Rule{Name: "rule\x1bname", Message: hostileMessage}, Source: "pack"},
+			},
+		})
+	})
+	ts := unixSocketServer(t, sockPath, mux)
+	defer ts.Close()
+
+	cmd := exec.Command(bin, "rules", wtID)
+	cmd.Env = append(os.Environ(), "WTD_SOCKET="+sockPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("wt rules failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	// renderRules also emits its own legitimate ANSI styling (bold/color)
+	// unrelated to this attack — a blanket "no ESC anywhere" check would
+	// false-fail on those, so this checks specifically that the hostile raw
+	// bytes are gone and the caret-sanitized form is present instead.
+	out := stdout.String()
+	if strings.Contains(out, "rule\x1bname") {
+		t.Fatalf("raw ESC byte in the rule name leaked into wt rules output: %q", out)
+	}
+	if strings.Contains(out, hostileMessage) {
+		t.Fatalf("raw ESC/BEL bytes in the rule message leaked into wt rules output: %q", out)
+	}
+	if !strings.Contains(out, "rule^[name") {
+		t.Errorf("expected caret-notation sanitized rule name, got:\n%s", out)
+	}
+	if !strings.Contains(out, "click here^[]0;pwned^G now") {
+		t.Errorf("expected caret-notation sanitized message, got:\n%s", out)
+	}
+}
+
 // ---- conditionsSummary / renderRules (in-process, no socket needed) ----
 
 func TestConditionsSummaryRendersEverySetField(t *testing.T) {
