@@ -239,3 +239,81 @@ func (c *Client) Refresh(ctx context.Context) error {
 	}
 	return nil
 }
+
+// AddComment creates a comment on file within id's current diff (P4-design.md
+// §1.5). line 0 is the file-level convention; side "" lets the daemon default
+// to "new"; author "" lets it default to the daemon's OS user. A validation
+// refusal (unknown id/file, bad side, empty/oversized/invalid-UTF-8 body)
+// comes back as the daemon's body verbatim via the plain error path — unlike
+// SetReviewed/Approve there's no single typed sentinel here, since the REST
+// table maps several distinct causes to more than one status code.
+func (c *Client) AddComment(ctx context.Context, id, file string, line int, side, body, author string) (model.Comment, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"id": id, "file": file, "line": line, "side": side, "body": body, "author": author,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/comments", bytes.NewReader(payload))
+	if err != nil {
+		return model.Comment{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return model.Comment{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return model.Comment{}, readError(resp)
+	}
+	var out model.Comment
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return model.Comment{}, err
+	}
+	return out, nil
+}
+
+// Comments lists comments for id. state selects "open" (the daemon's default
+// when empty), "resolved", or "all"; file, when non-empty, filters to that
+// exact path. The returned model.CommentsPayload is GET /api/comments's
+// frozen response shape — cmd/wt's `wt comments --json` decodes this exact
+// type and re-emits it with MarshalIndent, so the API and the CLI can never
+// drift apart (P4-design.md §1.5).
+func (c *Client) Comments(ctx context.Context, id, state, file string) (model.CommentsPayload, error) {
+	q := url.Values{"id": {id}}
+	if state != "" {
+		q.Set("state", state)
+	}
+	if file != "" {
+		q.Set("file", file)
+	}
+	var out model.CommentsPayload
+	err := c.getJSON(ctx, "/api/comments?"+q.Encode(), &out)
+	return out, err
+}
+
+// ResolveComment marks a comment resolved — the agent's loop-closer.
+func (c *Client) ResolveComment(ctx context.Context, id, commentID string) error {
+	return c.postCommentAction(ctx, "/api/comments/resolve", id, commentID)
+}
+
+// DeleteComment removes a comment outright.
+func (c *Client) DeleteComment(ctx context.Context, id, commentID string) error {
+	return c.postCommentAction(ctx, "/api/comments/delete", id, commentID)
+}
+
+func (c *Client) postCommentAction(ctx context.Context, path, id, commentID string) error {
+	payload, _ := json.Marshal(map[string]any{"id": id, "commentId": commentID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return readError(resp)
+	}
+	return nil
+}

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -310,6 +311,144 @@ func TestRefreshReturnsErrorOnNon200(t *testing.T) {
 
 	if err := testClient(ts).Refresh(context.Background()); err == nil {
 		t.Error("Refresh() = nil error, want the 500 surfaced")
+	}
+}
+
+// ---- Comments ----
+
+func TestAddCommentPostsExpectedBodyAndDecodesResult(t *testing.T) {
+	var gotBody map[string]any
+	want := model.Comment{ID: "c-1", WorktreeID: "wt-1", File: "a.go", Line: 5, Side: "new", Body: "hi", Author: "nav", State: "open"}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/comments" || r.Method != http.MethodPost {
+			t.Errorf("request = %s %s, want POST /api/comments", r.Method, r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(want)
+	}))
+	defer ts.Close()
+
+	got, err := testClient(ts).AddComment(context.Background(), "wt-1", "a.go", 5, "", "hi", "")
+	if err != nil {
+		t.Fatalf("AddComment() error = %v", err)
+	}
+	if got != want {
+		t.Errorf("AddComment() = %+v, want %+v", got, want)
+	}
+	if gotBody["id"] != "wt-1" || gotBody["file"] != "a.go" || gotBody["line"] != float64(5) || gotBody["body"] != "hi" {
+		t.Errorf("request body = %+v, want id/file/line/body to round-trip", gotBody)
+	}
+}
+
+// TestAddCommentReturnsDaemonBodyVerbatimOnValidationError pins that a
+// refused validation (empty body, bad side, unknown id/file, oversized body)
+// surfaces as the daemon's exact message — no typed sentinel, since the REST
+// table maps these to more than one status code (400/404/413).
+func TestAddCommentReturnsDaemonBodyVerbatimOnValidationError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid comment: body must not be empty", http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	_, err := testClient(ts).AddComment(context.Background(), "wt-1", "a.go", 1, "", "", "")
+	if err == nil || !strings.Contains(err.Error(), "body must not be empty") {
+		t.Errorf("AddComment() error = %v, want the daemon's body verbatim", err)
+	}
+}
+
+func TestCommentsBuildsQueryAndDecodesPayload(t *testing.T) {
+	var gotQuery url.Values
+	want := model.CommentsPayload{
+		WorktreeID: "wt-1", Path: "/repo/wt-1", Branch: "feature", Base: "main",
+		Comments: []model.CommentView{{Comment: model.Comment{ID: "c-1", Body: "hi"}, Stale: true}},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_ = json.NewEncoder(w).Encode(want)
+	}))
+	defer ts.Close()
+
+	got, err := testClient(ts).Comments(context.Background(), "wt-1", "all", "a.go")
+	if err != nil {
+		t.Fatalf("Comments() error = %v", err)
+	}
+	if gotQuery.Get("id") != "wt-1" || gotQuery.Get("state") != "all" || gotQuery.Get("file") != "a.go" {
+		t.Errorf("request query = %+v, want id/state/file to round-trip", gotQuery)
+	}
+	if got.WorktreeID != want.WorktreeID || got.Path != want.Path || len(got.Comments) != 1 || !got.Comments[0].Stale {
+		t.Errorf("Comments() = %+v, want %+v", got, want)
+	}
+}
+
+// TestCommentsOmitsStateAndFileWhenEmpty pins that empty state/file simply
+// aren't sent — the daemon applies its own "open" default (P4-design.md
+// §1.5), rather than the client hardcoding that default itself.
+func TestCommentsOmitsStateAndFileWhenEmpty(t *testing.T) {
+	var gotQuery url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_ = json.NewEncoder(w).Encode(model.CommentsPayload{})
+	}))
+	defer ts.Close()
+
+	if _, err := testClient(ts).Comments(context.Background(), "wt-1", "", ""); err != nil {
+		t.Fatalf("Comments() error = %v", err)
+	}
+	if _, ok := gotQuery["state"]; ok {
+		t.Errorf("query = %+v, want no state param when state is empty", gotQuery)
+	}
+	if _, ok := gotQuery["file"]; ok {
+		t.Errorf("query = %+v, want no file param when file is empty", gotQuery)
+	}
+}
+
+func TestResolveCommentPostsExpectedBody(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/comments/resolve" {
+			t.Errorf("path = %q, want /api/comments/resolve", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+	defer ts.Close()
+
+	if err := testClient(ts).ResolveComment(context.Background(), "wt-1", "c-1"); err != nil {
+		t.Fatalf("ResolveComment() error = %v", err)
+	}
+	if gotBody["id"] != "wt-1" || gotBody["commentId"] != "c-1" {
+		t.Errorf("request body = %+v, want id/commentId to round-trip", gotBody)
+	}
+}
+
+func TestResolveCommentReturnsDaemonBodyVerbatimOn404(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "comment not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	err := testClient(ts).ResolveComment(context.Background(), "wt-1", "c-missing")
+	if err == nil || !strings.Contains(err.Error(), "comment not found") {
+		t.Errorf("ResolveComment() error = %v, want the daemon's body verbatim", err)
+	}
+}
+
+func TestDeleteCommentPostsExpectedBody(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/comments/delete" {
+			t.Errorf("path = %q, want /api/comments/delete", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+	defer ts.Close()
+
+	if err := testClient(ts).DeleteComment(context.Background(), "wt-1", "c-1"); err != nil {
+		t.Fatalf("DeleteComment() error = %v", err)
+	}
+	if gotBody["id"] != "wt-1" || gotBody["commentId"] != "c-1" {
+		t.Errorf("request body = %+v, want id/commentId to round-trip", gotBody)
 	}
 }
 
