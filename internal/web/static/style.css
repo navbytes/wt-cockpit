@@ -11,9 +11,15 @@
   --dim: #7d8996;
   --faint: #4d5763;
   --accent: #6cb6ff;
+  --accent2: #316dca;
   --add: #3fb950;
+  --addbg: rgba(46, 160, 67, .14);
+  --addln: rgba(46, 160, 67, .35);
   --del: #f85149;
+  --delbg: rgba(248, 81, 73, .12);
+  --delln: rgba(248, 81, 73, .30);
   --warn: #e3b341;
+  --warnbg: rgba(187, 128, 9, .13);
   --chip-claude: #d2a8ff;
   --chip-codex: #7ee787;
   --chip-aider: #79c0ff;
@@ -91,3 +97,92 @@ code { font-family: var(--mono); }
   border-radius: 8px;
   background: var(--panel);
 }
+.hidden { display: none !important; }
+
+/* ---- reading room (P4-design.md §1.4/§2 — ported from docs/ux/mock.html) ---- */
+.topbar .back { color: var(--dim); }
+.topbar .back:hover { color: var(--txt); }
+
+.pane-h { padding: 11px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.pane-h .title { color: #fff; font-weight: 700; }
+.pane-h .base { color: var(--dim); }
+.pane-h .base code { color: var(--accent); background: #111a24; padding: 1px 6px; border-radius: 4px; }
+.pane-h .sum { margin-left: auto; color: var(--dim); }
+
+.alert {
+  margin: 12px 16px 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(227, 179, 65, .4);
+  background: var(--warnbg);
+  border-radius: 7px;
+  color: #f0d68a;
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+.alert b { color: var(--warn); }
+.banner {
+  margin: 10px 16px 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(227, 179, 65, .4);
+  background: var(--warnbg);
+  border-radius: 7px;
+  color: #f0d68a;
+  font-size: 12px;
+}
+.note { color: var(--dim); padding: 6px 12px; font-size: 12px; }
+
+.review-wrap { display: flex; flex: 1; min-height: 0; }
+.review-main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: auto; }
+.diff { padding: 10px 0 40px; }
+
+.file { margin: 8px 16px 16px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+.file-h { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #0e141b; border-bottom: 1px solid var(--line); }
+.file-h .fname { color: var(--txt); }
+.file-h .fname .path { color: var(--faint); }
+.file-h .fnums { margin-left: auto; font-size: 11px; }
+.file-h.flag .fname, .file-h.flag .fname .path { color: #f0d68a; }
+.file-h .tag { font-size: 10px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 6px; color: var(--dim); }
+.file-h .tag.danger { color: var(--del); border-color: var(--delln); }
+.rev-check { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 11px; cursor: pointer; user-select: none; }
+.rev-check input { accent-color: var(--add); }
+
+.hunk-h { color: var(--accent); background: #0c1620; padding: 3px 12px; font-size: 11px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+
+/* side-by-side grid */
+.sxs { display: grid; grid-template-columns: 1fr 1fr; }
+.sxs .side { border-right: 1px solid var(--line); min-width: 0; }
+.sxs .side:last-child { border-right: 0; }
+.sxs .side-lab { padding: 4px 12px; font-size: 10px; color: var(--faint); letter-spacing: .5px; background: #0c1219; border-bottom: 1px solid var(--line); text-transform: uppercase; }
+.srow { display: grid; grid-template-columns: 40px 1fr; font-size: 12px; white-space: pre; overflow-x: auto; min-height: 19px; }
+.srow .ln { color: var(--faint); text-align: right; padding: 0 7px; background: rgba(255, 255, 255, .015); }
+.srow .code { padding: 0 9px; }
+.srow.add { background: var(--addbg); }
+.srow.add .code { color: #aff0b5; }
+.srow.del { background: var(--delbg); }
+.srow.del .code { color: #ffb3af; }
+.srow.empty { background: repeating-linear-gradient(45deg, #0b0f14, #0b0f14 6px, #0d1218 6px, #0d1218 12px); }
+.srow.ctx .code { color: var(--dim); }
+/* chroma's own ".chroma" rule (chroma.css) sets a background — our row tint
+   (add/del/empty stripes, above) is the one that must win, so the code cell
+   that carries the "chroma" class for token coloring never paints its own. */
+.srow .code.chroma { background: none; }
+
+/* right rail */
+.rail { width: 240px; flex: 0 0 240px; border-left: 1px solid var(--line); background: var(--bg2); display: flex; flex-direction: column; }
+.rail h4 { margin: 0; padding: 11px 14px; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--faint); border-bottom: 1px solid var(--line); }
+.rail .flist { overflow-y: auto; flex: 1; }
+.rail .fitem { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid #10161d; }
+.rail .fitem:hover { background: #0e141b; }
+.rail .fitem input { accent-color: var(--add); }
+.rail .fitem .fn { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
+.rail .fitem.done .fn { color: var(--faint); text-decoration: line-through; }
+.rail .fitem .n { font-size: 10px; }
+.rail .foot { padding: 12px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.progress { height: 6px; border-radius: 4px; background: #182029; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--add); transition: .3s; }
+.rail .prog-lab { color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; }
+.btn { border: 0; border-radius: 7px; padding: 9px; font: inherit; font-weight: 600; cursor: pointer; text-align: center; }
+.btn.merge { background: var(--add); color: #04170a; }
+.btn.merge:disabled { background: #1c2b20; color: var(--faint); cursor: not-allowed; }
+.approve-error { color: var(--del); font-size: 11px; }

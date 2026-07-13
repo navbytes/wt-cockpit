@@ -12,10 +12,11 @@ import (
 )
 
 // templateFuncs are the functions every page template can call directly
-// (P4-design.md §3's "template funcs" note on this file). dirsplit — dir
-// prefix vs filename for the room's per-file cards — has no caller yet: WP2's
-// room is a stub with no file cards, so it's added in WP3 alongside the
-// template that actually needs it (ponytail: no unused abstractions).
+// (P4-design.md §3's "template funcs" note on this file). Room's per-file
+// cards need a dir/filename split too (dirsplit, below) — it stays a plain
+// Go helper rather than a template func because html/template rejects a
+// function with two non-error return values, so it's called once per file
+// from buildFileCard and stored on fileCardView instead.
 var templateFuncs = template.FuncMap{
 	"reltime":    reltime,
 	"guardrails": guardrailSummary,
@@ -99,35 +100,246 @@ func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// roomStubContent is WP2's placeholder for /wt/{id} (P4-design.md WP2: "room
-// page is a stub card 'reading room: WP3'"). It renders unconditionally for
-// any id, real or unknown alike — the 404/terminal states are WP3's job,
-// once there's an actual diff to find or not find. Parsed into a clone of
-// layout.tmpl rather than living in its own templates/room.tmpl file: that
-// filename is WP3's to add alongside the real room template.
-const roomStubContent = `{{define "content"}}
-<div class="topbar"><div class="brand"><span>wt</span> cockpit</div></div>
-<div class="card">
-  <h2>reading room: WP3</h2>
-  <p>Side-by-side review for <code>{{.ID}}</code> lands in WP3.</p>
-  <p><a href="/">&larr; back to worktrees</a></p>
-</div>
-{{end}}`
-
+// roomView is GET /wt/{id}'s template data: the mock's Review view, side-by-
+// side (P4-design.md §2/§1.4). NotFound short-circuits every other field
+// (room.tmpl's "content" block checks it first) — an unknown or
+// just-removed worktree id renders the 404 state rather than a zero-valued
+// room.
 type roomView struct {
 	pageHeader
-	ID string
+	ID       string
+	NotFound bool
+	Empty    bool // diff has zero files: "no changes vs base" card
+
+	Repo, Name, Branch, Base string
+	Agent                    model.AgentKind
+	Stats                    model.Stats
+	DiffHash                 string
+
+	GuardrailMsg  string // featured hit's message, "" if none tripped
+	GuardrailMore int    // additional distinct hits beyond the featured one
+
+	Files                                []fileCardView
+	ReviewedCount, TotalFiles, LeftCount int
+	ProgressPct                          int
+	AllReviewed                          bool
+}
+
+// fileCardView is one DiffFile's rendered content: the header line (name,
+// status/danger tag, stats, reviewed checkbox) plus however its body renders
+// (binary note, collapsed note, or the side-by-side hunks).
+type fileCardView struct {
+	Idx         int
+	Path        string // == model.DiffFile.Path (data-file/anchor keys)
+	DisplayPath string // "old -> new" for a rename, else Path
+	Dir         string
+	FileName    string
+	Status      model.FileStatus
+	Danger      bool
+	Stats       model.Stats
+	Reviewed    bool
+	Hash        string
+
+	Binary       bool
+	Collapsed    bool
+	CollapseNote string
+	HighlightOff bool
+	Hunks        []hunkView
+}
+
+// hunkView is one hunk's header text plus its side-by-side rows (sxs.go).
+type hunkView struct {
+	Header string
+	Rows   []SxsRow
 }
 
 func (a *app) handleRoom(w http.ResponseWriter, r *http.Request) {
-	view := roomView{
-		pageHeader: pageHeader{Title: "reading room", CSRFToken: a.cfg.CSRFToken},
-		ID:         r.PathValue("id"),
-	}
+	id := r.PathValue("id")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	d, ok := a.eng.Diff(id)
+	view := roomView{pageHeader: pageHeader{Title: "reading room", CSRFToken: a.cfg.CSRFToken}, ID: id}
+	if !ok {
+		view.NotFound = true
+		w.WriteHeader(http.StatusNotFound)
+	} else {
+		view = a.buildRoomView(id, d, a.eng.Registry().Get(id), r.URL.Query()["expand"])
+	}
 	if err := a.tmpl["room"].ExecuteTemplate(w, "layout", view); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// buildRoomView assembles the room page's (and eventually its fragments')
+// data from a fresh engine snapshot. expandParams is the raw repeated
+// ?expand= query values (pages.go's handleRoom passes r.URL.Query()["expand"]
+// straight through) — each names one file path to render un-collapsed,
+// P4-design.md §1.4's "plain link ... zero JS, works without script".
+func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandParams []string) roomView {
+	reviewedMap, _ := a.eng.ReviewedMap(id)
+	expanded := make(map[string]bool, len(expandParams))
+	for _, p := range expandParams {
+		expanded[p] = true
+	}
+
+	hits := guardrailHitsFor(wt)
+	msg, more := guardrailBanner(hits)
+	danger := dangerFiles(hits)
+
+	files := make([]fileCardView, len(d.Files))
+	reviewedCount := 0
+	for i, f := range d.Files {
+		files[i] = a.buildFileCard(i, f, reviewedMap[f.Path], danger, expanded)
+		if reviewedMap[f.Path] {
+			reviewedCount++
+		}
+	}
+	total := len(d.Files)
+
+	view := roomView{
+		pageHeader:    pageHeader{Title: roomTitle(wt, id), CSRFToken: a.cfg.CSRFToken},
+		ID:            id,
+		Empty:         total == 0,
+		DiffHash:      d.Hash,
+		Files:         files,
+		ReviewedCount: reviewedCount,
+		TotalFiles:    total,
+		LeftCount:     total - reviewedCount,
+		ProgressPct:   progressPct(reviewedCount, total),
+		AllReviewed:   total > 0 && reviewedCount == total,
+		GuardrailMsg:  msg,
+		GuardrailMore: more,
+		Base:          d.Base,
+	}
+	if wt != nil {
+		view.Repo, view.Name, view.Branch = wt.Repo, wt.Name, wt.Branch
+		view.Agent, view.Stats = wt.Agent, wt.Stats
+	}
+	return view
+}
+
+// buildFileCard renders one DiffFile: binary and collapsed-by-default files
+// get a note instead of hunks (guardrail thresholds mirrored from the TUI,
+// highlight.go); everything else gets its side-by-side rows, sliced out of
+// the file's single per-file highlight pass by a running codeIdx offset —
+// the same "concatenated hunk lines, indexed 1:1" convention
+// internal/tui/flatten.go's codeIdx uses.
+func (a *app) buildFileCard(idx int, f model.DiffFile, reviewed bool, danger map[string]bool, expanded map[string]bool) fileCardView {
+	disp := displayPath(f)
+	dir, base := dirsplit(disp)
+	card := fileCardView{
+		Idx: idx, Path: f.Path, DisplayPath: disp, Dir: dir, FileName: base,
+		Status: f.Status, Danger: danger[f.Path] || (f.OldPath != "" && danger[f.OldPath]),
+		Stats: f.Stats, Reviewed: reviewed, Hash: f.Hash, Binary: f.Binary,
+	}
+
+	switch {
+	case f.Binary:
+		// Nothing more to render — git never emits hunks for a binary file.
+	case isCollapsedByDefault(f) && !expanded[f.Path]:
+		card.Collapsed = true
+		card.CollapseNote = fmt.Sprintf("collapsed (%d lines)", totalHunkLines(f))
+	default:
+		lines, off := a.linesForFile(f)
+		card.HighlightOff = off
+		card.Hunks = make([]hunkView, len(f.Hunks))
+		codeIdx := 0
+		for hi, h := range f.Hunks {
+			end := codeIdx + len(h.Lines)
+			var htmlSlice []template.HTML
+			if end <= len(lines) {
+				htmlSlice = lines[codeIdx:end]
+			}
+			card.Hunks[hi] = hunkView{Header: h.Header, Rows: SplitHunk(h, htmlSlice)}
+			codeIdx = end
+		}
+	}
+	return card
+}
+
+// roomTitle is the <title>/pane-header text: "repo / name", falling back to
+// the bare id if the worktree vanished between the Diff and Registry reads
+// (defensive only — refreshWorktree updates both together).
+func roomTitle(wt *model.Worktree, id string) string {
+	if wt == nil {
+		return id
+	}
+	return wt.Repo + " / " + wt.Name
+}
+
+// progressPct is the rail's progress-bar width, 0-100, 0 when there is
+// nothing to review (avoids a divide-by-zero rather than reporting "100%
+// reviewed" for an empty diff).
+func progressPct(done, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	return done * 100 / total
+}
+
+// guardrailHitsFor returns wt's tripped guardrails, or nil if wt vanished
+// between reads (see roomTitle).
+func guardrailHitsFor(wt *model.Worktree) []model.GuardrailHit {
+	if wt == nil {
+		return nil
+	}
+	return wt.Guardrails
+}
+
+// guardrailBanner mirrors internal/tui/radar.go's renderGuardrailBanner: the
+// featured hit (the first "danger"-severity hit, else the first hit at all)
+// verbatim, plus how many additional distinct hits there were.
+func guardrailBanner(hits []model.GuardrailHit) (message string, more int) {
+	if len(hits) == 0 {
+		return "", 0
+	}
+	featured := hits[0]
+	for _, h := range hits {
+		if h.Severity == "danger" {
+			featured = h
+			break
+		}
+	}
+	return featured.Message, len(hits) - 1
+}
+
+// dangerFiles is the set of file paths a guardrail hit names, regardless of
+// the hit's own severity — mirrors internal/tui/radar.go's dangerFiles
+// exactly (P3-design.md §1.1: "danger tag red when a guardrail hit names the
+// file").
+func dangerFiles(hits []model.GuardrailHit) map[string]bool {
+	out := make(map[string]bool, len(hits))
+	for _, h := range hits {
+		if h.File != "" {
+			out[h.File] = true
+		}
+	}
+	return out
+}
+
+// displayPath is the file card's title text: "old -> new" for a rename,
+// otherwise just the (git forward-slash) path. Mirrors
+// internal/tui/flatten.go's identical helper; duplicated, not imported (web
+// must not depend on the TUI package).
+func displayPath(f model.DiffFile) string {
+	if f.Status == model.FileRenamed && f.OldPath != "" && f.OldPath != f.Path {
+		return f.OldPath + " → " + f.Path
+	}
+	return f.Path
+}
+
+// dirsplit splits a git diff path (always "/"-separated, regardless of host
+// OS) into a dim directory prefix and the base name, matching the mock's
+// "path with dim dir prefix" file card treatment. Byte-splitting on '/' is
+// safe for any valid UTF-8 path: '/' never appears as, or inside, a
+// multi-byte rune's continuation bytes. Mirrors
+// internal/tui/flatten.go's splitDirBase.
+func dirsplit(p string) (dir, base string) {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return "", p
+	}
+	return p[:i+1], p[i+1:]
 }
 
 // reltime renders a coarse human-relative age ("3s ago", "6m ago", ...),
