@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -94,6 +95,17 @@ func main() {
 	}
 
 	c := newClient(socket)
+
+	// wt stop asks wtd to shut down gracefully (SIGTERM) and waits for it to
+	// actually exit (Item B). Like tui/menubar above, it skips the shared
+	// checkVersion preflight below: an unreachable daemon here is an
+	// ordinary "already stopped" outcome with its own tailored message (not
+	// checkVersion's generic "cannot reach wtd"), and a protocol mismatch is
+	// irrelevant to "please exit".
+	if args[0] == "stop" {
+		must(c.stop(socket, runtime.GOOS))
+		return
+	}
 
 	// Every remaining command talks to wtd, so check the protocol handshake
 	// first: one extra round trip per invocation, accepted (unix socket,
@@ -177,7 +189,7 @@ func main() {
 		}
 		must(c.rules(args[1], len(args) > 2 && args[2] == "--json"))
 	default:
-		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, rules, menubar, status, tui)", args[0])
+		fatal("unknown command %q (try: ls, watch, diff, review, approve, refresh, comments, comment, resolve, open, rules, menubar, status, stop, tui)", args[0])
 	}
 }
 
@@ -396,12 +408,17 @@ func (c *client) diff(id string) error {
 // anonymous result struct below) rather than importing the daemon's internal
 // packages — wt only ever depends on the wire format, never on wtd's Go types.
 type statusPayload struct {
-	Version       string           `json:"version"`
-	Protocol      int              `json:"protocol"`
-	UptimeSeconds float64          `json:"uptimeSeconds"`
-	SocketPath    string           `json:"socketPath"`
-	WatcherMode   string           `json:"watcherMode"`
-	Roots         []string         `json:"roots"`
+	Version       string   `json:"version"`
+	Protocol      int      `json:"protocol"`
+	Pid           int      `json:"pid"` // additive (Item B): os.Getpid() of the running wtd — `wt stop`'s target
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	SocketPath    string   `json:"socketPath"`
+	WatcherMode   string   `json:"watcherMode"`
+	Roots         []string `json:"roots"`
+	// IncludeRepos/ExcludeRepos are additive (repo discovery filter): empty
+	// unless the daemon's config.toml sets include_repos/exclude_repos.
+	IncludeRepos  []string         `json:"includeRepos,omitempty"`
+	ExcludeRepos  []string         `json:"excludeRepos,omitempty"`
 	StatePath     string           `json:"statePath"`
 	WebAddr       string           `json:"webAddr"` // "" when -web is off; see wt open below
 	RepoCount     int              `json:"repoCount"`
@@ -439,6 +456,82 @@ func (c *client) status(jsonOut bool) error {
 	}
 	renderStatus(st)
 	return nil
+}
+
+// stopPollInterval/stopTimeout govern `wt stop`'s wait loop below: poll
+// process liveness every ~100ms until wtd actually exits, bounded at 10s.
+// Vars, not consts, so a test can shrink both to exercise the timeout
+// branch in well under 10 real seconds.
+var (
+	stopPollInterval = 100 * time.Millisecond
+	stopTimeout      = 10 * time.Second
+)
+
+// stop implements `wt stop` (Item B): resolve wtd's pid via /api/status,
+// send it SIGTERM, then poll the PROCESS itself until it actually exits (or
+// the timeout below). goos is runtime.GOOS, passed in (like browserCommand's
+// own goos parameter above) so the Windows guidance branch is unit-testable
+// without a Windows machine. Called from main before the shared checkVersion
+// preflight — see that call site for why.
+func (c *client) stop(socket, goos string) error {
+	var st statusPayload
+	if err := c.get("/api/status", &st); err != nil {
+		return fmt.Errorf("wtd is not running (socket %s)", socket)
+	}
+
+	// A version-skewed wtd (built before Item B added Pid to statusPayload)
+	// or any other reason the daemon reports a non-positive pid must not
+	// fall through to os.FindProcess(0) or negative — an undocumented,
+	// platform-dependent thing to hand a real Signal call.
+	if st.Pid <= 0 {
+		return fmt.Errorf("wtd did not report a pid (daemon predates wt stop? version skew)")
+	}
+
+	// os.Process.Signal only supports os.Interrupt/os.Kill on Windows —
+	// SIGTERM there returns an unhelpful "not supported" error, so this is
+	// checked upfront and answered with real guidance instead, never
+	// escalating to a hard Kill.
+	if goos == "windows" {
+		return errors.New(windowsStopMessage(st.Pid))
+	}
+
+	proc, err := os.FindProcess(st.Pid)
+	if err != nil {
+		return fmt.Errorf("cannot find wtd process (pid %d): %w", st.Pid, err)
+	}
+
+	// ponytail: accepted risk, same-uid only — a microsecond-scale TOCTOU
+	// window exists between reading st.Pid above and this Signal call: if
+	// wtd already exited and something else reused that pid in between,
+	// this would signal the wrong (but same-user-owned) process instead.
+	// Inherent to the ratified "no dedicated shutdown endpoint" design (wt
+	// stop signals the OS process directly rather than wtd exposing e.g. a
+	// POST /api/shutdown); a real fix needs the daemon to name something
+	// more specific than a bare pid, out of scope here.
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("cannot signal wtd (pid %d): %w", st.Pid, err)
+	}
+
+	// Poll actual process liveness (signal 0: no-op, just existence/
+	// permission) rather than /api/status reachability — a wedged daemon
+	// that still 500s (or hangs) every request but whose process is
+	// genuinely gone, or vice versa, must not be misreported either way.
+	deadline := time.Now().Add(stopTimeout)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			fmt.Printf("wtd (pid %d) stopped\n", st.Pid)
+			return nil
+		}
+		time.Sleep(stopPollInterval)
+	}
+	return fmt.Errorf("wtd (pid %d) still running after 10s — kill it manually", st.Pid)
+}
+
+// windowsStopMessage is wt stop's Windows-only guidance: name the pid and
+// point at a manual stop, since SIGTERM isn't deliverable there (see stop
+// above).
+func windowsStopMessage(pid int) string {
+	return fmt.Sprintf("wtd is running as pid %d; SIGTERM is not supported on Windows — stop wtd from the terminal/task manager; pid %d", pid, pid)
 }
 
 func (c *client) review(id, file string, reviewed bool) error {
@@ -972,6 +1065,7 @@ func renderStatus(st statusPayload) {
 	uptime := time.Duration(st.UptimeSeconds * float64(time.Second)).Round(time.Second)
 	fmt.Printf("%s%swtd status%s\n", bold, blue, reset)
 	fmt.Printf("  %sversion%s    %s (protocol %d)\n", dim, reset, st.Version, st.Protocol)
+	fmt.Printf("  %spid%s        %d\n", dim, reset, st.Pid)
 	fmt.Printf("  %suptime%s     %s\n", dim, reset, uptime)
 	fmt.Printf("  %ssocket%s     %s\n", dim, reset, st.SocketPath)
 	web := st.WebAddr
@@ -982,6 +1076,12 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %swatcher%s    %s\n", dim, reset, st.WatcherMode)
 	fmt.Printf("  %sstate%s      %s\n", dim, reset, st.StatePath)
 	fmt.Printf("  %sroots%s      %s\n", dim, reset, strings.Join(st.Roots, ", "))
+	// filter: only when a repo discovery filter is actually configured —
+	// filtering must be loud, not silent, but an unfiltered daemon's status
+	// output must look exactly as it did before this field existed.
+	if len(st.IncludeRepos) > 0 || len(st.ExcludeRepos) > 0 {
+		fmt.Printf("  %sfilter%s     include=%s exclude=%s\n", dim, reset, filterListOrNone(st.IncludeRepos), filterListOrNone(st.ExcludeRepos))
+	}
 	fmt.Printf("  %srepos%s      %d\n", dim, reset, st.RepoCount)
 	fmt.Printf("  %sworktrees%s  %d\n", dim, reset, st.WorktreeCount)
 	fmt.Printf("  %sreviewed%s   %d/%d files\n", dim, reset, st.ReviewedFiles, st.TotalFiles)
@@ -989,6 +1089,17 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %snotifier%s   %s\n", dim, reset, st.Notifier)
 	fmt.Printf("  %srefresh (full)%s %s\n", dim, reset, formatRefreshMs(st.LastRefreshMs))
 	fmt.Printf("  %srefresh (one)%s  %s\n", dim, reset, formatRefreshMs(st.LastRefreshOneMs))
+}
+
+// filterListOrNone renders one half of wt status's "filter:" line: a
+// comma-joined glob list, or "(none)" for that half when it's unset (the
+// other half can still be non-empty; renderStatus decides whether to print
+// the line at all).
+func filterListOrNone(patterns []string) string {
+	if len(patterns) == 0 {
+		return "(none)"
+	}
+	return strings.Join(patterns, ",")
 }
 
 // formatRefreshMs renders a statusPayload refresh-timing field (P6-design.md
@@ -1021,7 +1132,8 @@ func usage() {
   wt ls                     list worktrees (radar)
   wt watch                  live radar, updates on every change
   wt diff <id>              show a worktree's diff
-  wt status [--json]        daemon health: version, uptime, watcher, roots, review counts
+  wt status [--json]        daemon health: version, pid, uptime, watcher, roots, review counts
+  wt stop                   ask wtd to shut down gracefully (SIGTERM) and wait for it to exit
   wt review <id> <file>     mark a file reviewed (--off to unmark)
   wt approve <id>           merge worktree→base & remove it (needs full review + clean tree)
   wt refresh                force a rescan

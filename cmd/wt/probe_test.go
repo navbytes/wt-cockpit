@@ -121,3 +121,39 @@ func TestStatusJSONOutputRoundTripsThroughUnmarshal(t *testing.T) {
 		t.Errorf("round-tripped status = %+v, want %+v", got, want)
 	}
 }
+
+// ---- wt status human output ----
+
+// TestRenderStatusShowsPidAndOmitsFilterLineWhenUnset pins Item A/B's status
+// additions: pid always renders, but the "filter:" line only appears when a
+// repo discovery filter is actually configured — an unfiltered daemon's
+// status output must look exactly as it did before these fields existed.
+func TestRenderStatusShowsPidAndOmitsFilterLineWhenUnset(t *testing.T) {
+	out := captureStdout(t, func() {
+		renderStatus(statusPayload{Version: "v1", Pid: 4242, Roots: []string{"/a"}})
+	})
+	if !strings.Contains(out, "4242") {
+		t.Errorf("renderStatus output = %q, want it to show the pid", out)
+	}
+	if strings.Contains(out, "filter") {
+		t.Errorf("renderStatus output = %q, want no filter line when include/exclude are both unset", out)
+	}
+}
+
+// TestRenderStatusShowsFilterLineWhenConfigured is the filter line's
+// positive case: either list being non-empty must show the line, with the
+// unset half rendered as "(none)" rather than blank.
+func TestRenderStatusShowsFilterLineWhenConfigured(t *testing.T) {
+	out := captureStdout(t, func() {
+		renderStatus(statusPayload{Version: "v1", Roots: []string{"/a"}, ExcludeRepos: []string{"archive-*"}})
+	})
+	if !strings.Contains(out, "filter") {
+		t.Errorf("renderStatus output = %q, want a filter line when exclude_repos is set", out)
+	}
+	if !strings.Contains(out, "archive-*") {
+		t.Errorf("renderStatus output = %q, want it to name the exclude pattern", out)
+	}
+	if !strings.Contains(out, "include=(none)") {
+		t.Errorf("renderStatus output = %q, want the unset half rendered as (none)", out)
+	}
+}

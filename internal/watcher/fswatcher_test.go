@@ -255,14 +255,14 @@ func TestReconcileDropsBookkeepingForRemovedWorktree(t *testing.T) {
 		dirCount:  map[string]int{},
 		capLogged: map[string]bool{},
 	}
-	sess.reconcile([]string{root}, 4)
+	sess.reconcile([]string{root}, 4, nil, nil)
 
 	if _, ok := sess.dirCount[featurePath]; !ok {
 		t.Fatalf("precondition: feature worktree should be tracked after the first reconcile, got %+v", sess.dirCount)
 	}
 
 	git(t, repoPath, "worktree", "remove", "--force", featurePath)
-	sess.reconcile([]string{root}, 4)
+	sess.reconcile([]string{root}, 4, nil, nil)
 
 	if _, ok := sess.dirCount[featurePath]; ok {
 		t.Errorf("dirCount should drop the removed worktree, got %+v", sess.dirCount)

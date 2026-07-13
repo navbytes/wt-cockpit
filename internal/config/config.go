@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
@@ -65,18 +67,27 @@ func (n NotificationsConfig) CooldownOr() time.Duration {
 // Config is the on-disk shape of config.toml. The zero value (returned when
 // the file doesn't exist) means "nothing configured" — every field left unset.
 type Config struct {
-	Roots     []string              `toml:"roots"`
-	Base      string                `toml:"base"`
-	Socket    string                `toml:"socket"`
-	TCP       string                `toml:"tcp"`
-	Web       string                `toml:"web"`
-	State     string                `toml:"state"`
-	Interval  time.Duration         `toml:"interval"`
-	Watch     string                `toml:"watch"`
-	LogFormat string                `toml:"log_format"`
-	LogLevel  string                `toml:"log_level"`
-	Repos     map[string]RepoConfig `toml:"repos"`
-	Rules     []guardrail.Rule      `toml:"rules"`
+	Roots []string `toml:"roots"`
+	// IncludeRepos/ExcludeRepos filter which discovered repos the daemon
+	// actually watches, matched against the repo folder's BASENAME (what
+	// shows as the repo name everywhere in the UI) using stdlib
+	// path/filepath.Match glob syntax only (internal/discovery.DiscoverRepos
+	// applies the actual include/exclude semantics). See Load's validation
+	// below for why a bad pattern is a load-time error rather than a
+	// silent no-op.
+	IncludeRepos []string              `toml:"include_repos"`
+	ExcludeRepos []string              `toml:"exclude_repos"`
+	Base         string                `toml:"base"`
+	Socket       string                `toml:"socket"`
+	TCP          string                `toml:"tcp"`
+	Web          string                `toml:"web"`
+	State        string                `toml:"state"`
+	Interval     time.Duration         `toml:"interval"`
+	Watch        string                `toml:"watch"`
+	LogFormat    string                `toml:"log_format"`
+	LogLevel     string                `toml:"log_level"`
+	Repos        map[string]RepoConfig `toml:"repos"`
+	Rules        []guardrail.Rule      `toml:"rules"`
 
 	// RulesSet is true iff [[rules]] appeared in the file at all (even empty).
 	// An absent [[rules]] means "use guardrail.DefaultRules()"; a present one —
@@ -144,5 +155,130 @@ func Load(path string) (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("%s: invalid notifications.severity %q (want \"danger\" or \"warn\")", path, cfg.Notifications.Severity)
 	}
+	if err := validateRepoGlobs(path, "include_repos", cfg.IncludeRepos); err != nil {
+		return Config{}, err
+	}
+	if err := validateRepoGlobs(path, "exclude_repos", cfg.ExcludeRepos); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// validateRepoGlobs checks that every pattern in patterns is syntactically
+// valid per stdlib path/filepath.Match's own grammar — fail-closed, same as
+// the rest of Load's validation: an invalid pattern must fail the daemon's
+// startup, not silently misbehave at scan time.
+//
+// This used to probe filepath.Match(pat, "x") directly, but Match only
+// surfaces ErrBadPattern LAZILY: it parses a pattern chunk by chunk and
+// gives up as soon as an earlier segment fails to match the specific name
+// it was called with, so probing against "x" passed clean for a pattern
+// like "prod-*[" — the mismatch on the literal "prod-" happens before the
+// dangling "[" is ever parsed — yet that same pattern errors at scan time
+// against a real repo named e.g. "prod-api" (internal/discovery.anyGlobMatch
+// would then swallow that error as "no match": exclude fails OPEN, include
+// silently drops wanted repos). checkGlobSyntax below walks the WHOLE
+// pattern unconditionally instead — no "name" involved at all — so this is
+// caught regardless of what name a later scan would ever try it against.
+func validateRepoGlobs(path, field string, patterns []string) error {
+	for _, pat := range patterns {
+		if err := checkGlobSyntax(pat); err != nil {
+			return fmt.Errorf("%s: invalid %s pattern %q: %w", path, field, pat, err)
+		}
+	}
+	return nil
+}
+
+// checkGlobSyntax reports whether pattern is syntactically well-formed per
+// path/filepath.Match's documented grammar (see that stdlib package's
+// match.go, which this mirrors): a linear syntax walk, not a matcher —
+// O(len(pattern)), independent of any "name" being matched. The grammar's
+// only two error shapes (from Match's own scanChunk/matchChunk/getEsc) are
+// a malformed "[...]" character class (empty, a bare "-"/"]" where a range
+// item was expected, or running out of pattern before the closing "]") and
+// a dangling "\" with nothing left to escape. Escaping is disabled on
+// Windows — filepath.Match's own documented behavior ("\\" is the path
+// separator there instead) — so those checks are skipped on that GOOS, to
+// stay exactly in sync with what Match will actually do at scan time on
+// whatever OS wtd is actually running on.
+func checkGlobSyntax(pattern string) error {
+	escape := runtime.GOOS != "windows"
+	i := 0
+	for i < len(pattern) {
+		switch pattern[i] {
+		case '[':
+			var err error
+			if i, err = skipGlobClass(pattern, i, escape); err != nil {
+				return err
+			}
+		case '\\':
+			if !escape {
+				i++
+				continue
+			}
+			if i+1 >= len(pattern) {
+				return filepath.ErrBadPattern
+			}
+			i += 2 // the backslash plus exactly one escaped byte
+		default:
+			i++
+		}
+	}
+	return nil
+}
+
+// skipGlobClass parses one "[...]" character class starting at
+// pattern[start] (which must be '['), mirroring filepath.Match's own
+// matchChunk '[' case: an optional leading "^", then one or more range
+// items (each optionally "lo-hi"), until a "]" closes it. Returns the index
+// just past that closing "]", or filepath.ErrBadPattern for anything
+// matchChunk/getEsc would themselves reject — including running out of
+// pattern before a "]" is ever found (the "unterminated class" case).
+func skipGlobClass(pattern string, start int, escape bool) (int, error) {
+	i := start + 1 // past '['
+	if i < len(pattern) && pattern[i] == '^' {
+		i++
+	}
+	nrange := 0
+	for {
+		if i < len(pattern) && pattern[i] == ']' && nrange > 0 {
+			return i + 1, nil
+		}
+		var err error
+		if i, err = skipGlobClassItem(pattern, i, escape); err != nil {
+			return 0, err
+		}
+		if i < len(pattern) && pattern[i] == '-' {
+			if i, err = skipGlobClassItem(pattern, i+1, escape); err != nil {
+				return 0, err
+			}
+		}
+		nrange++
+	}
+}
+
+// skipGlobClassItem parses one character-range endpoint, mirroring
+// filepath.Match's own getEsc EXACTLY: a bare "-" or "]" (or running out of
+// pattern) can't start an item; "\" (when escaping applies) is stripped,
+// erroring if nothing follows it; either way (escaped or not) getEsc then
+// decodes one full UTF-8 RUNE from whatever remains and rejects
+// utf8.RuneError — FIX 7: this used to short-circuit the escaped branch as
+// exactly one BYTE, which over-rejected a legal escaped multibyte character
+// in a class (e.g. "[\€]") as though its continuation bytes were their own,
+// invalid, standalone item.
+func skipGlobClassItem(pattern string, i int, escape bool) (int, error) {
+	if i >= len(pattern) || pattern[i] == '-' || pattern[i] == ']' {
+		return 0, filepath.ErrBadPattern
+	}
+	if escape && pattern[i] == '\\' {
+		i++
+		if i >= len(pattern) {
+			return 0, filepath.ErrBadPattern
+		}
+	}
+	r, n := utf8.DecodeRuneInString(pattern[i:])
+	if r == utf8.RuneError && n == 1 {
+		return 0, filepath.ErrBadPattern
+	}
+	return i + n, nil
 }

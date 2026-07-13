@@ -8,6 +8,7 @@ package discovery
 
 import (
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -23,8 +24,15 @@ var SkipDirs = map[string]bool{
 	".next": true, ".cache": true, ".terraform": true,
 }
 
-// DiscoverRepos walks each root up to maxDepth levels and returns the repos found.
-func DiscoverRepos(roots []string, maxDepth int) ([]model.Repo, error) {
+// DiscoverRepos walks each root up to maxDepth levels and returns the repos
+// found, filtered by include/exclude glob lists matched against each repo's
+// folder BASENAME (config.Config.IncludeRepos/ExcludeRepos): include empty
+// admits everything; include non-empty requires at least one match; exclude
+// always wins regardless of include. A filtered-out repo is dropped here, so
+// it is never enumerated further by any caller (its worktrees never reach
+// the engine or the fsnotify watcher) — both nil is the "no filter" case
+// every existing caller/test predates this feature with.
+func DiscoverRepos(roots []string, maxDepth int, include, exclude []string) ([]model.Repo, error) {
 	seen := map[string]bool{}
 	var repos []model.Repo
 
@@ -38,8 +46,13 @@ func DiscoverRepos(roots []string, maxDepth int) ([]model.Repo, error) {
 				return
 			}
 			seen[dir] = true
+			name := filepath.Base(dir)
+			if !repoPasses(name, include, exclude) {
+				slog.Debug("discovery: repo skipped by include/exclude filter", "repo", name, "path", dir)
+				return
+			}
 			repos = append(repos, model.Repo{
-				Name: filepath.Base(dir),
+				Name: name,
 				Path: dir,
 				Lang: detectLang(dir),
 			})
@@ -49,6 +62,58 @@ func DiscoverRepos(roots []string, maxDepth int) ([]model.Repo, error) {
 		}
 	}
 	return repos, nil
+}
+
+// repoPasses reports whether a repo's folder basename survives the
+// include-then-exclude filter (config.toml's include_repos/exclude_repos):
+// an empty include list admits everything at that stage; a non-empty one
+// requires at least one match. Exclude is evaluated after, and always wins —
+// a basename matching any exclude pattern is dropped even if it also matched
+// an include pattern.
+func repoPasses(name string, include, exclude []string) bool {
+	if len(include) > 0 && !anyGlobMatch(include, name, false) {
+		return false
+	}
+	return !anyGlobMatch(exclude, name, true)
+}
+
+// anyGlobMatch reports whether name matches any of patterns, using stdlib
+// path/filepath.Match only (never a custom matcher — see config.Load's
+// checkGlobSyntax, which rejects every syntactically invalid pattern at
+// config-load time, before it ever reaches here). onErrorMatch is a
+// backstop for filepath.Match still returning an error at scan time despite
+// that upfront check (only reachable if stdlib's own Match grammar ever
+// drifts from what checkGlobSyntax mirrors) — it decides which way THIS
+// caller must fail:
+//   - include (onErrorMatch=false): an errored pattern never itself admits
+//     a repo, so a broken include pattern can only ever narrow admission,
+//     the same direction Match's own error return already implies.
+//   - exclude (onErrorMatch=true): an errored pattern is treated as if it
+//     HAD matched, so a broken exclude pattern hides the repo rather than
+//     silently leaving it visible — failing OPEN is the dangerous direction
+//     for exclude specifically, since its whole job is to hide repos.
+//
+// ponytail: no dedup/rate-limit on the slog.Warn below — checkGlobSyntax
+// means this path is essentially unreachable in practice, so a real hit
+// warning once per repo per scan (rather than once per process) is an
+// acceptable cost for staying loud about an otherwise-silent miscount; add
+// throttling if a genuine stdlib grammar drift ever makes this noisy.
+func anyGlobMatch(patterns []string, name string, onErrorMatch bool) bool {
+	for _, pat := range patterns {
+		ok, err := filepath.Match(pat, name)
+		if err != nil {
+			slog.Warn("discovery: glob pattern errored at match time; failing closed",
+				"pattern", pat, "repo", name, "treatedAsMatch", onErrorMatch)
+			if onErrorMatch {
+				return true
+			}
+			continue
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // walk descends dir, calling onRepo for any directory holding a `.git` dir and not

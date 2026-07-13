@@ -17,6 +17,20 @@
 # entirely rather than merging with it.
 roots = ["~/code", "~/work"]
 
+# Repo discovery filters (optional): globs matched against each repo's folder
+# basename, using stdlib filepath.Match syntax: * (any chars), ? (any single
+# char), [abc] (char class). No ** (recursive) or regex.
+# - include_repos empty/unset = admit all repos; non-empty = admit only repos
+#   matching at least one pattern.
+# - exclude_repos = never watch these, even if include_repos matched them.
+#   Exclude always wins.
+# - A bad pattern (e.g. unterminated '[') is a fatal error at config load;
+#   the daemon refuses to start and names the pattern.
+# - Restart to apply changes. A filtered-out repo's review marks and comments
+#   stay dormant in the store and return when the repo is un-hidden.
+include_repos = []              # default: empty (admit all)
+exclude_repos = ["archive-*", "scratch-*"]  # example: hide old/temporary repos
+
 # Default diff baseline branch for every repo, used when a repo has no
 # per-repo override below and wtd can't otherwise detect its default branch.
 base = "main"

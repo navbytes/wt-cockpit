@@ -37,7 +37,13 @@ var ErrFileChanged = errors.New("file changed since it was reviewed")
 
 // Config holds engine settings.
 type Config struct {
-	Roots          []string
+	Roots []string
+	// IncludeRepos/ExcludeRepos mirror config.Config's own fields of the same
+	// name (repo discovery filter, matched against each repo's folder
+	// basename) — passed straight through to discovery.DiscoverRepos by
+	// Refresh. Both nil means no filter, same as today.
+	IncludeRepos   []string
+	ExcludeRepos   []string
 	MaxDepth       int
 	DefaultBase    string            // "" => use each repo's own default branch
 	BaseFor        map[string]string // repo path -> base override, takes precedence over DefaultBase
@@ -443,7 +449,7 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	defer e.refreshMu.Unlock()
 	start := time.Now()
 
-	repos, err := discovery.DiscoverRepos(e.cfg.Roots, e.cfg.MaxDepth)
+	repos, err := discovery.DiscoverRepos(e.cfg.Roots, e.cfg.MaxDepth, e.cfg.IncludeRepos, e.cfg.ExcludeRepos)
 	if err != nil {
 		return err
 	}

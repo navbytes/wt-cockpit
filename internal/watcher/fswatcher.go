@@ -69,10 +69,16 @@ type watchEntry struct {
 // set up watches before it can usefully wait for events — unlike Poller, which
 // simply hands the whole job to the engine's own Refresh.
 type FSWatcher struct {
-	Roots    []string
-	MaxDepth int                // discovery depth; <=0 defaults to 4 (mirrors engine.Config)
-	Interval time.Duration      // reconciliation tick; <=0 defaults to 10s
-	Backend  gitbackend.Backend // used to list each repo's worktrees; must be non-nil
+	Roots []string
+	// IncludeRepos/ExcludeRepos mirror engine.Config's own fields of the same
+	// name (repo discovery filter, matched against each repo's folder
+	// basename) — passed straight through to discovery.DiscoverRepos on
+	// every reconcile, so a filtered-out repo is never watched here either.
+	IncludeRepos []string
+	ExcludeRepos []string
+	MaxDepth     int                // discovery depth; <=0 defaults to 4 (mirrors engine.Config)
+	Interval     time.Duration      // reconciliation tick; <=0 defaults to 10s
+	Backend      gitbackend.Backend // used to list each repo's worktrees; must be non-nil
 }
 
 // Run watches every worktree under Roots and invokes onChange(worktreeRoot) on
@@ -104,7 +110,7 @@ func (w *FSWatcher) Run(ctx context.Context, onChange func(path string)) {
 		dirCount:  map[string]int{},
 		capLogged: map[string]bool{},
 	}
-	sess.reconcile(w.Roots, maxDepth)
+	sess.reconcile(w.Roots, maxDepth, w.IncludeRepos, w.ExcludeRepos)
 	onChange("") // initial scan, mirrors Poller's immediate first tick
 
 	// Trailing-edge debounce: an event for a key (a worktree root, or globalKey)
@@ -152,13 +158,13 @@ func (w *FSWatcher) Run(ctx context.Context, onChange func(path string)) {
 			slog.Warn("fswatcher error", "error", err)
 		case key := <-fired:
 			if key == globalKey {
-				sess.reconcile(w.Roots, maxDepth)
+				sess.reconcile(w.Roots, maxDepth, w.IncludeRepos, w.ExcludeRepos)
 				onChange("")
 			} else {
 				onChange(key)
 			}
 		case <-ticker.C:
-			sess.reconcile(w.Roots, maxDepth)
+			sess.reconcile(w.Roots, maxDepth, w.IncludeRepos, w.ExcludeRepos)
 			onChange("")
 		}
 	}
@@ -176,9 +182,12 @@ type fsSession struct {
 
 // reconcile re-runs discovery, adds watches for any new repo or worktree, and
 // drops bookkeeping for worktrees that disappeared (fsnotify itself already
-// auto-removes the underlying watch when a path is deleted).
-func (s *fsSession) reconcile(roots []string, maxDepth int) {
-	repos, err := discovery.DiscoverRepos(roots, maxDepth)
+// auto-removes the underlying watch when a path is deleted). include/exclude
+// are FSWatcher's own IncludeRepos/ExcludeRepos, threaded through unchanged —
+// a filtered-out repo comes back from DiscoverRepos already dropped, so it is
+// never watched here at all.
+func (s *fsSession) reconcile(roots []string, maxDepth int, include, exclude []string) {
+	repos, err := discovery.DiscoverRepos(roots, maxDepth, include, exclude)
 	if err != nil {
 		return
 	}
