@@ -153,6 +153,105 @@ func TestDiscoverReposIncludeExcludeFilter(t *testing.T) {
 	}
 }
 
+// TestDiscoverReposHandlesRepoNameContainingGlobMetacharacters is candidate
+// gap #5 from the discovery-filter test brief: filepath.Match only ever
+// interprets glob syntax ("[", "*", "?") from its PATTERN argument
+// (include_repos/exclude_repos' own config-authored globs); anyGlobMatch
+// passes the repo's folder BASENAME as the NAME argument, which Match
+// compares structurally/literally and can never itself cause an error no
+// matter what bytes the actual directory on disk happens to contain. This
+// pins that a repo named with glob metacharacters neither crashes discovery
+// nor gets mismatched by an unrelated pattern.
+func TestDiscoverReposHandlesRepoNameContainingGlobMetacharacters(t *testing.T) {
+	root := t.TempDir()
+	fakeRepo(t, filepath.Join(root, "my[repo"))
+	fakeRepo(t, filepath.Join(root, "plain-repo"))
+	want := []string{"my[repo", "plain-repo"}
+
+	// No filter at all: the walk itself must not error out over the odd name.
+	repos, err := DiscoverRepos([]string{root}, 4, nil, nil)
+	if err != nil {
+		t.Fatalf("DiscoverRepos returned an error for a repo whose name contains glob metacharacters: %v", err)
+	}
+	var names []string
+	for _, r := range repos {
+		names = append(names, r.Name)
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("repos = %v, want %v", names, want)
+	}
+
+	// An ordinary wildcard include pattern must still match the odd name
+	// literally: "*" matches any run of bytes in NAME, including a "[" that
+	// would be special if it appeared in PATTERN instead.
+	repos, err = DiscoverRepos([]string{root}, 4, []string{"my*"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0].Name != "my[repo" {
+		t.Errorf("include=[my*] = %+v, want just my[repo", repos)
+	}
+
+	// An unrelated exclude pattern must not accidentally catch it either.
+	repos, err = DiscoverRepos([]string{root}, 4, nil, []string{"other-*"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names = nil
+	for _, r := range repos {
+		names = append(names, r.Name)
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("exclude=[other-*] should not affect either repo, got %v want %v", names, want)
+	}
+}
+
+// ---- anyGlobMatch/repoPasses: fail-closed backstop for a match-time error ----
+//
+// config.Load's checkGlobSyntax rejects every syntactically invalid pattern
+// before it ever reaches discovery, so filepath.Match erroring here should
+// be unreachable in practice — these bypass that upstream validation by
+// calling anyGlobMatch/repoPasses directly with a malformed pattern, to pin
+// what happens if stdlib's own Match grammar ever drifts from what
+// checkGlobSyntax mirrors: exclude must fail CLOSED (hide the repo), not
+// open (silently leave a "should be hidden" repo visible).
+
+// TestAnyGlobMatchFailsClosedOnMatchTimeError pins onErrorMatch's two
+// directions directly: true (exclude's backstop) must count an errored
+// pattern as a match; false (include's backstop) must not.
+func TestAnyGlobMatchFailsClosedOnMatchTimeError(t *testing.T) {
+	const badPattern = "[" // unterminated char class; config.Load would normally reject this
+	if _, err := filepath.Match(badPattern, "x"); err == nil {
+		t.Fatalf("test premise broken: %q no longer errors from filepath.Match", badPattern)
+	}
+
+	if !anyGlobMatch([]string{badPattern}, "x", true) {
+		t.Error("onErrorMatch=true (exclude): an errored pattern must count as a match, so the repo is hidden")
+	}
+	if anyGlobMatch([]string{badPattern}, "x", false) {
+		t.Error("onErrorMatch=false (include): an errored pattern must not count as a match")
+	}
+}
+
+// TestRepoPassesFailsClosedWhenExcludePatternErrorsAtScanTime is the
+// security-relevant direction: a malformed exclude pattern must hide the
+// repo rather than silently leave it visible.
+func TestRepoPassesFailsClosedWhenExcludePatternErrorsAtScanTime(t *testing.T) {
+	if repoPasses("anything", nil, []string{"["}) {
+		t.Error("a malformed exclude pattern must hide the repo (fail closed), not silently admit it")
+	}
+}
+
+// TestRepoPassesFailsClosedWhenIncludePatternErrorsAtScanTime: an include
+// list made entirely of malformed patterns must admit nothing.
+func TestRepoPassesFailsClosedWhenIncludePatternErrorsAtScanTime(t *testing.T) {
+	if repoPasses("anything", []string{"["}, nil) {
+		t.Error("an include list of only malformed patterns must admit nothing")
+	}
+}
+
 func commit(t *testing.T, dir string) {
 	gitCmd(t, dir, "add", ".")
 	gitCmd(t, dir, "commit", "-q", "-m", "c")

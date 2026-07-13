@@ -459,22 +459,32 @@ func (c *client) status(jsonOut bool) error {
 }
 
 // stopPollInterval/stopTimeout govern `wt stop`'s wait loop below: poll
-// status every ~100ms until the daemon actually goes away, bounded at 10s.
-const (
+// process liveness every ~100ms until wtd actually exits, bounded at 10s.
+// Vars, not consts, so a test can shrink both to exercise the timeout
+// branch in well under 10 real seconds.
+var (
 	stopPollInterval = 100 * time.Millisecond
 	stopTimeout      = 10 * time.Second
 )
 
 // stop implements `wt stop` (Item B): resolve wtd's pid via /api/status,
-// send it SIGTERM, then poll status until the daemon actually exits (or the
-// timeout below). goos is runtime.GOOS, passed in (like browserCommand's own
-// goos parameter above) so the Windows guidance branch is unit-testable
+// send it SIGTERM, then poll the PROCESS itself until it actually exits (or
+// the timeout below). goos is runtime.GOOS, passed in (like browserCommand's
+// own goos parameter above) so the Windows guidance branch is unit-testable
 // without a Windows machine. Called from main before the shared checkVersion
 // preflight — see that call site for why.
 func (c *client) stop(socket, goos string) error {
 	var st statusPayload
 	if err := c.get("/api/status", &st); err != nil {
 		return fmt.Errorf("wtd is not running (socket %s)", socket)
+	}
+
+	// A version-skewed wtd (built before Item B added Pid to statusPayload)
+	// or any other reason the daemon reports a non-positive pid must not
+	// fall through to os.FindProcess(0) or negative — an undocumented,
+	// platform-dependent thing to hand a real Signal call.
+	if st.Pid <= 0 {
+		return fmt.Errorf("wtd did not report a pid (daemon predates wt stop? version skew)")
 	}
 
 	// os.Process.Signal only supports os.Interrupt/os.Kill on Windows —
@@ -489,14 +499,26 @@ func (c *client) stop(socket, goos string) error {
 	if err != nil {
 		return fmt.Errorf("cannot find wtd process (pid %d): %w", st.Pid, err)
 	}
+
+	// ponytail: accepted risk, same-uid only — a microsecond-scale TOCTOU
+	// window exists between reading st.Pid above and this Signal call: if
+	// wtd already exited and something else reused that pid in between,
+	// this would signal the wrong (but same-user-owned) process instead.
+	// Inherent to the ratified "no dedicated shutdown endpoint" design (wt
+	// stop signals the OS process directly rather than wtd exposing e.g. a
+	// POST /api/shutdown); a real fix needs the daemon to name something
+	// more specific than a bare pid, out of scope here.
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("cannot signal wtd (pid %d): %w", st.Pid, err)
 	}
 
+	// Poll actual process liveness (signal 0: no-op, just existence/
+	// permission) rather than /api/status reachability — a wedged daemon
+	// that still 500s (or hangs) every request but whose process is
+	// genuinely gone, or vice versa, must not be misreported either way.
 	deadline := time.Now().Add(stopTimeout)
 	for time.Now().Before(deadline) {
-		var probe statusPayload
-		if err := c.get("/api/status", &probe); err != nil {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
 			fmt.Printf("wtd (pid %d) stopped\n", st.Pid)
 			return nil
 		}

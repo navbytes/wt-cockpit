@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
 )
@@ -486,6 +487,25 @@ func TestLoadBadExcludeRepoGlobErrorsAndNamesPattern(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsUnterminatedBracketGlobWithContent is
+// TestLoadBadIncludeRepoGlobErrorsAndNamesPattern's sibling for the "[ab"
+// shape specifically: an unterminated character class WITH content before
+// the missing "]", as opposed to a bare "[". A config author is far more
+// likely to typo a glob this way (meaning "a or b", forgetting the closing
+// bracket) than to write a lone "[", so this pins that filepath.Match still
+// reports ErrBadPattern for it too — not, say, some other malformed-pattern
+// code path — at config LOAD time, same as every other bad pattern.
+func TestLoadRejectsUnterminatedBracketGlobWithContent(t *testing.T) {
+	path := writeTOML(t, `include_repos = ["[ab"]`+"\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an unterminated character class with content ([ab)")
+	}
+	if got := err.Error(); !strings.Contains(got, "[ab") {
+		t.Errorf("error should name the offending pattern, got: %v", got)
+	}
+}
+
 // TestLoadValidGlobFormsAllParseCleanly exercises the glob forms the
 // discovery-side table test also covers (archive-*, ?tmp, [ab]x) end to end
 // through Load's validation probe — none of them should trip ErrBadPattern.
@@ -493,5 +513,245 @@ func TestLoadValidGlobFormsAllParseCleanly(t *testing.T) {
 	path := writeTOML(t, `exclude_repos = ["archive-*", "?tmp", "[ab]x"]`+"\n")
 	if _, err := Load(path); err != nil {
 		t.Errorf("valid glob forms should load cleanly, got: %v", err)
+	}
+}
+
+// ---- checkGlobSyntax: equivalence proof (the lazy-Match footgun) ----
+//
+// filepath.Match only surfaces ErrBadPattern LAZILY: it parses a pattern
+// chunk by chunk and gives up as soon as an earlier segment fails to match
+// the specific name it was called with. That means probing
+// Match(pattern, "x") — validateRepoGlobs' OLD approach — can pass clean for
+// a pattern like "prod-*[": the mismatch on the literal "prod-" happens
+// before the dangling "[" is ever parsed, yet that same pattern errors at
+// scan time against a real repo named e.g. "prod-api". The tests below
+// prove checkGlobSyntax doesn't share that blind spot: it must reject a
+// pattern iff Match would error for SOME name it could ever be evaluated
+// against — not just the one probe name a config-load-time check happens
+// to try.
+
+// globProbeBase seeds buildGlobProbeNames — the brief's own fixed probe set.
+var globProbeBase = []string{"", "x", "prod-api", "a", "ab", "a]c"}
+
+// buildGlobProbeNames returns globProbeBase plus every prefix of pattern
+// itself, and of pattern with its "\" escapes stripped: a literal chunk
+// always matches its own DE-ESCAPED text, so probing with a pattern's own
+// prefixes is the general way to reach as deep as Match's lazy, chunk-by-
+// chunk parser can structurally go into a LATER chunk — exactly how
+// "prod-api" reaches into "prod-*[" 's dangling "[".
+func buildGlobProbeNames(pattern string) []string {
+	names := append([]string(nil), globProbeBase...)
+	for i := 1; i <= len(pattern); i++ {
+		names = append(names, pattern[:i])
+	}
+	de := deEscapeForGlobTest(pattern)
+	for i := 1; i <= len(de); i++ {
+		names = append(names, de[:i])
+	}
+	// A "[...]" class matches CONTENT, not its own bracket syntax — a plain
+	// prefix of pattern's raw text can never satisfy one (e.g. a class
+	// chunk "[*]" needs a name starting with the literal "*", not "["), so
+	// a pattern shaped like "[*]*[" (a valid single-char class, then a
+	// dangling class after a star) would otherwise look falsely "never bad"
+	// to this ground truth. bracketContentProbes below plugs that hole.
+	for _, p := range bracketContentProbes(pattern) {
+		for i := 1; i <= len(p); i++ {
+			names = append(names, p[:i])
+		}
+	}
+	return names
+}
+
+// bracketContentProbes returns, for every "[" in pattern, a synthetic probe
+// name: pattern's own text up to that "[", plus the single content
+// character the class itself would accept as its first item (skipping a
+// leading "^" negation marker) — letting ground truth actually satisfy a
+// bracket-class CHUNK the same way a real repo name eventually could, the
+// same "use the pattern's own content to reach deeper" idea
+// buildGlobProbeNames already applies to plain literal chunks.
+func bracketContentProbes(pattern string) []string {
+	var out []string
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] != '[' {
+			continue
+		}
+		j := i + 1
+		if j < len(pattern) && pattern[j] == '^' {
+			j++
+		}
+		if j >= len(pattern) {
+			continue
+		}
+		_, n := utf8.DecodeRuneInString(pattern[j:])
+		if j+n > len(pattern) {
+			continue
+		}
+		out = append(out, pattern[:i]+pattern[j:j+n])
+	}
+	return out
+}
+
+// deEscapeForGlobTest strips one backslash before each following byte — a
+// rough, test-only unescape, good enough to derive additional candidate
+// probe names: it can only make matchErrorsForSomeName MORE complete (find
+// more real Match errors), never less accurate for any name actually tried.
+func deEscapeForGlobTest(pattern string) string {
+	b := make([]byte, 0, len(pattern))
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\\' && i+1 < len(pattern) {
+			i++
+		}
+		b = append(b, pattern[i])
+	}
+	return string(b)
+}
+
+// matchErrorsForSomeName is the ground truth checkGlobSyntax must track:
+// whether filepath.Match(pattern, name) errors for SOME name in
+// buildGlobProbeNames(pattern).
+func matchErrorsForSomeName(pattern string) bool {
+	for _, n := range buildGlobProbeNames(pattern) {
+		if _, err := filepath.Match(pattern, n); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCheckGlobSyntaxEquivalentToLazyMatchAcrossTrickyCorpus is FIX 1's
+// equivalence proof, over the brief's own corpus: a[, [ab, prod-*[, a\, \,
+// [], []], [^], [a-], [--0], a[b\]c, *[, ?[x (all genuinely malformed) and
+// a set of validly-formed patterns (which must stay accepted).
+func TestCheckGlobSyntaxEquivalentToLazyMatchAcrossTrickyCorpus(t *testing.T) {
+	tricky := []string{
+		"a[", "[ab", "prod-*[", `a\`, `\`, "[]", "[]]", "[^]", "[a-]", "[--0]",
+		`a[b\]c`, "*[", "?[x",
+	}
+	valid := []string{
+		"[a-z]", "prod-*", "archive-*", "?tmp", "[ab]x", "[^ab]x", `a\*b`,
+		`\*`, `\?`, `\[`, "a**b", "[!ab]", "", "*", "?",
+		// FIX 7/8: an escaped MULTIBYTE rune inside a class, its negated
+		// form, and a range between two multibyte runes — all genuinely
+		// valid per filepath.Match, but over-rejected by the bug FIX 7
+		// fixed (skipGlobClassItem used to treat an escaped char as exactly
+		// one BYTE rather than decoding the full rune, so "€"'s trailing
+		// continuation bytes read back as their own invalid item).
+		`[\€]`, `[^\€]`, `[€-☃]`,
+	}
+
+	for _, pat := range tricky {
+		if !matchErrorsForSomeName(pat) {
+			t.Fatalf("test bug: ground truth says tricky pattern %q is never bad — corpus needs a probe name that reaches it", pat)
+		}
+		if err := checkGlobSyntax(pat); err == nil {
+			t.Errorf("checkGlobSyntax(%q) = nil, want an error (Match errors for some reachable name)", pat)
+		}
+	}
+	for _, pat := range valid {
+		if err := checkGlobSyntax(pat); err != nil {
+			t.Errorf("checkGlobSyntax(%q) = %v, want nil (a genuinely valid glob)", pat, err)
+		}
+		if matchErrorsForSomeName(pat) {
+			t.Fatalf("test bug: ground truth says supposedly-valid pattern %q IS bad", pat)
+		}
+	}
+}
+
+// globSyntaxAlphabet is the generation alphabet for the exhaustive
+// equivalence test below. FIX 8: the original alphabet here was ASCII-only,
+// which is exactly why that test stayed green straight through FIX 7's
+// escaped-multibyte-rune bug — it never generated a pattern shaped like
+// "[\€]". "€" (3 bytes) and "é" (2 bytes) exercise multibyte runes of two
+// different widths, both standalone and combined with the ASCII glob
+// metacharacters.
+var globSyntaxAlphabet = []string{"a", "-", "[", "]", "^", `\`, "*", "?", "€", "é"}
+
+// genGlobPatterns returns every string of length 1..maxLen built from
+// alphabet (a rune/multi-rune-string alphabet, not a byte one — string
+// concatenation keeps each multibyte entry intact).
+func genGlobPatterns(alphabet []string, maxLen int) []string {
+	var out []string
+	var rec func(cur string, depth int)
+	rec = func(cur string, depth int) {
+		if depth > 0 {
+			out = append(out, cur)
+		}
+		if depth == maxLen {
+			return
+		}
+		for _, c := range alphabet {
+			rec(cur+c, depth+1)
+		}
+	}
+	rec("", 0)
+	return out
+}
+
+// TestCheckGlobSyntaxEquivalentToLazyMatchExhaustiveWithMultibyte is FIX 8:
+// generates every pattern up to length 4 over globSyntaxAlphabet (which
+// includes multibyte runes) and checks checkGlobSyntax against the same
+// Match-based ground truth as the corpus test above — both directions, no
+// false-accept and no false-reject — closing the false-green gap an
+// ASCII-only corpus left open for FIX 7's bug.
+func TestCheckGlobSyntaxEquivalentToLazyMatchExhaustiveWithMultibyte(t *testing.T) {
+	patterns := genGlobPatterns(globSyntaxAlphabet, 5)
+	t.Logf("checking %d generated patterns (incl. multibyte runes)", len(patterns))
+
+	mismatches := 0
+	for _, pat := range patterns {
+		want := matchErrorsForSomeName(pat)
+		got := checkGlobSyntax(pat) != nil
+		if want != got {
+			mismatches++
+			if mismatches <= 20 {
+				t.Errorf("pattern %q: checkGlobSyntax.bad=%v, groundTruth(Match).bad=%v", pat, got, want)
+			}
+		}
+	}
+	if mismatches > 0 {
+		t.Fatalf("%d/%d generated patterns disagreed with ground truth (showing up to 20)", mismatches, len(patterns))
+	}
+}
+
+// TestCheckGlobSyntaxAgreesWithMatchOnARawInvalidUTF8Byte is FIX 8's
+// direct-function-level check: TOML can never actually deliver a raw
+// invalid UTF-8 byte in a config string (BurntSushi's decoder requires
+// valid UTF-8), so this bypasses Load/writeTOML entirely and calls
+// checkGlobSyntax directly — proving it still agrees with filepath.Match's
+// own verdict on such a byte (both bare and backslash-escaped, inside a
+// class), not just on patterns a config author could actually type.
+func TestCheckGlobSyntaxAgreesWithMatchOnARawInvalidUTF8Byte(t *testing.T) {
+	patterns := []string{"[\xff]", "[\\" + "\xff" + "]"}
+	for _, pat := range patterns {
+		if !matchErrorsForSomeName(pat) {
+			t.Fatalf("test bug: ground truth says %q is never bad", pat)
+		}
+		if err := checkGlobSyntax(pat); err == nil {
+			t.Errorf("checkGlobSyntax(%q) = nil, want an error (matches filepath.Match's own verdict on an invalid UTF-8 byte)", pat)
+		}
+	}
+}
+
+// TestCheckGlobSyntaxCatchesPatternTheOldProbeMissed is FIX 1's headline
+// regression pin: "prod-*[" passes the OLD filepath.Match(pat, "x") probe
+// clean (the mismatch on "prod-" happens before the dangling "[" is ever
+// parsed) yet errors against a real repo name like "prod-api" — this locks
+// in both halves of that premise, then asserts checkGlobSyntax rejects it
+// outright and Load() refuses to start over it end to end.
+func TestCheckGlobSyntaxCatchesPatternTheOldProbeMissed(t *testing.T) {
+	const pat = "prod-*["
+	if _, err := filepath.Match(pat, "x"); err != nil {
+		t.Fatalf("test premise broken: Match(%q, \"x\") now errors (%v) — pick a different probe-blind pattern", pat, err)
+	}
+	if _, err := filepath.Match(pat, "prod-api"); err == nil {
+		t.Fatalf("test premise broken: Match(%q, \"prod-api\") no longer errors — pick a different probe-blind pattern", pat)
+	}
+	if err := checkGlobSyntax(pat); err == nil {
+		t.Error(`checkGlobSyntax("prod-*[") = nil, want an error`)
+	}
+
+	path := writeTOML(t, `exclude_repos = ["prod-*["]`+"\n")
+	if _, err := Load(path); err == nil {
+		t.Error("Load should refuse to start over an exclude_repos pattern that only errors for SOME repo names, not just a single config-load probe")
 	}
 }

@@ -84,9 +84,18 @@ func TestWtStopStopsRealDaemonExitZero(t *testing.T) {
 	if err := daemon.Start(); err != nil {
 		t.Fatalf("starting wtd: %v", err)
 	}
+	// Reap promptly via a background goroutine, mirroring what a real
+	// supervisor (launchd/systemd/an interactive shell) does: an exited but
+	// UNREAPED process is a zombie that os.Process.Signal(syscall.Signal(0))
+	// — wt stop's own liveness poll (FIX 4) — still reports as "alive" until
+	// its parent actually reaps it. Deferring Wait() to test cleanup (as
+	// this used to) would make wtd's own process linger as a false "still
+	// running" for the whole poll timeout, well after it had actually exited.
+	daemonDone := make(chan error, 1)
+	go func() { daemonDone <- daemon.Wait() }()
 	defer func() {
 		_ = daemon.Process.Kill()
-		_ = daemon.Wait()
+		<-daemonDone
 	}()
 	waitForSocket(t, sockPath, 5*time.Second)
 
@@ -203,5 +212,59 @@ func TestWindowsStopMessageNamesPidAndGuidance(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("windowsStopMessage(4242) = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// TestClientStopReturnsErrorWhenPidIsNonPositive pins the guard a version-
+// skewed wtd (built before Item B added Pid to statusPayload, so it decodes
+// to Go's zero value 0) — or any other reason a non-positive pid comes
+// back — must trip BEFORE os.FindProcess/Signal ever sees it: an
+// undocumented, platform-dependent thing to hand a real Signal call.
+// Reaching os.FindProcess instead would surface a different error message
+// ("cannot find process"), so this also proves the guard fires first.
+func TestClientStopReturnsErrorWhenPidIsNonPositive(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(statusPayload{Pid: pid})
+		}))
+		c := &client{http: &http.Client{Timeout: 2 * time.Second}, base: ts.URL}
+		err := c.stop("/tmp/example.sock", "darwin")
+		ts.Close()
+		if err == nil || !strings.Contains(err.Error(), "did not report a pid") {
+			t.Errorf("stop() with pid=%d = %v, want a \"did not report a pid\" error", pid, err)
+		}
+	}
+}
+
+// TestClientStopTimesOutWhenProcessIgnoresSIGTERM is FIX 4/FIX 6's
+// timeout-branch test: a real (but SIGTERM-ignoring) process, reported via
+// a fake /api/status, must make stop() actually time out and report "still
+// running" — proving the poll loop now checks real process liveness
+// (proc.Signal(0)) rather than treating any /api/status error as success
+// (there is no /api/status to even ask here). stopTimeout/stopPollInterval
+// are vars (FIX 6) specifically so this runs in well under 10 real seconds.
+func TestClientStopTimesOutWhenProcessIgnoresSIGTERM(t *testing.T) {
+	sleeper := exec.Command("sh", "-c", `trap '' TERM; sleep 60`)
+	if err := sleeper.Start(); err != nil {
+		t.Fatalf("starting sleeper: %v", err)
+	}
+	defer func() {
+		_ = sleeper.Process.Kill()
+		_ = sleeper.Wait()
+	}()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(statusPayload{Pid: sleeper.Process.Pid})
+	}))
+	defer ts.Close()
+
+	oldTimeout, oldPoll := stopTimeout, stopPollInterval
+	stopTimeout, stopPollInterval = 300*time.Millisecond, 20*time.Millisecond
+	defer func() { stopTimeout, stopPollInterval = oldTimeout, oldPoll }()
+
+	c := &client{http: &http.Client{Timeout: 2 * time.Second}, base: ts.URL}
+	err := c.stop("/tmp/example.sock", "darwin")
+	if err == nil || !strings.Contains(err.Error(), "still running") {
+		t.Errorf("stop() against a SIGTERM-ignoring process = %v, want a \"still running\" error", err)
 	}
 }

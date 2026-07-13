@@ -71,22 +71,45 @@ func DiscoverRepos(roots []string, maxDepth int, include, exclude []string) ([]m
 // a basename matching any exclude pattern is dropped even if it also matched
 // an include pattern.
 func repoPasses(name string, include, exclude []string) bool {
-	if len(include) > 0 && !anyGlobMatch(include, name) {
+	if len(include) > 0 && !anyGlobMatch(include, name, false) {
 		return false
 	}
-	return !anyGlobMatch(exclude, name)
+	return !anyGlobMatch(exclude, name, true)
 }
 
 // anyGlobMatch reports whether name matches any of patterns, using stdlib
 // path/filepath.Match only (never a custom matcher — see config.Load's
-// validateRepoGlobs, which probes each pattern at config-load time so an
-// invalid one fails the daemon's startup instead of quietly matching
-// nothing here). A pattern that still errors at match time despite that
-// upfront probe (unreachable in practice) is treated as "no match" rather
-// than aborting discovery.
-func anyGlobMatch(patterns []string, name string) bool {
+// checkGlobSyntax, which rejects every syntactically invalid pattern at
+// config-load time, before it ever reaches here). onErrorMatch is a
+// backstop for filepath.Match still returning an error at scan time despite
+// that upfront check (only reachable if stdlib's own Match grammar ever
+// drifts from what checkGlobSyntax mirrors) — it decides which way THIS
+// caller must fail:
+//   - include (onErrorMatch=false): an errored pattern never itself admits
+//     a repo, so a broken include pattern can only ever narrow admission,
+//     the same direction Match's own error return already implies.
+//   - exclude (onErrorMatch=true): an errored pattern is treated as if it
+//     HAD matched, so a broken exclude pattern hides the repo rather than
+//     silently leaving it visible — failing OPEN is the dangerous direction
+//     for exclude specifically, since its whole job is to hide repos.
+//
+// ponytail: no dedup/rate-limit on the slog.Warn below — checkGlobSyntax
+// means this path is essentially unreachable in practice, so a real hit
+// warning once per repo per scan (rather than once per process) is an
+// acceptable cost for staying loud about an otherwise-silent miscount; add
+// throttling if a genuine stdlib grammar drift ever makes this noisy.
+func anyGlobMatch(patterns []string, name string, onErrorMatch bool) bool {
 	for _, pat := range patterns {
-		if ok, err := filepath.Match(pat, name); err == nil && ok {
+		ok, err := filepath.Match(pat, name)
+		if err != nil {
+			slog.Warn("discovery: glob pattern errored at match time; failing closed",
+				"pattern", pat, "repo", name, "treatedAsMatch", onErrorMatch)
+			if onErrorMatch {
+				return true
+			}
+			continue
+		}
+		if ok {
 			return true
 		}
 	}
