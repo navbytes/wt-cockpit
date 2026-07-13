@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestDiscoverReposFindsMainReposWithLang(t *testing.T) {
 	junk := filepath.Join(root, "notarepo", "node_modules", "pkg")
 	os.MkdirAll(filepath.Join(junk, ".git"), 0o755) // fake .git inside node_modules
 
-	repos, err := DiscoverRepos([]string{root}, 4)
+	repos, err := DiscoverRepos([]string{root}, 4, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestDiscoverSkipsLinkedWorktrees(t *testing.T) {
 	wt := filepath.Join(root, "proj-feat")
 	gitCmd(t, repo, "worktree", "add", "-q", "-b", "feat", wt)
 
-	repos, err := DiscoverRepos([]string{root}, 4)
+	repos, err := DiscoverRepos([]string{root}, 4, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +75,81 @@ func TestDiscoverSkipsLinkedWorktrees(t *testing.T) {
 	}
 	if repos[0].Name != "proj" {
 		t.Errorf("repo = %q", repos[0].Name)
+	}
+}
+
+// fakeRepo creates a minimal repo marker (a .git directory, no real git
+// repo) at dir — DiscoverRepos only ever os.Stats "<dir>/.git" to decide a
+// directory is a repo, so this is enough and far cheaper than a real `git
+// init` for a table test spanning several repos (mirrors the existing
+// "notarepo/node_modules/pkg/.git" synthetic case above).
+func fakeRepo(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDiscoverReposIncludeExcludeFilter is the include/exclude table test:
+// four repos whose basenames exercise the glob forms named in the brief
+// (archive-*, ?tmp, [ab]x) plus one plain name, filtered every which way —
+// empty/empty, include-only, exclude-only, and an overlapping include+
+// exclude where exclude must win.
+func TestDiscoverReposIncludeExcludeFilter(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"archive-2023", "atmp", "ax", "keep-me"} {
+		fakeRepo(t, filepath.Join(root, name))
+	}
+
+	tests := []struct {
+		name    string
+		include []string
+		exclude []string
+		want    []string
+	}{
+		{
+			name: "empty include and empty exclude admit everything",
+			want: []string{"archive-2023", "atmp", "ax", "keep-me"},
+		},
+		{
+			name:    "include-only keeps only what matches",
+			include: []string{"keep-me"},
+			want:    []string{"keep-me"},
+		},
+		{
+			name:    "exclude-only drops matches, keeps the rest",
+			exclude: []string{"archive-*", "?tmp", "[ab]x"},
+			want:    []string{"keep-me"},
+		},
+		{
+			name:    "exclude wins over an overlapping include",
+			include: []string{"archive-*", "keep-me"},
+			exclude: []string{"archive-*"},
+			want:    []string{"keep-me"},
+		},
+		{
+			name:    "include with no matches admits nothing",
+			include: []string{"nonexistent-*"},
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repos, err := DiscoverRepos([]string{root}, 4, tt.include, tt.exclude)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, r := range repos {
+				got = append(got, r.Name)
+			}
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("repos = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

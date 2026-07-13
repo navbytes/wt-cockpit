@@ -123,6 +123,14 @@ func main() {
 	// itself depends on (log-format/log-level) are resolved.
 	slog.SetDefault(newLogger(*logFormat, *logLevel, os.Stderr))
 
+	// A repo discovery filter is easy to forget having set; logging it
+	// loudly at startup (on top of it showing in `wt status`) is what turns
+	// "why isn't repo X showing up" from a silent mystery into a one-line
+	// answer in the daemon's own log.
+	if len(cfg.IncludeRepos) > 0 || len(cfg.ExcludeRepos) > 0 {
+		slog.Info("repo discovery filter active", "include_repos", cfg.IncludeRepos, "exclude_repos", cfg.ExcludeRepos)
+	}
+
 	// -web is loopback-only, full stop: remote access to a listener that
 	// renders agent-authored bytes into a browser is a v0.7 problem (auth),
 	// not this phase's. Validated as soon as the logger exists so the
@@ -168,6 +176,8 @@ func main() {
 	be := gitbackend.NewCLI()
 	eng := engine.New(engine.Config{
 		Roots:          roots,
+		IncludeRepos:   cfg.IncludeRepos,
+		ExcludeRepos:   cfg.ExcludeRepos,
 		DefaultBase:    *base,
 		BaseFor:        baseFor(cfg),
 		ActivityWindow: 30 * time.Second,
@@ -181,7 +191,7 @@ func main() {
 	var wch watcher.Watcher
 	switch *watchMode {
 	case "fsnotify":
-		wch = &watcher.FSWatcher{Roots: roots, Interval: *interval, Backend: be}
+		wch = &watcher.FSWatcher{Roots: roots, IncludeRepos: cfg.IncludeRepos, ExcludeRepos: cfg.ExcludeRepos, Interval: *interval, Backend: be}
 	case "poll":
 		wch = &watcher.Poller{Interval: *interval}
 	default:
@@ -238,14 +248,16 @@ func main() {
 	}
 
 	srv := &server{
-		eng:         eng,
-		socketPath:  *socket,
-		watcherMode: *watchMode,
-		roots:       roots,
-		statePath:   *statePath,
-		startedAt:   time.Now(),
-		webAddr:     resolvedWebAddr,
-		notifier:    notifier,
+		eng:          eng,
+		socketPath:   *socket,
+		watcherMode:  *watchMode,
+		roots:        roots,
+		includeRepos: cfg.IncludeRepos,
+		excludeRepos: cfg.ExcludeRepos,
+		statePath:    *statePath,
+		startedAt:    time.Now(),
+		webAddr:      resolvedWebAddr,
+		notifier:     notifier,
 	}
 	handler := srv.routes()
 
@@ -518,10 +530,15 @@ type server struct {
 	socketPath  string
 	watcherMode string
 	roots       []string
-	statePath   string
-	startedAt   time.Time
-	webAddr     string // "" when -web is off; else the actual bound address (correct under port 0)
-	notifier    *notify.Notifier
+	// includeRepos/excludeRepos mirror config.Config's own fields (repo
+	// discovery filter) — purely for /api/status to report; the engine/
+	// watcher were already handed these directly at construction (see main).
+	includeRepos []string
+	excludeRepos []string
+	statePath    string
+	startedAt    time.Time
+	webAddr      string // "" when -web is off; else the actual bound address (correct under port 0)
+	notifier     *notify.Notifier
 }
 
 func (s *server) routes() http.Handler {
@@ -578,12 +595,18 @@ type rulePacksPayload struct {
 // straight off the existing registry snapshot (s.eng.List()) — cheap, and no
 // new engine/registry accessor needed for it.
 type statusPayload struct {
-	Version       string           `json:"version"`
-	Protocol      int              `json:"protocol"`
-	UptimeSeconds float64          `json:"uptimeSeconds"`
-	SocketPath    string           `json:"socketPath"`
-	WatcherMode   string           `json:"watcherMode"`
-	Roots         []string         `json:"roots"`
+	Version       string   `json:"version"`
+	Protocol      int      `json:"protocol"`
+	Pid           int      `json:"pid"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	SocketPath    string   `json:"socketPath"`
+	WatcherMode   string   `json:"watcherMode"`
+	Roots         []string `json:"roots"`
+	// IncludeRepos/ExcludeRepos are additive (repo discovery filter):
+	// omitted from the JSON entirely when unset, so an unfiltered daemon's
+	// /api/status looks exactly as it did before this field existed.
+	IncludeRepos  []string         `json:"includeRepos,omitempty"`
+	ExcludeRepos  []string         `json:"excludeRepos,omitempty"`
 	StatePath     string           `json:"statePath"`
 	WebAddr       string           `json:"webAddr"` // "" when -web is off; see wt open (P4-design.md §1.6)
 	RepoCount     int              `json:"repoCount"`
@@ -621,10 +644,13 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, statusPayload{
 		Version:          version,
 		Protocol:         model.ProtocolVersion,
+		Pid:              os.Getpid(),
 		UptimeSeconds:    time.Since(s.startedAt).Seconds(),
 		SocketPath:       s.socketPath,
 		WatcherMode:      s.watcherMode,
 		Roots:            s.roots,
+		IncludeRepos:     s.includeRepos,
+		ExcludeRepos:     s.excludeRepos,
 		StatePath:        s.statePath,
 		WebAddr:          s.webAddr,
 		RepoCount:        len(repos),

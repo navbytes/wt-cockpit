@@ -193,3 +193,29 @@ func TestWtdExitsOneOnInvalidLogLevelFromConfigFile(t *testing.T) {
 		t.Errorf("stderr = %q, want it to name the offending config value %q", stderr, "bogus")
 	}
 }
+
+// TestWtdExitsOneOnBadExcludeReposGlobFromConfigFile is the repo-discovery-
+// filter sibling of the config-file validation tests above: an
+// exclude_repos entry that filepath.Match itself rejects (ErrBadPattern)
+// must fail config.Load and exit 1, naming the offending pattern — fail-
+// closed, same as every other hand-edited-config typo.
+func TestWtdExitsOneOnBadExcludeReposGlobFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(`exclude_repos = ["["]`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err, stderr := runWtd(t,
+		"-config", cfgPath,
+		"-root", dir,
+		"-socket", filepath.Join(dir, "wtd.sock"),
+		"-state", filepath.Join(dir, "state.json"),
+	)
+	wantExitCode1(t, err, stderr)
+	if !strings.Contains(stderr, "exclude_repos") {
+		t.Errorf("stderr = %q, want it to mention exclude_repos", stderr)
+	}
+	if !strings.Contains(stderr, "[") {
+		t.Errorf("stderr = %q, want it to name the offending pattern", stderr)
+	}
+}

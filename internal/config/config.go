@@ -65,18 +65,27 @@ func (n NotificationsConfig) CooldownOr() time.Duration {
 // Config is the on-disk shape of config.toml. The zero value (returned when
 // the file doesn't exist) means "nothing configured" — every field left unset.
 type Config struct {
-	Roots     []string              `toml:"roots"`
-	Base      string                `toml:"base"`
-	Socket    string                `toml:"socket"`
-	TCP       string                `toml:"tcp"`
-	Web       string                `toml:"web"`
-	State     string                `toml:"state"`
-	Interval  time.Duration         `toml:"interval"`
-	Watch     string                `toml:"watch"`
-	LogFormat string                `toml:"log_format"`
-	LogLevel  string                `toml:"log_level"`
-	Repos     map[string]RepoConfig `toml:"repos"`
-	Rules     []guardrail.Rule      `toml:"rules"`
+	Roots []string `toml:"roots"`
+	// IncludeRepos/ExcludeRepos filter which discovered repos the daemon
+	// actually watches, matched against the repo folder's BASENAME (what
+	// shows as the repo name everywhere in the UI) using stdlib
+	// path/filepath.Match glob syntax only (internal/discovery.DiscoverRepos
+	// applies the actual include/exclude semantics). See Load's validation
+	// below for why a bad pattern is a load-time error rather than a
+	// silent no-op.
+	IncludeRepos []string              `toml:"include_repos"`
+	ExcludeRepos []string              `toml:"exclude_repos"`
+	Base         string                `toml:"base"`
+	Socket       string                `toml:"socket"`
+	TCP          string                `toml:"tcp"`
+	Web          string                `toml:"web"`
+	State        string                `toml:"state"`
+	Interval     time.Duration         `toml:"interval"`
+	Watch        string                `toml:"watch"`
+	LogFormat    string                `toml:"log_format"`
+	LogLevel     string                `toml:"log_level"`
+	Repos        map[string]RepoConfig `toml:"repos"`
+	Rules        []guardrail.Rule      `toml:"rules"`
 
 	// RulesSet is true iff [[rules]] appeared in the file at all (even empty).
 	// An absent [[rules]] means "use guardrail.DefaultRules()"; a present one —
@@ -144,5 +153,27 @@ func Load(path string) (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("%s: invalid notifications.severity %q (want \"danger\" or \"warn\")", path, cfg.Notifications.Severity)
 	}
+	if err := validateRepoGlobs(path, "include_repos", cfg.IncludeRepos); err != nil {
+		return Config{}, err
+	}
+	if err := validateRepoGlobs(path, "exclude_repos", cfg.ExcludeRepos); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// validateRepoGlobs probes every pattern in patterns with filepath.Match
+// against an arbitrary test name ("x") — fail-closed, same as the rest of
+// Load's validation: a pattern only path/filepath.Match itself would reject
+// at match time (filepath.ErrBadPattern, e.g. an unterminated "[" character
+// class) must not silently become a no-op filter later at scan time. The
+// test name's own content never matters; only whether Match returns an error
+// at all.
+func validateRepoGlobs(path, field string, patterns []string) error {
+	for _, pat := range patterns {
+		if _, err := filepath.Match(pat, "x"); err != nil {
+			return fmt.Errorf("%s: invalid %s pattern %q: %w", path, field, pat, err)
+		}
+	}
+	return nil
 }

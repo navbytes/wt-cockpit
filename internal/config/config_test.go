@@ -418,3 +418,80 @@ func TestCooldownOrLeavesPositiveValuesUntouched(t *testing.T) {
 		t.Errorf("CooldownOr() = %v, want 90s unchanged", got)
 	}
 }
+
+// ---- include_repos / exclude_repos (repo discovery filter) ----
+
+// TestLoadParsesIncludeAndExcludeRepos pins the plain happy path: both keys
+// decode into their own string slices, independent of each other and of
+// Roots.
+func TestLoadParsesIncludeAndExcludeRepos(t *testing.T) {
+	path := writeTOML(t, `
+roots = ["/home/nav/code"]
+include_repos = ["api-*", "web-*"]
+exclude_repos = ["*-archive", "?tmp"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInclude := []string{"api-*", "web-*"}
+	if !reflect.DeepEqual(cfg.IncludeRepos, wantInclude) {
+		t.Errorf("IncludeRepos = %v, want %v", cfg.IncludeRepos, wantInclude)
+	}
+	wantExclude := []string{"*-archive", "?tmp"}
+	if !reflect.DeepEqual(cfg.ExcludeRepos, wantExclude) {
+		t.Errorf("ExcludeRepos = %v, want %v", cfg.ExcludeRepos, wantExclude)
+	}
+}
+
+// TestLoadAbsentIncludeExcludeReposAreNilNotError: neither key is required —
+// a config with no discovery filter at all must load cleanly with both
+// slices nil (RepoPasses's "include empty -> everything passes" default).
+func TestLoadAbsentIncludeExcludeReposAreNilNotError(t *testing.T) {
+	path := writeTOML(t, `base = "main"`+"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IncludeRepos != nil || cfg.ExcludeRepos != nil {
+		t.Errorf("IncludeRepos/ExcludeRepos = %v/%v, want both nil when absent", cfg.IncludeRepos, cfg.ExcludeRepos)
+	}
+}
+
+// TestLoadBadIncludeRepoGlobErrorsAndNamesPattern: an include_repos entry
+// that filepath.Match itself rejects (ErrBadPattern) must fail config load
+// fail-closed, same as every other hand-edited-config typo — and the error
+// must name the offending pattern so the operator can find it.
+func TestLoadBadIncludeRepoGlobErrorsAndNamesPattern(t *testing.T) {
+	path := writeTOML(t, `include_repos = ["["]`+"\n") // unterminated char class
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an invalid include_repos glob")
+	}
+	if got := err.Error(); !strings.Contains(got, "[") {
+		t.Errorf("error should name the offending pattern, got: %v", got)
+	}
+}
+
+// TestLoadBadExcludeRepoGlobErrorsAndNamesPattern is the exclude_repos
+// sibling of the above.
+func TestLoadBadExcludeRepoGlobErrorsAndNamesPattern(t *testing.T) {
+	path := writeTOML(t, `exclude_repos = ["archive-*", "["]`+"\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an invalid exclude_repos glob")
+	}
+	if got := err.Error(); !strings.Contains(got, "[") {
+		t.Errorf("error should name the offending pattern, got: %v", got)
+	}
+}
+
+// TestLoadValidGlobFormsAllParseCleanly exercises the glob forms the
+// discovery-side table test also covers (archive-*, ?tmp, [ab]x) end to end
+// through Load's validation probe — none of them should trip ErrBadPattern.
+func TestLoadValidGlobFormsAllParseCleanly(t *testing.T) {
+	path := writeTOML(t, `exclude_repos = ["archive-*", "?tmp", "[ab]x"]`+"\n")
+	if _, err := Load(path); err != nil {
+		t.Errorf("valid glob forms should load cleanly, got: %v", err)
+	}
+}
