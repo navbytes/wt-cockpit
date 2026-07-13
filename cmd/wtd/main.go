@@ -60,7 +60,7 @@ func main() {
 	socket := flag.String("socket", filepath.Join(dataDir, "wtd.sock"), "unix socket path")
 	tcp := flag.String("tcp", "", "optional TCP address to also listen on (e.g. 127.0.0.1:7799)")
 	webAddr := flag.String("web", "", "optional loopback web UI address (e.g. 127.0.0.1:7788); refuses non-loopback binds (remote access is v0.7)")
-	statePath := flag.String("state", filepath.Join(dataDir, "state.json"), "review state file")
+	statePath := flag.String("state", filepath.Join(dataDir, "state.db"), "review state file (.db → SQLite, default; .json → legacy JSON store)")
 	base := flag.String("base", "", "diff baseline branch (default: each repo's own default)")
 	interval := flag.Duration("interval", 2*time.Second, "poll interval (also governs the fsnotify reconciliation tick)")
 	watchMode := flag.String("watch", "fsnotify", "watcher backend: fsnotify (default) or poll")
@@ -144,11 +144,12 @@ func main() {
 	}
 	_ = os.MkdirAll(dataDir, 0o755)
 
-	st, err := store.OpenJSON(*statePath)
+	st, err := store.Open(*statePath)
 	if err != nil {
 		slog.Error("open state failed", "path", *statePath, "error", err)
 		os.Exit(1)
 	}
+	slog.Info("state store", "backend", backendName(*statePath), "path", *statePath)
 	reg := registry.New()
 	// globalSource distinguishes DefaultRules() from a user's own config
 	// [[rules]] for /api/rules and `wt rules`'s provenance column
@@ -305,7 +306,24 @@ func main() {
 	if webSrv != nil {
 		_ = webSrv.Shutdown(shutCtx)
 	}
+	// Store isn't part of the Store interface (sqlite.go's sqliteStore.Close
+	// deliberately keeps it off — jsonStore has no handle to release); this
+	// type-asserts for it so a SQLite-backed daemon checkpoints its WAL on a
+	// clean shutdown, while a JSON-backed one (no Close method) is a no-op.
+	if closer, ok := st.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 	slog.Info("wtd stopped")
+}
+
+// backendName reports which Store backend -state's extension selects
+// (store.Open's own dispatch rule, P6-design.md §7) — purely for the
+// startup log line naming what's actually running.
+func backendName(path string) string {
+	if filepath.Ext(path) == ".json" {
+		return "json"
+	}
+	return "sqlite"
 }
 
 // printVersion writes the build-time version string to w. Pulled out of the

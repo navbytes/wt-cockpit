@@ -28,7 +28,11 @@ tcp = ""                 # e.g. "127.0.0.1:7799" to also listen on TCP
 web = ""                 # e.g. "127.0.0.1:7788" for the opt-in web reading room;
                          # must be loopback (127.0.0.0/8, ::1, or "localhost") —
                          # anything else refuses to start (remote access is v0.7)
-state = "/Users/nav/.wtcockpit/state.json"
+# Default is a SQLite-backed "*.db": the first time it's created, a legacy
+# state.json sitting alongside it is imported once (review marks + comments)
+# and renamed to state.json.imported. Point this at a "*.json" path instead
+# to keep running the pre-v0.6 JSON store, unchanged.
+state = "/Users/nav/.wtcockpit/state.db"
 interval = "2s"          # poll interval / fsnotify reconciliation tick
 watch = "fsnotify"       # "fsnotify" (default) or "poll"
 

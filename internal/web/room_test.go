@@ -64,7 +64,7 @@ func buildRepoEngineWithRules(t *testing.T, rules []guardrail.Rule, populate fun
 	}
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestRoomHandlerApproveGateReflectsDirtyWorktreeState(t *testing.T) {
 	}
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +670,7 @@ func BenchmarkRoomRender5kLines(b *testing.B) {
 	}
 
 	reg := registry.New()
-	st, err := store.OpenJSON(filepath.Join(b.TempDir(), "state.json"))
+	st, err := store.Open(filepath.Join(b.TempDir(), "state.db"))
 	if err != nil {
 		b.Fatal(err)
 	}
