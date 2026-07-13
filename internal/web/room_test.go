@@ -371,7 +371,7 @@ func assertNoLiveInjection(t *testing.T, body string) {
 // requirement, checked at the artifact it actually governs.
 func TestTemplatesHaveNoInlineEventHandlerAttributes(t *testing.T) {
 	inlineAttr := regexp.MustCompile(`\son[a-z]+\s*=\s*"`)
-	for _, name := range []string{"templates/layout.tmpl", "templates/index.tmpl", "templates/room.tmpl"} {
+	for _, name := range []string{"templates/layout.tmpl", "templates/index.tmpl", "templates/room.tmpl", "templates/fragments.tmpl"} {
 		src, err := templateFS.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)

@@ -11,7 +11,7 @@
   <p><a href="/">&larr; back to worktrees</a></p>
 </div>
 {{else}}
-<div class="pane-h">
+<div class="pane-h" data-id="{{.ID}}" data-diff-hash="{{.DiffHash}}">
   <span class="title">{{.Repo}} / {{.Name}}</span>
   <span class="base">reviewing working tree vs <code>{{.Base}}</code></span>
   <span class="sum">{{.TotalFiles}} files · <span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span> · <span class="chip {{.Agent}}">{{.Agent}}</span></span>
@@ -19,6 +19,7 @@
 {{if .GuardrailMsg}}
 <div class="alert"><span>&#9888;</span><div><b>Guardrail:</b> {{.GuardrailMsg}}{{if .GuardrailMore}} <span class="more">(+{{.GuardrailMore}} more)</span>{{end}}</div></div>
 {{end}}
+<div id="proto-banner" class="banner hidden" role="alert">wtd was upgraded — reload</div>
 <div id="banner" class="banner hidden" role="alert"></div>
 {{if .Empty}}
 <div class="card empty-diff"><p class="empty">no changes vs <code>{{.Base}}</code></p></div>
@@ -26,30 +27,32 @@
 <div class="review-wrap" data-id="{{.ID}}" data-diff-hash="{{.DiffHash}}">
   <div class="review-main">
     <div class="diff" id="diff">
-      {{range .Files}}
-      <div class="file" id="file-{{.Idx}}">
-        <div class="file-h {{if .Danger}}flag{{end}}">
-          <span class="fname"><span class="path">{{.Dir}}</span>{{.FileName}}</span>
-          {{if .Danger}}<span class="tag danger">danger</span>{{else if ne (print .Status) "modified"}}<span class="tag">{{.Status}}</span>{{end}}
-          <span class="fnums"><span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span></span>
-          <label class="rev-check"><input type="checkbox" class="rev-toggle card-toggle" data-file="{{.Path}}" data-file-hash="{{.Hash}}" {{if .Reviewed}}checked{{end}}> reviewed</label>
+      {{range $fc := .Files}}
+      <div class="file" id="file-{{$fc.Idx}}">
+        <div class="file-h {{if $fc.Danger}}flag{{end}}">
+          <span class="fname"><span class="path">{{$fc.Dir}}</span>{{$fc.FileName}}</span>
+          {{if $fc.Danger}}<span class="tag danger">danger</span>{{else if ne (print $fc.Status) "modified"}}<span class="tag">{{$fc.Status}}</span>{{end}}
+          <span class="fnums"><span class="add">+{{$fc.Stats.Add}}</span> <span class="del">&minus;{{$fc.Stats.Del}}</span></span>
+          <label class="rev-check"><input type="checkbox" class="rev-toggle card-toggle" data-file="{{$fc.Path}}" data-file-hash="{{$fc.Hash}}" {{if $fc.Reviewed}}checked{{end}}> reviewed</label>
+          <button type="button" class="btn ghost c-add" data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="0" data-side="new" title="comment on this file">&#9998; comment</button>
         </div>
-        {{if .Binary}}
+        {{template "fileCommentsStrip" $fc}}
+        {{if $fc.Binary}}
         <p class="note">binary file</p>
-        {{else if .Collapsed}}
-        <p class="note">{{.CollapseNote}} — <a href="?expand={{.Path}}">expand</a></p>
+        {{else if $fc.Collapsed}}
+        <p class="note">{{$fc.CollapseNote}} — <a href="?expand={{$fc.Path}}">expand</a></p>
         {{else}}
-          {{if .HighlightOff}}<p class="note">highlighting off (large file)</p>{{end}}
-          {{range .Hunks}}
+          {{if $fc.HighlightOff}}<p class="note">highlighting off (large file)</p>{{end}}
+          {{range $fc.Hunks}}
           <div class="hunk-h">{{.Header}}</div>
           <div class="sxs">
             <div class="side">
               <div class="side-lab">before · {{$.Base}}</div>
-              {{range .Rows}}<div class="srow {{.Left.Kind}}"><span class="ln">{{if .Left.Num}}{{.Left.Num}}{{end}}</span><span class="code chroma">{{.Left.HTML}}</span></div>{{end}}
+              {{range .Rows}}<div class="srow {{.Left.Kind}}"><span class="ln"{{if .Left.Num}} data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Left.Num}}" data-side="old"{{end}}>{{if .Left.Num}}{{.Left.Num}}{{end}}</span><span class="code chroma">{{.Left.HTML}}</span></div>{{end}}
             </div>
             <div class="side">
               <div class="side-lab">after · working tree</div>
-              {{range .Rows}}<div class="srow {{.Right.Kind}}"><span class="ln">{{if .Right.Num}}{{.Right.Num}}{{end}}</span><span class="code chroma">{{.Right.HTML}}</span></div>{{end}}
+              {{range .Rows}}<div class="srow {{.Right.Kind}}"><span class="ln"{{if .Right.Num}} data-file="{{$fc.Path}}" data-file-idx="{{$fc.Idx}}" data-line="{{.Right.Num}}" data-side="new"{{end}}>{{if .Right.Num}}{{.Right.Num}}{{end}}</span><span class="code chroma">{{.Right.HTML}}</span></div>{{end}}
             </div>
           </div>
           {{end}}
@@ -58,30 +61,17 @@
       {{end}}
     </div>
   </div>
-  <div class="rail">
-    <h4>Files in this worktree</h4>
-    <div class="flist">
-      {{range .Files}}
-      <div class="fitem {{if .Reviewed}}done{{end}}">
-        <input type="checkbox" class="rev-toggle rail-toggle" data-file="{{.Path}}" data-file-hash="{{.Hash}}" {{if .Reviewed}}checked{{end}}>
-        <a class="fn" href="#file-{{.Idx}}" title="{{.DisplayPath}}">{{.DisplayPath}}</a>
-        <span class="n"><span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span></span>
-      </div>
-      {{end}}
-    </div>
-    <div class="foot">
-      <div class="prog-lab"><span>Reviewed</span><span id="prog-txt">{{.ReviewedCount}} / {{.TotalFiles}}</span></div>
-      <div class="progress"><i id="prog-bar" style="width:{{.ProgressPct}}%"></i></div>
-      <button class="btn merge" id="approve-btn" data-id="{{.ID}}" data-base="{{.Base}}" {{if not .AllReviewed}}disabled{{end}}>{{if .AllReviewed}}&#10003; Approve &amp; merge to {{.Base}}{{else}}&#10003; Approve &amp; merge ({{.LeftCount}} left){{end}}</button>
-      <div id="approve-error" class="approve-error hidden" role="alert"></div>
-    </div>
+  <div class="rail" id="rail">
+    {{template "rail" .}}
   </div>
 </div>
 {{end}}
+{{template "orphanedComments" .OrphanedComments}}
 <div id="terminal" class="card hidden">
   <h2>merged</h2>
   <p>merged into <code id="terminal-base"></code>, worktree removed.</p>
   <p><a href="/">&larr; back to worktrees</a></p>
 </div>
+{{template "composerTemplate"}}
 {{end}}
 {{end}}

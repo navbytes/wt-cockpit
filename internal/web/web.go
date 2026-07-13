@@ -19,7 +19,7 @@ import (
 //go:embed static
 var staticFS embed.FS
 
-//go:embed templates/layout.tmpl templates/index.tmpl templates/room.tmpl
+//go:embed templates/layout.tmpl templates/index.tmpl templates/room.tmpl templates/fragments.tmpl
 var templateFS embed.FS
 
 // Config carries what New needs beyond the engine and the shared API
@@ -56,6 +56,8 @@ func New(eng *engine.Engine, api http.Handler, cfg Config) http.Handler {
 	mux.HandleFunc("GET /{$}", a.handleIndex)
 	mux.HandleFunc("GET /wt/{id}", a.handleRoom)
 	mux.HandleFunc("GET /fragment/worktrees", a.handleFragmentWorktrees)
+	mux.HandleFunc("GET /fragment/rail", a.handleFragmentRail)
+	mux.HandleFunc("GET /fragment/comments", a.handleFragmentComments)
 	mux.HandleFunc("GET /static/chroma.css", handleChromaCSS) // more specific than /static/, wins regardless of registration order
 	mux.Handle("GET /static/", http.FileServerFS(staticFS))
 	mux.Handle("/api/", api) // same handler value the socket/-tcp serve; no route changes
@@ -74,8 +76,14 @@ func parseTemplates() map[string]*template.Template {
 	index := template.Must(layout.Clone())
 	index = template.Must(index.ParseFS(templateFS, "templates/index.tmpl"))
 
+	// room additionally parses fragments.tmpl: room.tmpl's per-file loop calls
+	// {{template "fileCommentsStrip"}}/"composerTemplate" defined there, and
+	// the comments/rail fragment handlers execute named blocks ("rail",
+	// "commentBlocks") out of this same parsed template — one definition of
+	// each block, so the full page and its live-refresh fragments can never
+	// render it differently.
 	room := template.Must(layout.Clone())
-	room = template.Must(room.ParseFS(templateFS, "templates/room.tmpl"))
+	room = template.Must(room.ParseFS(templateFS, "templates/room.tmpl", "templates/fragments.tmpl"))
 
 	return map[string]*template.Template{"index": index, "room": room}
 }

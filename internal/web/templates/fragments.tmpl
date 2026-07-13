@@ -1,0 +1,96 @@
+{{/* fragments.tmpl holds every template block shared between the full room
+     page (room.tmpl) and its live-refresh fragment endpoints (fragments.go):
+     "rail" backs GET /fragment/rail, "commentBlocks" backs GET
+     /fragment/comments, and "fileCommentsStrip"/"commentCard"/
+     "orphanedComments" are the comment-rendering blocks both room.tmpl and
+     "commentBlocks" call. One definition of each, so the initial page and a
+     later fragment swap can never render the same data differently
+     (P4-design.md §3). Comment bodies go through the ordinary {{ "{{.Body}}" }}
+     text-context escaping html/template already applies to every other
+     dynamic value on this page — the same mechanism, not a special case. */}}
+
+{{define "rail"}}
+<h4>Files in this worktree</h4>
+<div class="flist">
+  {{range .Files}}
+  <div class="fitem {{if .Reviewed}}done{{end}}">
+    <input type="checkbox" class="rev-toggle rail-toggle" data-file="{{.Path}}" data-file-hash="{{.Hash}}" {{if .Reviewed}}checked{{end}}>
+    <a class="fn" href="#file-{{.Idx}}" title="{{.DisplayPath}}">{{.DisplayPath}}</a>
+    <span class="n"><span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span></span>
+  </div>
+  {{end}}
+</div>
+<div class="foot">
+  <div class="prog-lab"><span>Reviewed</span><span id="prog-txt">{{.ReviewedCount}} / {{.TotalFiles}}</span></div>
+  <div class="progress"><i id="prog-bar" style="width:{{.ProgressPct}}%"></i></div>
+  <button class="btn merge" id="approve-btn" data-id="{{.ID}}" data-base="{{.Base}}" {{if not .AllReviewed}}disabled{{end}}>{{if .AllReviewed}}&#10003; Approve &amp; merge to {{.Base}}{{else}}&#10003; Approve &amp; merge ({{.LeftCount}} left){{end}}</button>
+  <div id="approve-error" class="approve-error hidden" role="alert"></div>
+</div>
+{{end}}
+
+{{define "commentCard"}}
+<div class="ccard{{if eq .State "resolved"}} resolved{{end}}" data-comment-id="{{.ID}}">
+  <div class="ccard-h">
+    <span class="cauthor">{{.Author}}</span>
+    <span class="cage">{{reltime .At}}</span>
+    {{if eq .State "resolved"}}<span class="cbadge resolved">resolved</span>{{end}}
+    {{if .Stale}}<span class="cbadge stale" title="the file changed since this comment was made — re-read before trusting the line number">stale</span>{{end}}
+    {{if .Orphaned}}<span class="cbadge orphaned" title="this file is no longer in the diff">orphaned</span>{{end}}
+  </div>
+  <div class="cbody">{{.Body}}</div>
+  <div class="cactions">
+    {{if eq .State "open"}}<button type="button" class="btn ghost c-resolve" data-comment-id="{{.ID}}">resolve</button>{{end}}
+    <button type="button" class="btn ghost danger c-delete" data-comment-id="{{.ID}}">delete</button>
+  </div>
+</div>
+{{end}}
+
+{{/* No literal whitespace between the outer div and the range/end actions:
+     with zero CommentGroups this must render a genuinely childless
+     <div>...</div> (style.css keys ":not(:empty)" off exactly that) rather
+     than one holding a stray whitespace text node, which — being a real
+     child — would defeat that selector for every uncommented file. */}}
+{{define "fileCommentsStrip"}}
+<div class="comments" id="comments-{{.Idx}}" data-file-idx="{{.Idx}}">{{range .CommentGroups}}
+  <div class="cgroup" data-anchor="{{.Anchor}}">
+    <div class="cgroup-lab">{{.Label}}</div>
+    {{range .Comments}}{{template "commentCard" .}}{{end}}
+  </div>
+  {{end}}</div>
+{{end}}
+
+{{define "orphanedComments"}}
+<div class="card orphaned-comments" id="orphaned-comments">
+  <h3>comments on files no longer in this diff</h3>
+  {{if not .}}<p class="empty">none</p>{{end}}
+  {{range .}}
+  <div class="cgroup">
+    <div class="cgroup-lab">{{.File}} · {{if eq .Line 0}}file-level{{else}}line {{.Line}} ({{.Side}}){{end}}</div>
+    {{template "commentCard" .}}
+  </div>
+  {{end}}
+</div>
+{{end}}
+
+{{define "commentBlocks"}}
+{{range .Files}}{{template "fileCommentsStrip" .}}{{end}}
+{{template "orphanedComments" .Orphaned}}
+{{end}}
+
+{{/* composerTemplate is static, trusted markup shipped once per page load —
+     app.js clones it (P4-design.md §1.2 boundary rule (d)) rather than the
+     room rendering one near-identical <form> per file; nothing inside it is
+     ever templated from request data. */}}
+{{define "composerTemplate"}}
+<template id="tpl-comment-composer">
+  <form class="composer">
+    <div class="composer-h">
+      <span class="composer-lab"></span>
+      <button type="button" class="composer-cancel" aria-label="cancel">&times;</button>
+    </div>
+    <textarea class="composer-body" rows="3" placeholder="leave a note for whoever reads this next…" required></textarea>
+    <div class="composer-actions"><button type="submit" class="btn ghost">comment</button></div>
+    <div class="composer-error hidden" role="alert"></div>
+  </form>
+</template>
+{{end}}
