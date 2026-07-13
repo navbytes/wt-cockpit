@@ -37,3 +37,47 @@ jobs:
         run: |
           go build -o bin/wtd ./cmd/wtd
           go build -o bin/wt ./cmd/wt
+
+  # bench is a separate job (not a step in `test`) so a bench hiccup or
+  # shared-runner variance can never fail the core matrix above: it's marked
+  # continue-on-error so its own conclusion never turns the workflow run red
+  # either (P6-design.md §6.3). Linux only, no -race (the race detector's
+  # overhead alone blows through even the 10x smoke-gate margin below — by
+  # design, gates never run under it). Runs the benchmark suite as trend/
+  # profiling artifacts (layer 1), then — only here, behind WT_BENCH_GATE —
+  # the 10x-budget smoke gates (layer 2); a plain `go test ./...` in the
+  # `test` job above never executes them.
+  bench:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      WT_BENCH_GATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: benchmarks + pprof profiles (store, engine, wtd radar)
+        run: |
+          mkdir -p bench-artifacts
+          go test -run '^$' -bench=. -benchmem -count=6 \
+            -cpuprofile=bench-artifacts/store.cpu.prof -memprofile=bench-artifacts/store.mem.prof \
+            ./internal/store/... | tee bench-artifacts/store-bench.txt
+          go test -run '^$' -bench=. -benchmem -count=6 \
+            -cpuprofile=bench-artifacts/engine.cpu.prof -memprofile=bench-artifacts/engine.mem.prof \
+            ./internal/engine/... | tee bench-artifacts/engine-bench.txt
+          go test -run '^$' -bench=. -benchmem -count=6 \
+            ./cmd/wtd/... | tee bench-artifacts/wtd-bench.txt
+
+      - name: budget smoke gates (10x budget)
+        run: |
+          go test -run 'TestBudget|TestMemoryFootprint' -v \
+            ./internal/store/... ./internal/engine/... ./cmd/wtd/... | tee bench-artifacts/budget-gates.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench-artifacts/

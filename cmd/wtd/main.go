@@ -592,6 +592,12 @@ type statusPayload struct {
 	TotalFiles    int              `json:"totalFiles"`
 	RulePacks     rulePacksPayload `json:"rulePacks"`
 	Notifier      string           `json:"notifier"` // "osascript" | "notify-send" | "disabled (config)" | "unavailable (no notifier binary)"
+	// LastRefreshMs/LastRefreshOneMs are additive (P6-design.md §6.3 layer 3,
+	// the v0.2 roadmap's "scan timings" IOU): the most recently completed
+	// full Refresh / targeted RefreshOne wall-clock duration, in
+	// milliseconds. 0 before either has completed once.
+	LastRefreshMs    float64 `json:"lastRefreshMs"`
+	LastRefreshOneMs float64 `json:"lastRefreshOneMs"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -611,22 +617,34 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.notifier != nil {
 		notifierStatus = s.notifier.Status()
 	}
+	full, one := s.eng.LastRefreshDurations()
 	writeJSON(w, statusPayload{
-		Version:       version,
-		Protocol:      model.ProtocolVersion,
-		UptimeSeconds: time.Since(s.startedAt).Seconds(),
-		SocketPath:    s.socketPath,
-		WatcherMode:   s.watcherMode,
-		Roots:         s.roots,
-		StatePath:     s.statePath,
-		WebAddr:       s.webAddr,
-		RepoCount:     len(repos),
-		WorktreeCount: len(wts),
-		ReviewedFiles: reviewed,
-		TotalFiles:    total,
-		RulePacks:     rulePacksPayload{Loaded: loaded, Errors: errs},
-		Notifier:      notifierStatus,
+		Version:          version,
+		Protocol:         model.ProtocolVersion,
+		UptimeSeconds:    time.Since(s.startedAt).Seconds(),
+		SocketPath:       s.socketPath,
+		WatcherMode:      s.watcherMode,
+		Roots:            s.roots,
+		StatePath:        s.statePath,
+		WebAddr:          s.webAddr,
+		RepoCount:        len(repos),
+		WorktreeCount:    len(wts),
+		ReviewedFiles:    reviewed,
+		TotalFiles:       total,
+		RulePacks:        rulePacksPayload{Loaded: loaded, Errors: errs},
+		Notifier:         notifierStatus,
+		LastRefreshMs:    durationMs(full),
+		LastRefreshOneMs: durationMs(one),
 	})
+}
+
+// durationMs converts a time.Duration to fractional milliseconds — plain
+// d.Milliseconds() truncates to an int64, which would round every §6
+// microbenchmark-scale duration (sub-millisecond to low-millisecond) down to
+// 0 or a coarse integer; the perf counters this feeds are exactly the ones
+// that need that precision.
+func durationMs(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
 }
 
 func (s *server) handleWorktrees(w http.ResponseWriter, r *http.Request) {

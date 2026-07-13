@@ -410,6 +410,12 @@ type statusPayload struct {
 	TotalFiles    int              `json:"totalFiles"`
 	RulePacks     rulePacksPayload `json:"rulePacks"`
 	Notifier      string           `json:"notifier"` // additive (P5-design.md §1.5, §2): the desktop notifier's resolved state
+	// LastRefreshMs/LastRefreshOneMs are additive (P6-design.md §6.3 layer 3,
+	// the v0.2 roadmap's "scan timings" IOU): the daemon's most recently
+	// completed full Refresh / targeted RefreshOne wall-clock duration, in
+	// milliseconds. 0 before either has completed once.
+	LastRefreshMs    float64 `json:"lastRefreshMs"`
+	LastRefreshOneMs float64 `json:"lastRefreshOneMs"`
 }
 
 // rulePacksPayload mirrors statusPayload's additive `rulePacks` field
@@ -969,6 +975,20 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %sreviewed%s   %d/%d files\n", dim, reset, st.ReviewedFiles, st.TotalFiles)
 	fmt.Printf("  %srule packs%s %d loaded, %d errors\n", dim, reset, st.RulePacks.Loaded, st.RulePacks.Errors)
 	fmt.Printf("  %snotifier%s   %s\n", dim, reset, st.Notifier)
+	fmt.Printf("  %srefresh (full)%s %s\n", dim, reset, formatRefreshMs(st.LastRefreshMs))
+	fmt.Printf("  %srefresh (one)%s  %s\n", dim, reset, formatRefreshMs(st.LastRefreshOneMs))
+}
+
+// formatRefreshMs renders a statusPayload refresh-timing field (P6-design.md
+// §6.3 layer 3): 0 means the daemon hasn't completed that kind of refresh
+// yet (rather than a genuinely instantaneous one — indistinguishable from 0
+// in practice, and "none yet" is the far more common reason to see it),
+// otherwise one decimal place of milliseconds.
+func formatRefreshMs(ms float64) string {
+	if ms <= 0 {
+		return "n/a (none yet)"
+	}
+	return fmt.Sprintf("%.1fms", ms)
 }
 
 func truncate(s string, n int) string {
