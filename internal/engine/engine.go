@@ -253,6 +253,24 @@ func reviewedCount(files []model.DiffFile, reviewed map[string]string) int {
 // engine.ApproveResult references keep compiling unchanged.
 type ApproveResult = model.ApproveResult
 
+// ApproveMergeConflictError is Approve's error for a real merge conflict
+// (P7-ux.md P1-2): a bare git exit-status/conflict dump is not an actionable
+// message for the human at the "money moment" of a failed approve. Error()
+// is deliberately just the one clear sentence — CLI fatal() and the web
+// banner both print whatever Approve returns verbatim, so this is what they
+// show. Raw carries git's own conflict detail for cmd/wtd's AUDIT log only
+// (via errors.As); it must never be included in Error()'s own text.
+type ApproveMergeConflictError struct {
+	Branch, Base string
+	Raw          error
+}
+
+func (e *ApproveMergeConflictError) Error() string {
+	return fmt.Sprintf("cannot merge %s into %s: conflicts with the base branch — update your branch and re-review (base unchanged)", e.Branch, e.Base)
+}
+
+func (e *ApproveMergeConflictError) Unwrap() error { return e.Raw }
+
 // Approve is the single write path. It is deliberately gated: every file in the
 // worktree's diff must be marked reviewed, and the worktree must be clean (all work
 // committed — you cannot merge uncommitted or untracked changes). It then merges the
@@ -330,6 +348,9 @@ func (e *Engine) Approve(id string) (ApproveResult, error) {
 
 	// Merge (aborts internally on conflict, leaving base clean).
 	if err := e.be.Merge(basePath, m.branch); err != nil {
+		if errors.Is(err, gitbackend.ErrMergeConflict) {
+			return ApproveResult{}, &ApproveMergeConflictError{Branch: m.branch, Base: m.base, Raw: err}
+		}
 		return ApproveResult{}, fmt.Errorf("merge failed and was aborted (base unchanged): %w", err)
 	}
 

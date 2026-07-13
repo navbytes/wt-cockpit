@@ -651,6 +651,75 @@ func TestApproveRequiresCleanWorktree(t *testing.T) {
 	}
 }
 
+// TestApproveMergeConflictReturnsFriendlyMessageAndLeavesBaseClean is P7-
+// ux.md P1-2's TDD: a real merge conflict during Approve must not leak git's
+// raw "exit status 1"/conflict text to the caller — CLI fatal() and the web
+// banner both print whatever Approve returns verbatim. The base worktree's
+// existing safety property (left clean, merge aborted — gitbackend_test.go's
+// TestMergeAbortsOnConflict) must hold exactly as before; only the message
+// text changes.
+func TestApproveMergeConflictReturnsFriendlyMessageAndLeavesBaseClean(t *testing.T) {
+	root := buildWorkspace(t)
+	commitWorktree(t, root)
+
+	// Conflict main and feature on the SAME line of app.go (mirrors
+	// gitbackend_test.go's TestMergeAbortsOnConflict setup).
+	repo := filepath.Join(root, "api-server")
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package api\n\nfunc MAIN() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "commit", "-qam", "main edit")
+	wt := filepath.Join(root, "api-server-feature")
+	if err := os.WriteFile(filepath.Join(wt, "app.go"), []byte("package api\n\nfunc FEAT() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "commit", "-qam", "feature edit, conflicting with main's")
+
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	d, _ := e.Diff(feat.ID)
+	for _, f := range d.Files {
+		if err := e.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, err := e.Approve(feat.ID)
+	if err == nil {
+		t.Fatal("approve should refuse a real merge conflict")
+	}
+	if strings.Contains(err.Error(), "exit status") {
+		t.Errorf("error leaked git's raw exit-status text: %v", err)
+	}
+	for _, want := range []string{"conflicts with the base branch", "base unchanged"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err.Error(), want)
+		}
+	}
+	var mc *ApproveMergeConflictError
+	if !errors.As(err, &mc) {
+		t.Fatalf("expected *ApproveMergeConflictError, got %T: %v", err, err)
+	}
+	if mc.Raw == nil || !errors.Is(mc.Raw, gitbackend.ErrMergeConflict) {
+		t.Errorf("expected Raw to unwrap to gitbackend.ErrMergeConflict (for the AUDIT log), got %v", mc.Raw)
+	}
+
+	// The underlying safety property must not have weakened: base left clean...
+	dirty, direrr := e.be.IsDirty(repo)
+	if direrr != nil {
+		t.Fatal(direrr)
+	}
+	if dirty {
+		t.Error("base worktree should be clean after a failed/aborted merge")
+	}
+	// ...and a failed approve must not remove the worktree.
+	if findByBranch(e.List(), "feature") == nil {
+		t.Error("a failed approve must not remove the worktree")
+	}
+}
+
 // TestApproveBlockedOnStaleReviewHash is AC3's stale-review case: a file is
 // reviewed, then edited again (and re-committed, so only the review gate is in
 // play) — approve must refuse because the stored hash no longer matches.

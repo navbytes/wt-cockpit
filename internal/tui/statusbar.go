@@ -31,9 +31,11 @@ func renderTopbar(width int, wts []model.Worktree, conn connState, attempt int, 
 		if w.Reviewed < w.Stats.Files {
 			unreviewed++
 		}
-		if len(w.Guardrails) > 0 {
-			alerts++
-		}
+		// alerts is a TOTAL-hits count, not worktrees-with-a-hit (ux-expert
+		// P2-3): the web index and CLI `wt ls` already counted every hit, so
+		// the TUI topbar used to disagree with both on the same workspace —
+		// one worktree with three guardrail hits counted as 1 here, 3 there.
+		alerts += len(w.Guardrails)
 	}
 	left := styles.Brand.Render("wt cockpit") + "  " + renderTopbarCounts(len(wts), active, unreviewed, alerts)
 	right := connChip(conn, attempt)
@@ -64,14 +66,16 @@ func renderTopbar(width int, wts []model.Worktree, conn connState, attempt int, 
 // renderTopbarCounts builds the "N worktrees · N active · N unreviewed · N
 // alerts" segment with each number bright/bold and the unreviewed/alerts
 // numbers additionally styled by whether they're worth the user's attention
-// right now (ux-expert P2-5) — labels stay dim throughout.
+// right now (ux-expert P2-5) — labels stay dim throughout. "worktree"/"alert"
+// singularize at exactly 1 (ux-expert P3-9): "active"/"unreviewed" have no
+// trailing noun to pluralize, so only these two need it.
 func renderTopbarCounts(total, active, unreviewed, alerts int) string {
 	sep := styles.Dim.Render(" · ")
 	parts := []string{
-		countStat(total, styles.Txt) + styles.Dim.Render(" worktrees"),
+		countStat(total, styles.Txt) + styles.Dim.Render(" "+pluralize(total, "worktree")),
 		countStat(active, styles.Txt) + styles.Dim.Render(" active"),
 		countStat(unreviewed, unreviewedCountStyle(unreviewed)) + styles.Dim.Render(" unreviewed"),
-		countStat(alerts, alertsCountStyle(alerts)) + styles.Dim.Render(" alerts"),
+		countStat(alerts, alertsCountStyle(alerts)) + styles.Dim.Render(" "+pluralize(alerts, "alert")),
 	}
 	return strings.Join(parts, sep)
 }
@@ -79,6 +83,15 @@ func renderTopbarCounts(total, active, unreviewed, alerts int) string {
 // countStat renders one topbar number in bold against st's color.
 func countStat(n int, st lipgloss.Style) string {
 	return st.Bold(true).Render(strconv.Itoa(n))
+}
+
+// pluralize renders noun with a trailing "s" unless n is exactly 1 — "1
+// alerts"/"1 worktrees" reads as a typo, not a count (ux-expert P3-9).
+func pluralize(n int, noun string) string {
+	if n == 1 {
+		return noun
+	}
+	return noun + "s"
 }
 
 // unreviewedCountStyle accents the unreviewed count once there's actually

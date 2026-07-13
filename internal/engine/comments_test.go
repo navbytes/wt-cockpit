@@ -202,10 +202,93 @@ func TestAddCommentAcceptsBodyExactlyAtSizeLimit(t *testing.T) {
 	}
 }
 
+// TestAddCommentRejectsUnknownWorktree pins the distinct ErrWorktreeNotFound
+// sentinel (P7-ux.md backlog): an unknown worktree id used to share
+// ErrFileNotFound's "file not found in current diff" text with an
+// out-of-diff file, a confusing 404 body for a request that never named a
+// real worktree at all.
 func TestAddCommentRejectsUnknownWorktree(t *testing.T) {
 	e := newEngine(t, t.TempDir())
-	if _, err := e.AddComment("no-such-id", "new.go", 1, "", "hi", ""); !errors.Is(err, ErrFileNotFound) {
-		t.Errorf("expected ErrFileNotFound for an unknown worktree, got %v", err)
+	if _, err := e.AddComment("no-such-id", "new.go", 1, "", "hi", ""); !errors.Is(err, ErrWorktreeNotFound) {
+		t.Errorf("expected ErrWorktreeNotFound for an unknown worktree, got %v", err)
+	}
+}
+
+// ---- AddComment: body/author control-byte sanitization + author validation
+// (P7 security MEDIUM-1/LOW-2) ----
+
+// TestAddCommentSanitizesControlBytesInBodyAndAuthor is the security fix's
+// headline pin: raw ESC/OSC bytes in either field must never reach storage —
+// they come back out as their caret-notation equivalent, matching
+// diffparse.SanitizeControl's own contract, so `wt comments` (which prints
+// these fields verbatim) can never emit a raw escape sequence.
+func TestAddCommentSanitizesControlBytesInBodyAndAuthor(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	c, err := e.AddComment(feat.ID, "new.go", 1, "", "evil\x1b]0;pwned\x07 body", "evil\x1bauthor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(c.Body, "\x1b\x07") || strings.ContainsAny(c.Author, "\x1b\x07") {
+		t.Fatalf("raw ESC/BEL bytes leaked into stored comment: %+v", c)
+	}
+	if c.Body != "evil^[]0;pwned^G body" {
+		t.Errorf("Body = %q, want the caret-sanitized text", c.Body)
+	}
+	if c.Author != "evil^[author" {
+		t.Errorf("Author = %q, want the caret-sanitized text", c.Author)
+	}
+
+	// Comments() (what `wt comments`/GET /api/comments actually serve) must
+	// read back the same sanitized text, not the raw original.
+	views, err := e.Comments(feat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := findCommentView(views, c.ID)
+	if v == nil {
+		t.Fatal("comment missing from Comments() immediately after AddComment")
+	}
+	if strings.ContainsAny(v.Body, "\x1b\x07") || strings.ContainsAny(v.Author, "\x1b\x07") {
+		t.Errorf("raw ESC/BEL bytes leaked into Comments() read-back: %+v", v)
+	}
+}
+
+func TestAddCommentRejectsOverlongAuthor(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	big := strings.Repeat("a", maxCommentAuthorBytes+1)
+	if _, err := e.AddComment(feat.ID, "new.go", 1, "", "hi", big); !errors.Is(err, ErrInvalidComment) {
+		t.Errorf("expected ErrInvalidComment for a %d-byte author, got %v", len(big), err)
+	}
+}
+
+func TestAddCommentAcceptsAuthorExactlyAtSizeLimit(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	exact := strings.Repeat("a", maxCommentAuthorBytes)
+	if _, err := e.AddComment(feat.ID, "new.go", 1, "", "hi", exact); err != nil {
+		t.Errorf("an author exactly at the %d-byte limit should be accepted, got %v", maxCommentAuthorBytes, err)
+	}
+}
+
+func TestAddCommentRejectsInvalidUTF8Author(t *testing.T) {
+	root := buildWorkspace(t)
+	e := newEngine(t, root)
+	e.Refresh(context.Background())
+	feat := findByBranch(e.List(), "feature")
+
+	if _, err := e.AddComment(feat.ID, "new.go", 1, "", "hi", "bad \xff\xfe author"); !errors.Is(err, ErrInvalidComment) {
+		t.Errorf("expected ErrInvalidComment for invalid UTF-8 author, got %v", err)
 	}
 }
 
@@ -255,8 +338,8 @@ func TestAddCommentRejectedValidationDoesNotPublish(t *testing.T) {
 
 func TestCommentsUnknownWorktreeReturnsError(t *testing.T) {
 	e := newEngine(t, t.TempDir())
-	if _, err := e.Comments("no-such-id"); !errors.Is(err, ErrFileNotFound) {
-		t.Errorf("expected ErrFileNotFound for an unknown worktree, got %v", err)
+	if _, err := e.Comments("no-such-id"); !errors.Is(err, ErrWorktreeNotFound) {
+		t.Errorf("expected ErrWorktreeNotFound for an unknown worktree, got %v", err)
 	}
 }
 

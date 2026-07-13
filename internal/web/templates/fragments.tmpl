@@ -14,7 +14,7 @@
 <div class="flist">
   {{range .Files}}
   <div class="fitem {{if .Reviewed}}done{{end}}">
-    <input type="checkbox" class="rev-toggle rail-toggle" data-file="{{.Path}}" data-file-hash="{{.Hash}}" {{if .Reviewed}}checked{{end}}>
+    <input type="checkbox" class="rev-toggle rail-toggle" data-file="{{.Path}}" data-file-hash="{{.Hash}}" aria-label="mark {{.DisplayPath}} reviewed" {{if .Reviewed}}checked{{end}}>
     <a class="fn" href="#file-{{.Idx}}" title="{{.DisplayPath}}">{{.DisplayPath}}</a>
     <span class="n"><span class="add">+{{.Stats.Add}}</span> <span class="del">&minus;{{.Stats.Del}}</span></span>
   </div>

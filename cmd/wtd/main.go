@@ -727,6 +727,14 @@ func (s *server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	outcome := "ok"
 	if err != nil {
 		outcome = "denied: " + err.Error()
+		// A merge-conflict denial's own Error() is deliberately just the
+		// friendly, actionable sentence (P7-ux.md P1-2: no raw git exit-status/
+		// conflict text at the money moment) — recover that raw detail here so
+		// the audit trail doesn't lose it, even though the client never sees it.
+		var mc *engine.ApproveMergeConflictError
+		if errors.As(err, &mc) && mc.Raw != nil {
+			outcome += " (" + mc.Raw.Error() + ")"
+		}
 	}
 	slog.Info("AUDIT approve", "worktree", req.ID, "repo", repo, "files", files, "outcome", outcome)
 
@@ -833,9 +841,9 @@ func (s *server) handleCommentsCreate(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		writeJSON(w, c)
-	case errors.Is(err, engine.ErrCommentTooLarge):
+	case errors.Is(err, engine.ErrCommentTooLarge), errors.Is(err, engine.ErrTooManyComments):
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
-	case errors.Is(err, engine.ErrFileNotFound):
+	case errors.Is(err, engine.ErrWorktreeNotFound), errors.Is(err, engine.ErrFileNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, engine.ErrInvalidComment):
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -341,6 +341,27 @@ func TestFragmentRailReflectsReviewedStateAndUnknownID404s(t *testing.T) {
 	}
 }
 
+// TestFragmentRailCheckboxHasAccessibleLabel is ux-expert P2-5a's pin: the
+// rail's reviewed-checkbox used to be a bare <input> with no label/aria,
+// silent to a screen reader — mirroring the file-card checkbox (room.tmpl),
+// which already has one via a wrapping <label>.
+func TestFragmentRailCheckboxHasAccessibleLabel(t *testing.T) {
+	eng, feat := buildTestEngine(t)
+	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	rec := getPage(t, h, "/fragment/rail?id="+feat.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="rev-toggle rail-toggle"`) {
+		t.Fatalf("precondition: expected the rail checkbox in the fragment, got:\n%s", body)
+	}
+	if !strings.Contains(body, `aria-label="mark app.go reviewed"`) {
+		t.Errorf("expected the rail checkbox to carry an aria-label naming its file, got:\n%s", body)
+	}
+}
+
 // ---- composer POST: CSRF-gated, through the full web.New stack ----
 
 func commentsStubAPI() http.Handler {

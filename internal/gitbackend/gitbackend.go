@@ -8,6 +8,8 @@ package gitbackend
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -261,18 +263,47 @@ func hashString(s string) string {
 	return string(b[:])
 }
 
+// ErrMergeConflict is Merge's sentinel for a real merge conflict, as opposed
+// to any other merge failure (a missing branch, a permissions error, ...) —
+// P7-ux.md P1-2: git writes a conflict's "CONFLICT (content): ..." detail to
+// STDOUT, not stderr, so c.run's stderr-only GitError wrapping never saw it
+// and this case fell through to a bare, uninformative *exec.ExitError
+// ("exit status 1") at the "money moment" of a failed approve. errors.Is
+// lets engine.Approve distinguish this case and give the human one clear
+// sentence instead, while the wrapped detail (the conflict text itself)
+// stays available via errors.Unwrap for the audit log.
+var ErrMergeConflict = errors.New("merge conflict")
+
 // Merge merges branch into the branch checked out at baseWorktreePath. It uses a
 // normal merge (fast-forward when possible, else a merge commit). If the merge
 // fails for any reason — most importantly a conflict — it runs `merge --abort` so
 // the base worktree is never left in a half-merged, conflict-marked state. This is
 // the safety property the tests pin: a failed approve must not corrupt main.
 func (c *CLI) Merge(baseWorktreePath, branch string) error {
-	_, err := c.run(baseWorktreePath, "merge", "--no-edit", branch)
+	out, err := c.runMergeOutput(baseWorktreePath, "merge", "--no-edit", branch)
 	if err != nil {
 		_, _ = c.run(baseWorktreePath, "merge", "--abort") // best-effort cleanup
+		if strings.Contains(out, "CONFLICT") {
+			return fmt.Errorf("%w: %s", ErrMergeConflict, strings.TrimSpace(out))
+		}
 		return err
 	}
 	return nil
+}
+
+// runMergeOutput is like run, but returns the command's combined stdout+
+// stderr text even on failure (run discards stdout entirely once err != nil).
+// Merge needs that text specifically to detect a conflict: git writes
+// "CONFLICT ..." to stdout, not stderr.
+func (c *CLI) runMergeOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command(c.gitPath, args...)
+	cmd.Dir = dir
+	cmd.Env = c.env
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
 }
 
 // RemoveWorktree removes targetPath. --force is used so untracked/ignored files in

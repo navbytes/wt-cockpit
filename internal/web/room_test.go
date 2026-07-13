@@ -550,6 +550,31 @@ func TestRoomPageHasNoInlineEventHandlersOrJavascriptURLs(t *testing.T) {
 // pre-existing fragment-swap helper WP2 shipped; the word "innerHTML" also
 // appears once more, in that helper's own doc comment, which this counts by
 // the real mutation site, not the bare word); no eval/document.write.
+// TestStyleCSSGuardsAnimationsBehindReducedMotion pins ux-expert P3-9: the
+// toast slide-in and the progress-bar fill transition are the stylesheet's
+// only two animated properties, and both must live inside a
+// `@media (prefers-reduced-motion: no-preference)` block rather than
+// unconditionally — a user who opted out of motion gets none.
+func TestStyleCSSGuardsAnimationsBehindReducedMotion(t *testing.T) {
+	src, err := staticFS.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(src)
+	mediaIdx := strings.Index(css, "@media (prefers-reduced-motion: no-preference)")
+	if mediaIdx < 0 {
+		t.Fatal("expected a @media (prefers-reduced-motion: no-preference) block")
+	}
+	for _, decl := range []string{"transition: .3s;", "animation: toast-in .15s ease-out;"} {
+		if strings.Contains(css[:mediaIdx], decl) {
+			t.Errorf("%q appears before the reduced-motion media block (unconditional), want it only inside", decl)
+		}
+		if !strings.Contains(css[mediaIdx:], decl) {
+			t.Errorf("expected %q inside the reduced-motion media block, got none", decl)
+		}
+	}
+}
+
 func TestAppJSKeepsBoundaryRulesInForce(t *testing.T) {
 	src, err := staticFS.ReadFile("static/app.js")
 	if err != nil {

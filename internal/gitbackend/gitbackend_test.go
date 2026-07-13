@@ -1,6 +1,7 @@
 package gitbackend
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +193,14 @@ func TestMergeAbortsOnConflict(t *testing.T) {
 	err := b.Merge(repo, "feature")
 	if err == nil {
 		t.Fatal("expected conflict error")
+	}
+	// P7-ux.md P1-2: a real conflict must be distinguishable from any other
+	// merge failure via errors.Is, so engine.Approve can give the human a
+	// clear message instead of relaying git's raw exit-status text (git
+	// writes "CONFLICT ..." to stdout, not stderr, so the ordinary stderr-only
+	// GitError wrapping never even saw it before this fix).
+	if !errors.Is(err, ErrMergeConflict) {
+		t.Errorf("expected errors.Is(err, ErrMergeConflict), got %v", err)
 	}
 	// Critically, the base worktree must be left CLEAN (merge aborted), not stuck
 	// mid-conflict with markers.

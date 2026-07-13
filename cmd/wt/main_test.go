@@ -234,3 +234,52 @@ func TestRenderRadarSanitizesControlBytesInGuardrailRuleName(t *testing.T) {
 		t.Errorf("expected the caret-sanitized rule name in wt ls output, got:\n%s", out)
 	}
 }
+
+// TestRenderRadarSanitizesControlBytesInRepoAndWorktreeName is P7 security
+// LOW-1's pin: repo.Name/Worktree.Name are filepath.Base(dir) — filesystem-
+// derived text that can carry raw control bytes on Unix — and renderRadar
+// used to print both raw. The menubar/web renderers of this exact field
+// already sanitize; this is `wt ls`'s own render sink catching up.
+func TestRenderRadarSanitizesControlBytesInRepoAndWorktreeName(t *testing.T) {
+	wts := []model.Worktree{
+		{ID: "wt1", Repo: "evil\x1b]0;pwned\x07-repo", Name: "evil\x1bname", State: model.StateDirty},
+	}
+	out := captureStdout(t, func() { renderRadar(wts) })
+	if strings.Contains(out, "evil\x1b]0;pwned\x07-repo") || strings.Contains(out, "evil\x1bname") {
+		t.Fatalf("raw ESC/BEL bytes in the repo/worktree name leaked into wt ls output:\n%s", out)
+	}
+	if !strings.Contains(out, "evil^[]0;pwned^G-repo") {
+		t.Errorf("expected the caret-sanitized repo name in wt ls output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "evil^[name") {
+		t.Errorf("expected the caret-sanitized worktree name in wt ls output, got:\n%s", out)
+	}
+}
+
+// ---- P2-3: "alerts" wording + empty-state nudge ----
+
+// TestRenderRadarSaysAlertsNotGuardrailHits pins the ux-expert P2-3 wording
+// fix: the CLI used to say "N guardrail hits" while the TUI/web both said
+// "alerts" for the identical total-hits count — one label everywhere now.
+func TestRenderRadarSaysAlertsNotGuardrailHits(t *testing.T) {
+	wts := []model.Worktree{
+		{ID: "wt1", Repo: "repo", Name: "feature", Guardrails: []model.GuardrailHit{{Rule: "r1"}, {Rule: "r2"}}},
+	}
+	out := captureStdout(t, func() { renderRadar(wts) })
+	if strings.Contains(out, "guardrail hits") {
+		t.Errorf("expected \"alerts\" wording, not the old \"guardrail hits\", got:\n%s", out)
+	}
+	if !strings.Contains(out, "2 alerts") {
+		t.Errorf("expected the total hit count (2) labeled \"alerts\", got:\n%s", out)
+	}
+}
+
+// TestRenderRadarEmptyStateNudgesTowardRootsConfig pins the P3-cheap fix:
+// zero worktrees now gives the same "add a root" nudge the TUI sidebar and
+// web index already give, instead of a bare "0 worktrees" header.
+func TestRenderRadarEmptyStateNudgesTowardRootsConfig(t *testing.T) {
+	out := captureStdout(t, func() { renderRadar(nil) })
+	if !strings.Contains(out, "wtd -root <dir>") {
+		t.Errorf("expected the empty-state roots nudge, got:\n%s", out)
+	}
+}

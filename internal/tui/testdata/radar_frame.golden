@@ -1,4 +1,4 @@
-wt cockpit  1 worktrees · 0 active · 1 unreviewed · 0 alerts        ◌ connecting
+wt cockpit  1 worktree · 0 active · 1 unreviewed · 0 alerts         ◌ connecting
 WORKTREES · LIVE                  │api-server / auth-refactor   base main   2 fi
 api-server                        │internal/auth/token.go  +2 -1                
 │ ● auth-refactor            +4 -1│@@ -18,3 +18,4 @@ func NewToken(             

@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/navbytes/wt-cockpit/internal/diffparse"
 	"github.com/navbytes/wt-cockpit/internal/model"
 	"github.com/navbytes/wt-cockpit/internal/store"
 )
@@ -21,6 +22,13 @@ import (
 // §1.5/§1.3) — distinct from the handler's transport-level 1 MiB JSON decode
 // cap, which guards the whole request rather than this one field.
 const maxCommentBodyBytes = 64 * 1024
+
+// maxCommentAuthorBytes caps an explicit --author/author POST field (P7
+// security MEDIUM-1/LOW-2): unlike body, author previously had no size limit
+// of its own at all beyond the handler's 1 MiB transport cap, letting ~500
+// comments balloon a worktree's store by hundreds of MB. A smaller cap than
+// body's is fine — an author is a name, not a note.
+const maxCommentAuthorBytes = 256
 
 // ErrInvalidComment wraps an AddComment validation failure (empty/invalid-
 // UTF-8 body, bad side) — errors.Is unwraps to this one sentinel regardless
@@ -37,22 +45,38 @@ var ErrCommentTooLarge = errors.New("comment body exceeds 64 KiB limit")
 // ErrFileNotFound/ErrFileChanged already work for review.
 var ErrCommentNotFound = store.ErrCommentNotFound
 
+// ErrTooManyComments aliases the store's per-worktree comment cap sentinel
+// (413, mirroring ErrCommentTooLarge's own per-comment cap) — same rationale
+// as ErrCommentNotFound above: cmd/wtd only ever imports engine for these.
+var ErrTooManyComments = store.ErrTooManyComments
+
+// ErrWorktreeNotFound is AddComment/Comments' sentinel for an unknown
+// worktree id, distinct from ErrFileNotFound (a known worktree whose current
+// diff just doesn't contain the named file) — P7-ux.md backlog: the two used
+// to share ErrFileNotFound's "file not found in current diff" text, which is
+// a confusing 404 body for a request that never even named a real worktree.
+var ErrWorktreeNotFound = errors.New("unknown worktree id")
+
 // AddComment creates a comment anchored to file within id's current diff.
-// file must be part of that diff (else ErrFileNotFound, exactly as
-// SetReviewed treats an unknown worktree or an out-of-diff file — the same
-// sentinel covers both cases here too). line 0 is the file-level convention;
-// negative lines are rejected. side defaults to "new" when empty and is
-// otherwise restricted to "old"/"new". body must be non-empty, valid UTF-8,
-// and at most maxCommentBodyBytes. author defaults to the daemon's OS user
-// when empty. The comment is stamped with a fresh ID, At and the file's
-// current hash (its stale-anchor baseline), persisted, and published as
-// comment.changed.
+// id must be a known worktree (else ErrWorktreeNotFound) and file must be
+// part of its current diff (else ErrFileNotFound). line 0 is the file-level
+// convention; negative lines are rejected. side defaults to "new" when empty
+// and is otherwise restricted to "old"/"new". body must be non-empty, valid
+// UTF-8, and at most maxCommentBodyBytes; author, when given explicitly,
+// must be valid UTF-8 and at most maxCommentAuthorBytes, else it defaults to
+// the daemon's OS user. Both body and author are run through
+// diffparse.SanitizeControl before storing (P7 security MEDIUM-1/LOW-2): this
+// is the one ingest chokepoint every comment — CLI, curl, or the web form —
+// passes through, so a raw ESC/OSC byte can never persist into SQLite and
+// later print raw from `wt comments`. The comment is stamped with a fresh
+// ID, At and the file's current hash (its stale-anchor baseline), persisted,
+// and published as comment.changed.
 func (e *Engine) AddComment(id, file string, line int, side, body, author string) (model.Comment, error) {
 	e.mu.RLock()
 	m, ok := e.cache[id]
 	e.mu.RUnlock()
 	if !ok {
-		return model.Comment{}, ErrFileNotFound
+		return model.Comment{}, ErrWorktreeNotFound
 	}
 	cur := findDiffFile(m.diff.Files, file)
 	if cur == nil {
@@ -79,6 +103,13 @@ func (e *Engine) AddComment(id, file string, line int, side, body, author string
 	}
 	if author == "" {
 		author = defaultAuthor()
+	} else {
+		if !utf8.ValidString(author) {
+			return model.Comment{}, fmt.Errorf("%w: author is not valid UTF-8", ErrInvalidComment)
+		}
+		if len(author) > maxCommentAuthorBytes {
+			return model.Comment{}, fmt.Errorf("%w: author exceeds %d byte limit", ErrInvalidComment, maxCommentAuthorBytes)
+		}
 	}
 
 	c := model.Comment{
@@ -87,8 +118,8 @@ func (e *Engine) AddComment(id, file string, line int, side, body, author string
 		File:       file,
 		Line:       line,
 		Side:       side,
-		Body:       body,
-		Author:     author,
+		Body:       diffparse.SanitizeControl(body),
+		Author:     diffparse.SanitizeControl(author),
 		State:      "open",
 		FileHash:   cur.Hash,
 		At:         time.Now(),
@@ -104,13 +135,14 @@ func (e *Engine) AddComment(id, file string, line int, side, body, author string
 // computed against the worktree's *current* cached diff — never persisted,
 // always derived fresh at read time (P4-design.md §1.5's frozen semantics).
 // Stale means the file is still in the diff but its hash moved since the
-// comment was made; Orphaned means the file left the diff entirely.
+// comment was made; Orphaned means the file left the diff entirely. id must
+// be a known worktree, else ErrWorktreeNotFound.
 func (e *Engine) Comments(id string) ([]model.CommentView, error) {
 	e.mu.RLock()
 	m, ok := e.cache[id]
 	e.mu.RUnlock()
 	if !ok {
-		return nil, ErrFileNotFound
+		return nil, ErrWorktreeNotFound
 	}
 	raw, err := e.st.Comments(id)
 	if err != nil {

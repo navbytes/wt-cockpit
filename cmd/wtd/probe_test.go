@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -283,5 +284,69 @@ func TestHandleApproveLogsAuditLineOnSuccess(t *testing.T) {
 	}
 	if line["outcome"] != "ok" {
 		t.Errorf("outcome = %v, want %q", line["outcome"], "ok")
+	}
+}
+
+// TestHandleApproveOnMergeConflictKeepsRawDetailInAuditButFriendlyInBody is
+// P7-ux.md P1-2's end-to-end pin over the real HTTP handler: a real merge
+// conflict must produce a friendly, git-detail-free response body (what the
+// CLI/web caller actually sees) while the AUDIT log line still retains git's
+// raw conflict text for troubleshooting.
+func TestHandleApproveOnMergeConflictKeepsRawDetailInAuditButFriendlyInBody(t *testing.T) {
+	srv, feat := buildTestServer(t)
+
+	wtPath, ok := srv.eng.WorktreePath(feat.ID)
+	if !ok {
+		t.Fatal("worktree path not found")
+	}
+	repo := filepath.Join(filepath.Dir(wtPath), "repo")
+
+	// Conflict main and feature on the SAME (only) line of app.go.
+	if err := os.WriteFile(filepath.Join(wtPath, "app.go"), []byte("package feat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, wtPath, "add", "-A")
+	testGit(t, wtPath, "commit", "-q", "-m", "feature edit")
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package main2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, repo, "commit", "-qam", "main edit, conflicting")
+
+	if err := srv.eng.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d, ok := srv.eng.Diff(feat.ID)
+	if !ok || len(d.Files) == 0 {
+		t.Fatalf("precondition: diff must still have files, got %+v", d)
+	}
+	for _, f := range d.Files {
+		if err := srv.eng.SetReviewed(feat.ID, f.Path, true, f.Hash); err != nil {
+			t.Fatalf("SetReviewed(%s): %v", f.Path, err)
+		}
+	}
+
+	handler := srv.routes()
+	var rec *httptest.ResponseRecorder
+	buf := withJSONLogCapture(t, func() {
+		rec = postJSON(t, handler, "/api/approve", map[string]any{"id": feat.ID})
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "exit status") {
+		t.Errorf("response body leaked git's raw exit-status text: %q", body)
+	}
+	if !strings.Contains(body, "conflicts with the base branch") {
+		t.Errorf("response body = %q, want the friendly conflict message", body)
+	}
+
+	line := findAuditLine(t, buf)
+	if line == nil {
+		t.Fatalf("no AUDIT approve line found in logs:\n%s", buf.String())
+	}
+	outcome, _ := line["outcome"].(string)
+	if !strings.Contains(outcome, "CONFLICT") {
+		t.Errorf("AUDIT outcome = %q, want it to retain git's raw conflict detail", outcome)
 	}
 }

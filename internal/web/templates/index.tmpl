@@ -1,6 +1,6 @@
 {{define "content"}}
 <div class="topbar">
-  <div class="brand"><span>wt</span> cockpit</div>
+  <h1 class="brand"><span>wt</span> cockpit</h1>
   <span id="sse-chip" class="sse-chip hidden" role="status">live updates paused — retrying</span>
   <div class="spacer"></div>
   <div class="stat"><b>{{.Counts.Worktrees}}</b> worktrees</div>
@@ -8,6 +8,7 @@
   <div class="stat rev"><b>{{.Counts.Unreviewed}}</b> unreviewed</div>
   <div class="stat warn"><b>{{.Counts.Alerts}}</b> alert{{if ne .Counts.Alerts 1}}s{{end}}</div>
 </div>
+<div id="proto-banner" class="banner hidden" role="alert">wtd was upgraded — reload</div>
 <div id="worktrees">{{template "worktrees" .}}</div>
 {{end}}
 
@@ -18,7 +19,7 @@
   — <code>wtd -root &lt;dir&gt;</code> or edit config.toml</p>
 {{else}}
 {{range .Groups}}
-<div class="proj">{{.Repo}}</div>
+<h2 class="proj">{{.Repo}}</h2>
 {{range .Worktrees}}
 <a class="wt {{.State}}" href="/wt/{{.ID}}">
   <span class="dot" title="{{.State}}" aria-label="{{.State}}"></span>

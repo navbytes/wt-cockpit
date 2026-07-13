@@ -304,7 +304,14 @@ function showBanner(el, text) {
     if (lab) lab.textContent = composerLabel(line, side);
     host.appendChild(frag);
     var ta = host.querySelector(".composer-body");
-    if (ta) ta.focus();
+    // preventScroll: the composer strip lives under the FILE header, not next
+    // to the clicked gutter line — a plain focus() on a possibly off-screen
+    // textarea scrolls the whole page to bring it into view, which for a deep
+    // line yanks the scroll position up to the file-card top and hides the
+    // very line just clicked (ux-expert P2-4). The trigger that was actually
+    // clicked is already on screen (that's how it got clicked), so there is
+    // nothing left to scroll into view once focus itself doesn't move it.
+    if (ta) ta.focus({ preventScroll: true });
   }
 
   document.addEventListener("click", function (e) {
