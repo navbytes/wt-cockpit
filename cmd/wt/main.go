@@ -26,6 +26,7 @@ import (
 	wtclient "github.com/navbytes/wt-cockpit/internal/client"
 	"github.com/navbytes/wt-cockpit/internal/guardrail"
 	"github.com/navbytes/wt-cockpit/internal/model"
+	"github.com/navbytes/wt-cockpit/internal/notify"
 	"github.com/navbytes/wt-cockpit/internal/tui"
 )
 
@@ -293,11 +294,54 @@ func (c *client) watch() error {
 		}
 	}
 	render()
+	bell := &watchBell{out: os.Stdout, now: time.Now}
 	events, errs := c.cl.Events(context.Background())
-	for range events {
+	for e := range events {
+		bell.maybeRing(e)
 		render()
 	}
 	return <-errs
+}
+
+// watchBellThrottle caps `wt watch`'s terminal bell to once per this long
+// (P5-design.md §1.6) — an agent storm tripping several danger hits in a row
+// must not turn the terminal into a klaxon.
+const watchBellThrottle = 5 * time.Second
+
+// watchBellBodyCap is the OSC 9 notification body's char cap — tighter than
+// the desktop notifier's own 200 (P5-design.md §1.5): an OSC 9 popup has
+// less room to show it.
+const watchBellBodyCap = 120
+
+// watchBell owns wt watch's "one bell per 5s" throttle across the event
+// loop. Its own type (rather than a bare closure) is what makes the throttle
+// logic unit-testable against a fake events channel and a fake clock, with
+// no pty needed (P5-design.md WP2 test list).
+type watchBell struct {
+	out  io.Writer
+	now  func() time.Time
+	last time.Time
+}
+
+// maybeRing writes a BEL plus a sanitized OSC 9 notification to b.out when e
+// is a danger-severity guardrail.tripped event and the throttle has
+// elapsed since the last ring; every other event — including a danger hit
+// arriving within the throttle window — is a no-op (P5-design.md §1.6).
+// notify.Sanitize is the exact same rule the desktop notifier uses for its
+// own argv content, reused here rather than a second, drifting
+// implementation: no raw hit text can smuggle escape bytes into the
+// terminal either way.
+func (b *watchBell) maybeRing(e model.Event) {
+	if e.Type != model.EventGuardrail || e.Hit == nil || e.Hit.Severity != "danger" {
+		return
+	}
+	now := b.now()
+	if !b.last.IsZero() && now.Sub(b.last) < watchBellThrottle {
+		return
+	}
+	b.last = now
+	msg := notify.Sanitize(e.Hit.Message, watchBellBodyCap)
+	fmt.Fprintf(b.out, "\a\x1b]9;wt-cockpit: %s\x07", msg)
 }
 
 // shouldRenderSSELine advances the SSE per-frame event-name state machine (an
@@ -353,6 +397,7 @@ type statusPayload struct {
 	ReviewedFiles int              `json:"reviewedFiles"`
 	TotalFiles    int              `json:"totalFiles"`
 	RulePacks     rulePacksPayload `json:"rulePacks"`
+	Notifier      string           `json:"notifier"` // additive (P5-design.md §1.5, §2): the desktop notifier's resolved state
 }
 
 // rulePacksPayload mirrors statusPayload's additive `rulePacks` field
@@ -762,6 +807,7 @@ func renderStatus(st statusPayload) {
 	fmt.Printf("  %sworktrees%s  %d\n", dim, reset, st.WorktreeCount)
 	fmt.Printf("  %sreviewed%s   %d/%d files\n", dim, reset, st.ReviewedFiles, st.TotalFiles)
 	fmt.Printf("  %srule packs%s %d loaded, %d errors\n", dim, reset, st.RulePacks.Loaded, st.RulePacks.Errors)
+	fmt.Printf("  %snotifier%s   %s\n", dim, reset, st.Notifier)
 }
 
 func truncate(s string, n int) string {

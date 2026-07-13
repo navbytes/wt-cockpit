@@ -45,6 +45,11 @@ message = "touches database migrations"
 name = "large-deletion"
 severity = "warn"
 min_net_deleted = 80
+
+[notifications]
+enabled = true
+severity = "warn"
+cooldown = "5m"
 `
 
 func TestLoadFullExamplePopulatesEveryField(t *testing.T) {
@@ -109,6 +114,16 @@ func TestLoadFullExamplePopulatesEveryField(t *testing.T) {
 	want1 := guardrail.Rule{Name: "large-deletion", Severity: "warn", MinNetDeleted: 80}
 	if !reflect.DeepEqual(cfg.Rules[1], want1) {
 		t.Errorf("Rules[1] = %+v, want %+v", cfg.Rules[1], want1)
+	}
+
+	if !cfg.Notifications.EnabledOr() {
+		t.Error("Notifications.EnabledOr() should be true")
+	}
+	if got := cfg.Notifications.SeverityOr(); got != "warn" {
+		t.Errorf("Notifications.SeverityOr() = %q, want warn", got)
+	}
+	if got := cfg.Notifications.CooldownOr(); got != 5*time.Minute {
+		t.Errorf("Notifications.CooldownOr() = %v, want 5m", got)
 	}
 }
 
@@ -280,5 +295,126 @@ func TestRulesOrFallsBackToDefaultsWhenAbsent(t *testing.T) {
 	got := cfg.RulesOr(defaults)
 	if len(got) != len(defaults) {
 		t.Errorf("RulesOr = %+v, want the defaults %+v", got, defaults)
+	}
+}
+
+// ---- [notifications] (P5-design.md §1.5, §2) ----
+
+// TestLoadNotificationsAbsentTableDefaultsToEnabled: no [notifications]
+// table at all must still resolve to enabled, danger-only, 10m cooldown —
+// the frozen "default ON" contract.
+func TestLoadNotificationsAbsentTableDefaultsToEnabled(t *testing.T) {
+	path := writeTOML(t, `base = "main"`+"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifications.EnabledOr() {
+		t.Error("EnabledOr() should be true when [notifications] is entirely absent")
+	}
+	if got := cfg.Notifications.SeverityOr(); got != "danger" {
+		t.Errorf("SeverityOr() = %q, want danger", got)
+	}
+	if got := cfg.Notifications.CooldownOr(); got != 10*time.Minute {
+		t.Errorf("CooldownOr() = %v, want 10m", got)
+	}
+}
+
+// TestLoadNotificationsPresentTableWithoutEnabledStillDefaultsTrue: a
+// [notifications] table that sets other keys but never `enabled` must still
+// default to enabled — only an explicit `enabled = false` turns it off.
+func TestLoadNotificationsPresentTableWithoutEnabledStillDefaultsTrue(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nseverity = \"warn\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifications.EnabledOr() {
+		t.Error("EnabledOr() should default true even when [notifications] is present but doesn't set `enabled`")
+	}
+	if got := cfg.Notifications.SeverityOr(); got != "warn" {
+		t.Errorf("SeverityOr() = %q, want warn", got)
+	}
+}
+
+// TestLoadNotificationsExplicitEnabledFalseDisables is the one way to opt
+// out entirely.
+func TestLoadNotificationsExplicitEnabledFalseDisables(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nenabled = false\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Notifications.EnabledOr() {
+		t.Error("EnabledOr() should be false after an explicit enabled = false")
+	}
+}
+
+// TestLoadNotificationsExplicitEnabledTrueIsRedundantButFine documents that
+// writing `enabled = true` explicitly (redundant with the default) still
+// round-trips correctly.
+func TestLoadNotificationsExplicitEnabledTrueIsRedundantButFine(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nenabled = true\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifications.EnabledOr() {
+		t.Error("EnabledOr() should be true")
+	}
+}
+
+func TestLoadNotificationsFullExampleParsesEveryField(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nenabled = true\nseverity = \"warn\"\ncooldown = \"5m\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifications.EnabledOr() {
+		t.Error("EnabledOr() should be true")
+	}
+	if got := cfg.Notifications.SeverityOr(); got != "warn" {
+		t.Errorf("SeverityOr() = %q, want warn", got)
+	}
+	if got := cfg.Notifications.CooldownOr(); got != 5*time.Minute {
+		t.Errorf("CooldownOr() = %v, want 5m", got)
+	}
+}
+
+// TestLoadNotificationsInvalidSeverityErrorsAndNamesIt pins the enum
+// validation: anything other than "danger"/"warn" (blank excepted) is a
+// load error naming the offending value.
+func TestLoadNotificationsInvalidSeverityErrorsAndNamesIt(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nseverity = \"critical\"\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an invalid notifications.severity")
+	}
+	if got := err.Error(); !strings.Contains(got, "critical") || !strings.Contains(got, "severity") {
+		t.Errorf("error = %q, want it to name the offending value and field", got)
+	}
+}
+
+// TestLoadNotificationsUnknownKeyErrorsAndNamesIt: a typo under
+// [notifications] must fail exactly like every other hand-edited-config
+// typo (meta.Undecoded() already catches this at the top level; this pins
+// that a nested table is no exception).
+func TestLoadNotificationsUnknownKeyErrorsAndNamesIt(t *testing.T) {
+	path := writeTOML(t, "[notifications]\nseverety = \"warn\"\n") // typo of "severity"
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for a mistyped [notifications] key")
+	}
+	if got := err.Error(); !strings.Contains(got, "severety") {
+		t.Errorf("error should name the offending key %q, got: %v", "severety", got)
+	}
+}
+
+// TestCooldownOrLeavesPositiveValuesUntouched is CooldownOr's control case:
+// a real configured cooldown must pass through exactly.
+func TestCooldownOrLeavesPositiveValuesUntouched(t *testing.T) {
+	n := NotificationsConfig{Cooldown: 90 * time.Second}
+	if got := n.CooldownOr(); got != 90*time.Second {
+		t.Errorf("CooldownOr() = %v, want 90s unchanged", got)
 	}
 }
