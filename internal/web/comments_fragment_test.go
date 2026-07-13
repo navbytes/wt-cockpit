@@ -109,9 +109,25 @@ func TestFragmentCommentsStaleBadgeAppearsAfterFileEdit(t *testing.T) {
 	}
 }
 
+// TestFragmentCommentsOrphanedSectionWhenFileLeavesDiff also pins the
+// P4-fixes.md #7 fix: the section used to render its "comments on files no
+// longer in this diff" heading (and a "none" placeholder) on every single
+// room page, orphaned comments or not. The empty state must now render a
+// genuinely childless container (style.css's ":empty" selector hides it) —
+// app.js still always finds #orphaned-comments as a live-refresh mount point.
 func TestFragmentCommentsOrphanedSectionWhenFileLeavesDiff(t *testing.T) {
 	eng, feat := buildTestEngine(t)
 	h := New(eng, stubAPI(), Config{BoundAddr: testBoundAddr, CSRFToken: "tok"})
+
+	// Precondition: nothing orphaned yet — the section must render as an
+	// empty, childless container, not the heading + "none" placeholder.
+	pre := getPage(t, h, "/fragment/comments?id="+feat.ID).Body.String()
+	if !strings.Contains(pre, `<div class="card orphaned-comments" id="orphaned-comments"></div>`) {
+		t.Fatalf("precondition: expected a genuinely empty orphaned-comments div, got:\n%s", pre)
+	}
+	if strings.Contains(pre, "comments on files no longer in this diff") || strings.Contains(pre, "none") {
+		t.Errorf("precondition: empty orphaned section must not render its heading/placeholder, got:\n%s", pre)
+	}
 
 	if _, err := eng.AddComment(feat.ID, "app.go", 0, "", "file-level note", ""); err != nil {
 		t.Fatalf("AddComment: %v", err)
@@ -129,6 +145,9 @@ func TestFragmentCommentsOrphanedSectionWhenFileLeavesDiff(t *testing.T) {
 	body := getPage(t, h, "/fragment/comments?id="+feat.ID).Body.String()
 	if !strings.Contains(body, `id="orphaned-comments"`) {
 		t.Fatalf("expected the orphaned section, got:\n%s", body)
+	}
+	if !strings.Contains(body, "comments on files no longer in this diff") {
+		t.Errorf("expected the section's heading now that it's populated, got:\n%s", body)
 	}
 	if !strings.Contains(body, `class="cbadge orphaned"`) || !strings.Contains(body, "app.go") {
 		t.Errorf("expected the orphaned comment naming its file, got:\n%s", body)
@@ -151,6 +170,13 @@ func TestFragmentCommentsResolveAndDeleteRoundTrip(t *testing.T) {
 	body := getPage(t, h, "/fragment/comments?id="+feat.ID).Body.String()
 	if !strings.Contains(body, `class="btn ghost c-resolve"`) {
 		t.Errorf("expected a resolve button on an open comment, got:\n%s", body)
+	}
+	// P4-fixes.md #2: delete is destructive and gets an inline two-step
+	// confirm (app.js turns "delete" into "delete?" + reveals this button on
+	// a first click) rather than a native confirm() dialog — both buttons
+	// are server-rendered up front, the cancel one just starts hidden.
+	if !strings.Contains(body, `class="btn ghost c-delete-cancel hidden"`) {
+		t.Errorf("expected a hidden delete-confirm cancel button alongside delete, got:\n%s", body)
 	}
 
 	if err := eng.ResolveComment(feat.ID, c.ID); err != nil {
@@ -243,6 +269,16 @@ func TestRoomPageRendersCommentStripsInline(t *testing.T) {
 	if !strings.Contains(body, `data-line="3"`) || !strings.Contains(body, `data-side="new"`) {
 		t.Errorf("expected gutter cells carrying data-line/data-side for the composer prefill, got:\n%s", body)
 	}
+	// P4-fixes.md #5: a commentable gutter cell is a real <button> (focusable,
+	// keyboard-operable — WCAG 2.1.1), not a hover-only <span>.
+	if !strings.Contains(body, `<button type="button" class="ln" data-file="app.go" data-file-idx="0" data-line="3" data-side="new"`) {
+		t.Errorf("expected the line-3/new gutter cell to be a real <button>, got:\n%s", body)
+	}
+	// P4-fixes.md #10: the strip's own container carries data-file (path),
+	// what app.js's live-refresh reconciles on instead of the index-derived id.
+	if !strings.Contains(body, `id="comments-0" data-file-idx="0" data-file="app.go"`) {
+		t.Errorf("expected the comments strip to carry data-file=\"app.go\", got:\n%s", body)
+	}
 }
 
 func TestRoomPageEmptyDiffStillRendersOrphanedCommentsSection(t *testing.T) {
@@ -286,6 +322,15 @@ func TestFragmentRailReflectsReviewedStateAndUnknownID404s(t *testing.T) {
 	}
 	if !strings.Contains(body, `id="approve-btn"`) {
 		t.Errorf("expected the approve button in the rail fragment, got:\n%s", body)
+	}
+	// P4-fixes.md #9: style-src 'self' (no unsafe-inline) silently no-ops an
+	// inline style="width:...%" attribute — the CSP audit's NOTE. The width
+	// must come from app.js (bar.style.width, not CSP-restricted) instead.
+	if strings.Contains(body, `id="prog-bar" style=`) {
+		t.Errorf("prog-bar must not use an inline style attribute (blocked by our own CSP), got:\n%s", body)
+	}
+	if !strings.Contains(body, `<i id="prog-bar"></i>`) {
+		t.Errorf("expected a bare prog-bar element with its width left to app.js, got:\n%s", body)
 	}
 
 	rec = getPage(t, h, "/fragment/rail?id=no-such-id")

@@ -1,11 +1,12 @@
 {{define "content"}}
 <div class="topbar">
   <div class="brand"><span>wt</span> cockpit</div>
+  <span id="sse-chip" class="sse-chip hidden" role="status">live updates paused — retrying</span>
   <div class="spacer"></div>
   <div class="stat"><b>{{.Counts.Worktrees}}</b> worktrees</div>
   <div class="stat"><b>{{.Counts.Active}}</b> active</div>
   <div class="stat rev"><b>{{.Counts.Unreviewed}}</b> unreviewed</div>
-  <div class="stat warn"><b>{{.Counts.Alerts}}</b> alerts</div>
+  <div class="stat warn"><b>{{.Counts.Alerts}}</b> alert{{if ne .Counts.Alerts 1}}s{{end}}</div>
 </div>
 <div id="worktrees">{{template "worktrees" .}}</div>
 {{end}}
@@ -20,7 +21,7 @@
 <div class="proj">{{.Repo}}</div>
 {{range .Worktrees}}
 <a class="wt {{.State}}" href="/wt/{{.ID}}">
-  <span class="dot"></span>
+  <span class="dot" title="{{.State}}" aria-label="{{.State}}"></span>
   <span class="main">
     <span class="name">{{.Name}}</span>
     <span class="sub">

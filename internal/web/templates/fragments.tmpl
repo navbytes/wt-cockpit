@@ -22,8 +22,12 @@
 </div>
 <div class="foot">
   <div class="prog-lab"><span>Reviewed</span><span id="prog-txt">{{.ReviewedCount}} / {{.TotalFiles}}</span></div>
-  <div class="progress"><i id="prog-bar" style="width:{{.ProgressPct}}%"></i></div>
-  <button class="btn merge" id="approve-btn" data-id="{{.ID}}" data-base="{{.Base}}" {{if not .AllReviewed}}disabled{{end}}>{{if .AllReviewed}}&#10003; Approve &amp; merge to {{.Base}}{{else}}&#10003; Approve &amp; merge ({{.LeftCount}} left){{end}}</button>
+  {{/* Width is set by app.js from these same rail-toggle checkboxes (updateProgress) —
+       a server-rendered inline style="width:...%" is silently no-op'd by our own
+       style-src 'self' CSP (no unsafe-inline), see P4-security.md's NOTE. */}}
+  <div class="progress"><i id="prog-bar"></i></div>
+  {{if .Dirty}}<p class="approve-error" id="dirty-warning">&#10007; uncommitted changes — commit them before approving</p>{{end}}
+  <button class="btn merge" id="approve-btn" data-id="{{.ID}}" data-base="{{.Base}}" data-dirty="{{.Dirty}}" {{if or (not .AllReviewed) .Dirty}}disabled{{end}}>{{if .AllReviewed}}&#10003; Approve &amp; merge to {{.Base}}{{else}}&#10003; Approve &amp; merge ({{.LeftCount}} left){{end}}</button>
   <div id="approve-error" class="approve-error hidden" role="alert"></div>
 </div>
 {{end}}
@@ -41,6 +45,7 @@
   <div class="cactions">
     {{if eq .State "open"}}<button type="button" class="btn ghost c-resolve" data-comment-id="{{.ID}}">resolve</button>{{end}}
     <button type="button" class="btn ghost danger c-delete" data-comment-id="{{.ID}}">delete</button>
+    <button type="button" class="btn ghost c-delete-cancel hidden" data-comment-id="{{.ID}}">cancel</button>
   </div>
 </div>
 {{end}}
@@ -49,9 +54,15 @@
      with zero CommentGroups this must render a genuinely childless
      <div>...</div> (style.css keys ":not(:empty)" off exactly that) rather
      than one holding a stray whitespace text node, which — being a real
-     child — would defeat that selector for every uncommented file. */}}
+     child — would defeat that selector for every uncommented file.
+
+     data-file (the diff path) is what app.js's live-refresh reconciles this
+     strip on, not data-file-idx/id: a file's index can shift if the diff's
+     file order changes between this page's render and a later
+     /fragment/comments fetch, but its path is stable for as long as it's in
+     the diff at all (P4-fixes.md #10). */}}
 {{define "fileCommentsStrip"}}
-<div class="comments" id="comments-{{.Idx}}" data-file-idx="{{.Idx}}">{{range .CommentGroups}}
+<div class="comments" id="comments-{{.Idx}}" data-file-idx="{{.Idx}}" data-file="{{.Path}}">{{range .CommentGroups}}
   <div class="cgroup" data-anchor="{{.Anchor}}">
     <div class="cgroup-lab">{{.Label}}</div>
     {{range .Comments}}{{template "commentCard" .}}{{end}}
@@ -59,17 +70,20 @@
   {{end}}</div>
 {{end}}
 
+{{/* No literal whitespace between the outer div and the if/end actions: with
+     zero orphaned comments this must render a genuinely childless
+     <div>...</div> (style.css keys ":empty" off exactly that to hide the
+     whole card, mirroring "fileCommentsStrip"'s ":not(:empty)" trick above) —
+     app.js still always finds #orphaned-comments as a live-refresh mount
+     point, it's just invisible with nothing in it. */}}
 {{define "orphanedComments"}}
-<div class="card orphaned-comments" id="orphaned-comments">
-  <h3>comments on files no longer in this diff</h3>
-  {{if not .}}<p class="empty">none</p>{{end}}
+<div class="card orphaned-comments" id="orphaned-comments">{{if .}}<h3>comments on files no longer in this diff</h3>
   {{range .}}
   <div class="cgroup">
     <div class="cgroup-lab">{{.File}} · {{if eq .Line 0}}file-level{{else}}line {{.Line}} ({{.Side}}){{end}}</div>
     {{template "commentCard" .}}
   </div>
-  {{end}}
-</div>
+  {{end}}{{end}}</div>
 {{end}}
 
 {{define "commentBlocks"}}

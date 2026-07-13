@@ -19,6 +19,19 @@ import (
 // commentID doesn't exist within worktreeID's comments.
 var ErrCommentNotFound = errors.New("comment not found")
 
+// ErrTooManyComments is returned by AddComment once worktreeID already holds
+// maxCommentsPerWorktree comments. Unbounded per-worktree growth is a local
+// DoS (P4-security.md LOW-1): every add re-marshals and rewrites the whole
+// state file (flush, below), and Comments always returns the full in-memory
+// slice — both scale badly with no cap at all.
+var ErrTooManyComments = errors.New("comment limit reached for this worktree")
+
+// maxCommentsPerWorktree caps how many comments a single worktree can
+// accumulate. ponytail: a flat per-worktree cap (not a global one, so one
+// noisy worktree can't starve the rest), chosen far above any real review
+// session's comment count.
+const maxCommentsPerWorktree = 500
+
 // Store is the persistence contract. Review identity is per file: SetReviewed
 // records the diff hash the file had when it was reviewed, and a caller decides
 // separately (by comparing against the file's current hash) whether that mark
@@ -122,6 +135,9 @@ func (s *jsonStore) ClearWorktree(worktreeID string) error {
 func (s *jsonStore) AddComment(c model.Comment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.data.Comments[c.WorktreeID]) >= maxCommentsPerWorktree {
+		return ErrTooManyComments
+	}
 	if c.State == "" {
 		c.State = "open"
 	}

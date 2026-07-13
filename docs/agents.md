@@ -37,7 +37,8 @@ already knows which worktree it's running in) can be derived once and cached
 The `--json` output is `CommentsPayload`, decoded straight off the daemon's
 `GET /api/comments` response and re-emitted with `encoding/json`'s
 `MarshalIndent` — the CLI never reformats or renames a field, so this is
-byte-for-byte what the API returns. That is a deliberate design invariant
+field-for-field (identical fields/order/values; CLI pretty-prints) what the
+API returns. That is a deliberate design invariant
 (P4-design.md §1.5): **the API and the CLI can never drift apart**, so you
 can point an agent at either one.
 

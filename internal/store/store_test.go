@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/navbytes/wt-cockpit/internal/model"
@@ -111,6 +112,38 @@ func TestDeleteCommentUnknownIDReturnsErrCommentNotFound(t *testing.T) {
 	s, _ := OpenJSON(path)
 	if err := s.DeleteComment("wt1", "c-nope"); !errors.Is(err, ErrCommentNotFound) {
 		t.Errorf("got %v, want ErrCommentNotFound", err)
+	}
+}
+
+// TestAddCommentEnforcesPerWorktreeCap pins the security-audit LOW-1 fix
+// (P4-security.md): AddComment is otherwise unbounded per worktree, and every
+// add re-marshals and rewrites the *entire* state file (flush), so an
+// unbounded count is both a local-DoS memory sink and O(n^2) write cost.
+func TestAddCommentEnforcesPerWorktreeCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := OpenJSON(path)
+
+	for i := 0; i < maxCommentsPerWorktree; i++ {
+		c := model.Comment{ID: "c-" + strconv.Itoa(i), WorktreeID: "wt1", File: "a.go", Body: "x"}
+		if err := s.AddComment(c); err != nil {
+			t.Fatalf("comment %d: unexpected error: %v", i, err)
+		}
+	}
+
+	if err := s.AddComment(model.Comment{ID: "c-over", WorktreeID: "wt1", File: "a.go", Body: "one too many"}); !errors.Is(err, ErrTooManyComments) {
+		t.Errorf("got %v, want ErrTooManyComments once the cap is reached", err)
+	}
+	cs, err := s.Comments("wt1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != maxCommentsPerWorktree {
+		t.Errorf("got %d comments, want exactly the cap (%d) — the rejected add must not be persisted", len(cs), maxCommentsPerWorktree)
+	}
+
+	// A different worktree must be unaffected by wt1's cap.
+	if err := s.AddComment(model.Comment{ID: "c-wt2", WorktreeID: "wt2", File: "z.go", Body: "fine"}); err != nil {
+		t.Errorf("a different worktree must not be affected by wt1's cap: %v", err)
 	}
 }
 

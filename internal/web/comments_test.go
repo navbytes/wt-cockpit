@@ -104,8 +104,11 @@ func TestBuildCommentsFragmentViewShapesFilesAndOrphaned(t *testing.T) {
 	if len(got.Files) != 2 {
 		t.Fatalf("Files = %+v, want one entry per diff file (2)", got.Files)
 	}
-	if got.Files[0].Idx != 0 || len(got.Files[0].CommentGroups) != 1 {
-		t.Errorf("Files[0] = %+v, want idx 0 with a.go's one group", got.Files[0])
+	if got.Files[0].Idx != 0 || got.Files[0].Path != "a.go" || len(got.Files[0].CommentGroups) != 1 {
+		t.Errorf("Files[0] = %+v, want idx 0, path a.go, with a.go's one group", got.Files[0])
+	}
+	if got.Files[1].Path != "b.go" {
+		t.Errorf("Files[1].Path = %q, want b.go — app.js's live-refresh reconciles the strip by this field, not by index", got.Files[1].Path)
 	}
 	if len(got.Files[1].CommentGroups) != 0 {
 		t.Errorf("Files[1] (b.go) = %+v, want no groups", got.Files[1])

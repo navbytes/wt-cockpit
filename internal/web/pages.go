@@ -131,8 +131,16 @@ type roomView struct {
 
 	Files                                []fileCardView
 	ReviewedCount, TotalFiles, LeftCount int
-	ProgressPct                          int
 	AllReviewed                          bool
+
+	// Dirty mirrors the worktree's registry State (P4-fixes.md #3): the
+	// engine's Approve also gates on a clean worktree (engine.go's Gate 2,
+	// IsDirty), which the room previously never surfaced before the click.
+	// This is the *knowable* signal already on the payload — State collapses
+	// "uncommitted changes" under "active" while the worktree was touched
+	// recently (engine.state), so it's a best-effort pre-check, not a
+	// replacement for the 409 backstop.
+	Dirty bool
 
 	// OrphanedComments are comments whose file left the diff entirely — no
 	// file card exists to strip them under, so they render in their own
@@ -236,7 +244,6 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 		ReviewedCount:    reviewedCount,
 		TotalFiles:       total,
 		LeftCount:        total - reviewedCount,
-		ProgressPct:      progressPct(reviewedCount, total),
 		AllReviewed:      total > 0 && reviewedCount == total,
 		GuardrailMsg:     msg,
 		GuardrailMore:    more,
@@ -246,6 +253,7 @@ func (a *app) buildRoomView(id string, d model.Diff, wt *model.Worktree, expandP
 	if wt != nil {
 		view.Repo, view.Name, view.Branch = wt.Repo, wt.Name, wt.Branch
 		view.Agent, view.Stats = wt.Agent, wt.Stats
+		view.Dirty = wt.State == model.StateDirty
 	}
 	return view
 }
@@ -298,16 +306,6 @@ func roomTitle(wt *model.Worktree, id string) string {
 		return id
 	}
 	return wt.Repo + " / " + wt.Name
-}
-
-// progressPct is the rail's progress-bar width, 0-100, 0 when there is
-// nothing to review (avoids a divide-by-zero rather than reporting "100%
-// reviewed" for an empty diff).
-func progressPct(done, total int) int {
-	if total <= 0 {
-		return 0
-	}
-	return done * 100 / total
 }
 
 // guardrailHitsFor returns wt's tripped guardrails, or nil if wt vanished
